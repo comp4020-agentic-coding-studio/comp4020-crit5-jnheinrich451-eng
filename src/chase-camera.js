@@ -7,6 +7,10 @@
 
 import * as THREE from "three";
 import { SPEED_MAX, SPEED_MIN, quatForward, quatUp } from "./flight.js";
+// Aspect handling lives in its own three-free module so the suite can
+// assert it headlessly. See framing.js for why vertical FOV is the wrong
+// thing to hold fixed across the two marking viewports.
+import { REF_ASPECT, widenForAspect } from "./framing.js";
 
 // The standard chase composition. standoff and fov are speed-scaled between
 // these pairs; a composition layer may override either with a fixed number.
@@ -70,14 +74,14 @@ export function createChaseCamera(camera) {
   // applied in insertion order, each lerping the running result toward itself
   // by its own weight, so a half-weight layer is genuinely half-applied
   // rather than winning outright.
-  function composition(speed) {
+  function composition(speed, aspect = REF_ASPECT) {
     const t = THREE.MathUtils.clamp(
       (speed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN),
       0,
       1,
     );
     let standoff = lerp(STANDOFF_SLOW, STANDOFF_FAST, t);
-    let fov = lerp(FOV_SLOW, FOV_FAST, t);
+    let fov = widenForAspect(lerp(FOV_SLOW, FOV_FAST, t), aspect);
     let height = STANDARD.height;
     let framingY = STANDARD.framingY;
     let lagScale = STANDARD.lagScale;
@@ -100,7 +104,7 @@ export function createChaseCamera(camera) {
     camera.position.sub(shake);
 
     readState(state);
-    const c = composition(state.speed);
+    const c = composition(state.speed, camera.aspect);
 
     // lagScale multiplies the FORWARD damping only -- that is how a
     // composition gets its lag (stage 4's catapult, stage 7's crash).

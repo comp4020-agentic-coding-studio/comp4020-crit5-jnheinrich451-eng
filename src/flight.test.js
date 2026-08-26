@@ -36,6 +36,12 @@ import {
   wrapAngle,
 } from "./flight.js";
 import { createInput } from "./input.js";
+import {
+  FOV_VERTICAL_MAX,
+  REF_ASPECT,
+  horizontalFov,
+  widenForAspect,
+} from "./framing.js";
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -884,6 +890,87 @@ function testPitchConvention() {
   check("I is not a held axis key", h5.input.heldKeys().length === 0);
 }
 
+// ── the two marking viewports ──────────────────────────────────────────────
+// The course marks at 1920x1080 and 390x844 in Chrome DevTools, and both are
+// full marking environments. These assert the FRAMING RULE rather than a
+// screenshot, so it cannot regress quietly.
+
+const DESKTOP = 1920 / 1080;
+const PHONE_PORTRAIT = 390 / 844;
+const PHONE_LANDSCAPE = 844 / 390;
+
+function testMarkingViewports() {
+  // The bug this replaced: a fixed VERTICAL fov holds the vertical view and
+  // lets the horizontal view collapse as the frame narrows. At the phone
+  // viewport that was 32 degrees of horizontal against the desktop's 96, so
+  // the aircraft filled the frame and the world read as a diorama.
+  const naiveDesktop = horizontalFov(64, DESKTOP);
+  const naivePhone = horizontalFov(64, PHONE_PORTRAIT);
+  check(
+    "the naive fixed-vertical FOV really does collapse on the phone",
+    naivePhone < naiveDesktop / 2,
+    `desktop ${naiveDesktop.toFixed(1)} vs phone ${naivePhone.toFixed(1)}`,
+  );
+
+  // Desktop is the reference and must be left exactly alone.
+  check(
+    "the desktop viewport is unchanged",
+    widenForAspect(64, DESKTOP) === 64,
+    `${widenForAspect(64, DESKTOP)}`,
+  );
+  check(
+    "an aspect at the reference is unchanged",
+    widenForAspect(64, REF_ASPECT) === 64,
+  );
+
+  // Wider than the reference is left alone too: clawing horizontal view back
+  // by narrowing the vertical would crop the horizon out of an ultrawide.
+  check(
+    "a landscape phone is not narrowed",
+    widenForAspect(64, PHONE_LANDSCAPE) === 64,
+    `${widenForAspect(64, PHONE_LANDSCAPE)}`,
+  );
+
+  // Portrait widens, and the result is capped rather than fisheyed.
+  const portrait = widenForAspect(64, PHONE_PORTRAIT);
+  check(
+    "the portrait phone widens the vertical FOV",
+    portrait > 64,
+    `${portrait}`,
+  );
+  check(
+    "the widening is capped short of a fisheye",
+    portrait <= FOV_VERTICAL_MAX,
+    `${portrait}`,
+  );
+  check(
+    "portrait recovers a usable share of the horizontal view",
+    horizontalFov(portrait, PHONE_PORTRAIT) > naivePhone * 1.5,
+    `${horizontalFov(portrait, PHONE_PORTRAIT).toFixed(1)} vs ${naivePhone.toFixed(1)}`,
+  );
+
+  // Monotonic: a narrower frame never gets LESS help than a wider one.
+  let previous = 0;
+  let monotonic = true;
+  for (const aspect of [1.78, 1.4, 1.0, 0.75, 0.46, 0.3]) {
+    const v = widenForAspect(64, aspect);
+    if (v < previous) monotonic = false;
+    previous = v;
+  }
+  check("widening is monotonic as the frame narrows", monotonic);
+
+  // Degenerate aspects must not produce NaN and kill the projection matrix.
+  for (const bad of [0, -1, NaN, undefined]) {
+    const v = widenForAspect(64, bad);
+    check(`a degenerate aspect (${bad}) falls back safely`, v === 64, `${v}`);
+  }
+
+  check(
+    "horizontalFov inverts sensibly at square",
+    near(horizontalFov(64, 1), 64, 1e-9),
+  );
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -906,6 +993,7 @@ const SUITES = [
   ["both modes write the quaternion", testBothModesWriteTheQuaternion],
   ["mode change", testModeChange],
   ["pitch convention", testPitchConvention],
+  ["marking viewports", testMarkingViewports],
 ];
 
 export function run() {
