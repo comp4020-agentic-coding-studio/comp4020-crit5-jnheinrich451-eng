@@ -83,6 +83,20 @@ import {
   turnRadius,
 } from "./missile.js";
 import { createGun, leadSolution } from "./gun.js";
+import {
+  HOSTILE_CFG,
+  HOSTILE_MISSILE,
+  createHostile,
+  hostileTransition,
+} from "./hostile.js";
+import {
+  EVADE_WINDOW,
+  authorityFor,
+  createEvasion,
+  createThreatMonitor,
+  wouldHaveHit,
+} from "./threat.js";
+import { createDamageResponse, playerDamageEvent } from "./damage.js";
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -2437,6 +2451,387 @@ function testGunMagazineAndFx() {
   check("an empty gun cannot go negative", gun3.rounds === 0);
 }
 
+// ── stage 6: an enemy that fights back ────────────────────────────────────
+
+const AI = (over = {}) => ({
+  state: "PATROL", stateTime: 0, lockTimer: 0, lockCue: 0,
+  defendCooldown: 0, ammo: 2, ...over,
+});
+const CTX = (over = {}) => ({
+  alive: true, playerAlive: true, ready: true,
+  range: 1500, inCone: true, lockCue: 0, ...over,
+});
+
+function testHostileTransitionTable() {
+  const T = hostileTransition;
+
+  // Death wins from EVERY state, and DESTROYED is terminal.
+  for (const state of ["PATROL", "PURSUIT", "ACQUIRE", "ATTACK", "COOLDOWN", "REPOSITION", "DEFEND"]) {
+    check(
+      `death wins from ${state}`,
+      T(AI({ state }), CTX({ alive: false })) === "DESTROYED",
+    );
+  }
+  check(
+    "DESTROYED is terminal even if it somehow revives",
+    T(AI({ state: "DESTROYED" }), CTX({ alive: true })) === "DESTROYED",
+  );
+
+  // Not ready, or no player: back to PATROL.
+  check("an unready hostile patrols", T(AI({ state: "PURSUIT" }), CTX({ ready: false })) === "PATROL");
+  check("a dead player is not pursued", T(AI({ state: "ACQUIRE" }), CTX({ playerAlive: false })) === "PATROL");
+
+  // PATROL -> PURSUIT on detection, and back out beyond it.
+  check("PATROL holds beyond detection", T(AI({ state: "PATROL" }), CTX({ range: 9000 })) === "PATROL");
+  check("PATROL promotes inside detection", T(AI({ state: "PATROL" }), CTX({ range: 4000 })) === "PURSUIT");
+  check("PURSUIT drops beyond detection", T(AI({ state: "PURSUIT" }), CTX({ range: 9000 })) === "PATROL");
+
+  // PURSUIT -> ACQUIRE only in the cone AND with a round.
+  check("PURSUIT holds outside the cone", T(AI({ state: "PURSUIT" }), CTX({ inCone: false })) === "PURSUIT");
+  check("PURSUIT promotes in the cone", T(AI({ state: "PURSUIT" }), CTX({ inCone: true })) === "ACQUIRE");
+
+  // ACQUIRE -> ATTACK on a completed lock; falls back out of the cone.
+  check(
+    "ACQUIRE holds while the lock builds",
+    T(AI({ state: "ACQUIRE", lockTimer: 0.5 }), CTX()) === "ACQUIRE",
+  );
+  check(
+    "ACQUIRE promotes on a completed lock",
+    T(AI({ state: "ACQUIRE", lockTimer: 1.3 }), CTX()) === "ATTACK",
+  );
+  check(
+    "ACQUIRE falls back when the player leaves the cone",
+    T(AI({ state: "ACQUIRE", lockTimer: 1.3 }), CTX({ inCone: false })) === "PURSUIT",
+  );
+
+  // ATTACK -> COOLDOWN -> REPOSITION -> PURSUIT.
+  check("ATTACK holds before the launch delay", T(AI({ state: "ATTACK", stateTime: 0.2 }), CTX()) === "ATTACK");
+  check("ATTACK launches after the delay", T(AI({ state: "ATTACK", stateTime: 0.6 }), CTX()) === "COOLDOWN");
+  check("COOLDOWN holds", T(AI({ state: "COOLDOWN", stateTime: 3 }), CTX()) === "COOLDOWN");
+  check("COOLDOWN releases after 7 s", T(AI({ state: "COOLDOWN", stateTime: 7.1 }), CTX()) === "REPOSITION");
+  check("REPOSITION returns to PURSUIT", T(AI({ state: "REPOSITION", stateTime: 5 }), CTX()) === "PURSUIT");
+
+  // The transition function is PURE: it must not mutate what it is handed.
+  const ai = AI({ state: "PURSUIT" });
+  const before = JSON.stringify(ai);
+  T(ai, CTX());
+  check("the transition function does not mutate the ai", JSON.stringify(ai) === before);
+}
+
+function testAmmoZeroIsTheDesignTool() {
+  // §12: "it chases you but does not shoot back yet" must need NO new state
+  // and NO special case -- the table already refuses to promote without a
+  // round. A perfect firing position with an empty magazine stays in PURSUIT.
+  const perfect = CTX({ range: 1200, inCone: true });
+  check(
+    "ammo 0 cannot reach ACQUIRE from a perfect firing position",
+    hostileTransition(AI({ state: "PURSUIT", ammo: 0 }), perfect) === "PURSUIT",
+  );
+  check(
+    "ammo 0 falls out of ACQUIRE",
+    hostileTransition(AI({ state: "ACQUIRE", ammo: 0, lockTimer: 9 }), perfect) === "PURSUIT",
+  );
+  check(
+    "one round is enough to promote",
+    hostileTransition(AI({ state: "PURSUIT", ammo: 1 }), perfect) === "ACQUIRE",
+  );
+  // And it still pursues -- being harmless is not being passive.
+  check(
+    "an unarmed hostile still pursues",
+    hostileTransition(AI({ state: "PATROL", ammo: 0 }), perfect) === "PURSUIT",
+  );
+}
+
+function testDefendRules() {
+  const T = hostileTransition;
+  const cfg = HOSTILE_CFG;
+
+  // A FLEETING lock provokes nothing.
+  check(
+    "a lock held briefly does not provoke a break",
+    T(AI({ state: "PURSUIT" }), CTX({ lockCue: 0.3 })) === "ACQUIRE",
+  );
+  check(
+    "a lock held past the reaction delay provokes a break",
+    T(AI({ state: "PURSUIT" }), CTX({ lockCue: cfg.defendReaction + 0.01 })) === "DEFEND",
+  );
+
+  // A COMMITTED ATTACK IS NEVER INTERRUPTIBLE. 0.55 s from lock to launch, and
+  // a hostile that could be talked out of a shot would never land one.
+  check(
+    "a committed ATTACK ignores the player's lock",
+    T(AI({ state: "ATTACK", stateTime: 0.2 }), CTX({ lockCue: 5 })) === "ATTACK",
+  );
+  check(
+    "a committed ATTACK still completes its launch",
+    T(AI({ state: "ATTACK", stateTime: 0.9 }), CTX({ lockCue: 5 })) === "COOLDOWN",
+  );
+
+  // A sustained lock cannot CHAIN breaks inside the cooldown -- otherwise it
+  // becomes a permanent evasion loop the player can never shoot it out of.
+  check(
+    "a break on cooldown is refused",
+    T(AI({ state: "PURSUIT", defendCooldown: 3 }), CTX({ lockCue: 5 })) === "ACQUIRE",
+  );
+  check(
+    "DEFEND runs its full 2.8 s",
+    T(AI({ state: "DEFEND", stateTime: 1.4 }), CTX({ lockCue: 5 })) === "DEFEND",
+  );
+  check(
+    "DEFEND ends in REPOSITION",
+    T(AI({ state: "DEFEND", stateTime: 3 }), CTX({ lockCue: 0 })) === "REPOSITION",
+  );
+}
+
+function testBreakDirectionIsLatched() {
+  // THE TEST THAT CATCHES AN UNLATCHED DIRECTION. Recomputing which way to
+  // turn every frame flips the cross product as the aircraft turns, and the
+  // break oscillates to a net heading change of nothing.
+  const h = createHostile();
+  h.deploy({ at: { x: 900, y: 1200, z: -2500 }, heading: 0, ammo: 2 });
+  const player = createFlightState({ position: { x: 0, y: 1200, z: 0 } });
+
+  // Hold a completed lock until it breaks.
+  let broke = false;
+  for (let t = 0; t < 3 && !broke; t += 1 / 60) {
+    h.update(1 / 60, { playerState: player, playerLockedOnMe: true });
+    if (h.ai.state === "DEFEND") broke = true;
+  }
+  check("a held lock makes it break", broke, h.ai.state);
+  const latched = h.ai.breakSign;
+  const headingAtEntry = h.ai.heading;
+
+  for (let t = 0; t < 2.6; t += 1 / 60) {
+    h.update(1 / 60, { playerState: player, playerLockedOnMe: true });
+  }
+  check("the latched direction never changed", h.ai.breakSign === latched, `${h.ai.breakSign}`);
+  const swept = Math.abs(wrapAngle(h.ai.heading - headingAtEntry));
+  check(
+    "the break changes heading by a meaningful amount",
+    swept > 0.5,
+    `${((swept * 180) / Math.PI).toFixed(1)} deg`,
+  );
+}
+
+function testAltitudeGuard() {
+  // It must NEVER fly into the sea, including through a diving break.
+  const h = createHostile();
+  h.deploy({ at: { x: 400, y: 320, z: -2000 }, heading: 0, ammo: 2 });
+  // A player far below, so every steering instinct points it downward.
+  const player = createFlightState({ position: { x: 0, y: 5, z: 0 } });
+  let lowest = Infinity;
+  for (let t = 0; t < 25; t += 1 / 60) {
+    h.update(1 / 60, { playerState: player, playerLockedOnMe: t > 4 && t < 9 });
+    lowest = Math.min(lowest, h.target.position.y);
+  }
+  check(
+    "the hostile never descends below its floor",
+    lowest >= HOSTILE_CFG.minAltitude - 1e-6,
+    `lowest ${lowest.toFixed(1)} vs floor ${HOSTILE_CFG.minAltitude}`,
+  );
+  check("it did get pushed down toward the floor", lowest < 400, `${lowest.toFixed(1)}`);
+}
+
+function testInactiveMeansInactive() {
+  const h = createHostile();
+  h.deploy({ at: { x: 500, y: 1000, z: -3000 }, heading: 0, ammo: 2 });
+  h.setActive(false);
+  const before = { ...h.target.position };
+  const player = createFlightState({ position: { x: 0, y: 1000, z: 0 } });
+  for (let t = 0; t < 10; t += 1 / 60) {
+    h.update(1 / 60, { playerState: player, playerLockedOnMe: true });
+  }
+  const moved = Math.hypot(
+    h.target.position.x - before.x,
+    h.target.position.y - before.y,
+    h.target.position.z - before.z,
+  );
+  check("ten seconds of updates on an inactive hostile moves it zero metres", moved === 0, `${moved}`);
+  check("an inactive hostile reports itself inactive", h.isActive() === false);
+  check("an inactive hostile does not change state", h.ai.state === "PATROL");
+}
+
+function testDeployAndSpent() {
+  const h = createHostile();
+  check("a fresh hostile has no encounters", h.ai.encounters === 0);
+
+  h.deploy({ at: { x: 100, y: 900, z: -1000 }, heading: 1, ammo: 2 });
+  check("deploy counts the encounter", h.ai.encounters === 1);
+  check("deploy arms it", h.ai.ammo === 2);
+  check("deploy positions it", h.target.position.x === 100 && h.target.position.z === -1000);
+  check("deploy activates it", h.isActive() === true);
+
+  // Kill it, then redeploy: it must REVIVE, and the count must survive the
+  // internal reset -- that count is what alternates which side it appears on.
+  h.target.alive = false;
+  h.target.health = 0;
+  h.ai.ammo = 0;
+  h.deploy({ at: { x: -400, y: 1200, z: -5000 }, heading: 2, ammo: 1 });
+  check("deploy revives it", h.target.alive === true && h.target.health === h.target.maxHealth);
+  check("deploy re-arms it", h.ai.ammo === 1);
+  check("deploy repositions it", h.target.position.x === -400);
+  check("the encounter count SURVIVES the reset", h.ai.encounters === 2, `${h.ai.encounters}`);
+
+  // `spent` is true only when the magazine is empty AND nothing is in the air.
+  check("armed is not spent", h.spent(0) === false);
+  h.ai.ammo = 0;
+  check("empty with a round still flying is NOT spent", h.spent(1) === false);
+  check("empty with nothing in the air IS spent", h.spent(0) === true);
+}
+
+function testHostileRoundFairness() {
+  // §14: the fairness claim is the turn RADIUS. It must stay comparable to the
+  // F-15's arcade turn at 250 m/s, which is what makes a hard crossing
+  // manoeuvre defeat the round with no countermeasure at all.
+  const r = turnRadius(HOSTILE_MISSILE);
+  check(
+    "the hostile round's turn radius is near §14's ~904 m",
+    r > 800 && r < 1000,
+    `${r.toFixed(0)} m`,
+  );
+  check(
+    "a hard crossing manoeuvre can defeat it: radius >= the aircraft's",
+    r >= TURN_RADIUS_REF * 0.85,
+    `round ${r.toFixed(0)} vs aircraft ${TURN_RADIUS_REF}`,
+  );
+  check(
+    "the hostile round is slower and turns wider than the AIM-9",
+    HOSTILE_MISSILE.maxSpeed < AIM9.maxSpeed &&
+      HOSTILE_MISSILE.turnRate < AIM9.turnRate,
+  );
+  check(
+    "it is the SAME implementation, differing only as data",
+    HOSTILE_MISSILE.name !== AIM9.name &&
+      typeof HOSTILE_MISSILE.fuze === "number",
+  );
+}
+
+function testThreatEscalation() {
+  const monitor = createThreatMonitor();
+  const at = { position: { x: 0, y: 1000, z: 0 } };
+
+  check("nothing is a threat at rest", monitor.update(1 / 60, at, [], []).level === "NONE");
+
+  const tracking = [{ level: "TRACK", position: { x: 0, y: 1000, z: -4000 }, progress: 0.3 }];
+  check("an acquisition escalates to TRACK", monitor.update(1 / 60, at, tracking, []).level === "TRACK");
+
+  const locking = [{ level: "LOCK", position: { x: 0, y: 1000, z: -3000 }, progress: 1 }];
+  check("a lock outranks a track", monitor.update(1 / 60, at, locking, []).level === "LOCK");
+
+  // A LIVE ROUND ALWAYS OUTRANKS AN ACQUISITION -- it is the only one of the
+  // two the player cannot ignore.
+  const round = {
+    owner: "hostile", position: { x: 0, y: 1000, z: -900 },
+    config: { name: "HOSTILE", fuze: 8 },
+  };
+  const s = monitor.update(1 / 60, at, locking, [round]);
+  check("a live round outranks any acquisition", s.level === "MISSILE", s.level);
+
+  // The player's own round is never a threat to the player.
+  const mine = { owner: "player", position: { x: 0, y: 1000, z: -400 }, config: { name: "AIM-9" } };
+  check(
+    "the player's own round is not a threat",
+    monitor.update(1 / 60, at, [], [mine]).level === "NONE",
+  );
+
+  // Two acquisitions at once: the CLOSER one is named. A site at 900 m is more
+  // urgent than a fighter tracking from 4 km.
+  const m2 = createThreatMonitor();
+  const near = { level: "LOCK", position: { x: 0, y: 1000, z: -900 }, origin: "sam", label: "SAM" };
+  const far = { level: "LOCK", position: { x: 0, y: 1000, z: -4000 }, label: "HOSTILE" };
+  const picked = m2.update(1 / 60, at, [far, near], []);
+  check("with two equal acquisitions the closer is named", picked.source === near, picked.source?.label);
+  check("the label carries the origin", picked.label === "SAM LOCK", picked.label);
+}
+
+function testAuthorityHook() {
+  const evasion = createEvasion();
+  const hostileRound = { owner: "hostile", config: HOSTILE_MISSILE };
+  const playerRound = { owner: "player", config: AIM9 };
+
+  check("no roll means full authority", authorityFor(hostileRound, evasion) === 1);
+
+  check("the roll is a latched request", evasion.request("ASSISTED") === true);
+  check("a second request while rolling is refused", evasion.request("ASSISTED") === false);
+  check("the roll is running", evasion.isRolling() === true);
+
+  const degraded = authorityFor(hostileRound, evasion);
+  check("the roll degrades an incoming round", degraded < 1, `${degraded}`);
+  // NEVER TO ZERO: a defeated round keeps flying its curve and can still get
+  // lucky on the fuze, so a miss reads as a miss.
+  check("authority is never reduced to zero", degraded > 0, `${degraded}`);
+
+  // AND IT NEVER AFFECTS THE PLAYER'S OWN ROUNDS.
+  check("the roll does not affect the player's own rounds", authorityFor(playerRound, evasion) === 1);
+
+  // Expert gets a tighter window: finer control, so the timing is worth more.
+  const e2 = createEvasion();
+  e2.request("EXPERT");
+  check("Expert's window is tighter than Assisted's", e2.window() < EVADE_WINDOW.ASSISTED);
+  check("the Assisted window is 0.60 s", EVADE_WINDOW.ASSISTED === 0.6);
+  check("the Expert window is 0.42 s", EVADE_WINDOW.EXPERT === 0.42);
+
+  // The window expires.
+  for (let t = 0; t < 1; t += 1 / 60) evasion.update(1 / 60);
+  check("the roll window expires", evasion.isRolling() === false);
+  check("authority returns to full", authorityFor(hostileRound, evasion) === 1);
+
+  // wouldHaveHit: only a miss that WAS going to connect is worth announcing.
+  const onTarget = {
+    position: { x: 0, y: 0, z: -400 }, velocity: { x: 0, y: 0, z: 400 },
+    config: { fuze: 8 },
+  };
+  check("a round on a collision course would have hit", wouldHaveHit(onTarget, { x: 0, y: 0, z: 0 }));
+  const wide = {
+    position: { x: 900, y: 0, z: -400 }, velocity: { x: 0, y: 0, z: 400 },
+    config: { fuze: 8 },
+  };
+  check("a round passing wide would not have hit", wouldHaveHit(wide, { x: 0, y: 0, z: 0 }) === false);
+  const receding = {
+    position: { x: 0, y: 0, z: 400 }, velocity: { x: 0, y: 0, z: 400 },
+    config: { fuze: 8 },
+  };
+  check("a round already past is not a would-have-hit", wouldHaveHit(receding, { x: 0, y: 0, z: 0 }) === false);
+}
+
+function testDamageResponseFiresOnce() {
+  const feedback = [];
+  const damage = createDamageResponse({ onFeedback: (e) => feedback.push(e) });
+  const event = playerDamageEvent({
+    source: "missile", at: 1, position: { x: 0, y: 0, z: 0 },
+    amount: 55, owner: "hostile",
+  });
+
+  check("the first hit is handled", damage.handle(event) === true);
+  check("feedback fired once", feedback.length === 1);
+
+  // A 22 m proximity fuze can trip on CONSECUTIVE FRAMES, and a re-entrant
+  // response loops forever. Everything arriving while holding or in cooldown
+  // is swallowed.
+  check("a same-frame re-entry is swallowed", damage.handle(event) === false);
+  check("no second feedback", feedback.length === 1);
+  for (let t = 0; t < 0.5; t += 1 / 60) damage.tick(1 / 60);
+  check("still swallowed during the hold", damage.handle(event) === false);
+  check("the veil is showing during the hold", damage.veil() > 0);
+
+  for (let t = 0; t < 1.6; t += 1 / 60) damage.tick(1 / 60);
+  check("the veil clears", damage.veil() === 0);
+  check("a later hit is handled again", damage.handle(event) === true);
+  check("the tally counted both", damage.hitsTaken() === 2);
+
+  // The event carries what a response needs and is a COPY of the position.
+  const captured = damage.lastEvent();
+  for (const field of ["source", "at", "position", "amount", "owner"]) {
+    check(`the damage event carries ${field}`, field in captured);
+  }
+  // Presentation resets; the tally does not (§17.11).
+  damage.reset();
+  check("reset clears the presentation", damage.veil() === 0);
+  check("reset does NOT clear the tally", damage.hitsTaken() === 2);
+  damage.resetAll();
+  check("resetAll clears the tally", damage.hitsTaken() === 0);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -2490,6 +2885,17 @@ const SUITES = [
   ["expireOwner", testExpireOwner],
   ["missile turn radius", testMissileTurnRadius],
   ["gun magazine and fx", testGunMagazineAndFx],
+  ["hostile transition table", testHostileTransitionTable],
+  ["ammo 0 is the design tool", testAmmoZeroIsTheDesignTool],
+  ["DEFEND rules", testDefendRules],
+  ["the break direction is latched", testBreakDirectionIsLatched],
+  ["hostile altitude guard", testAltitudeGuard],
+  ["inactive means inactive", testInactiveMeansInactive],
+  ["deploy and spent", testDeployAndSpent],
+  ["hostile round fairness", testHostileRoundFairness],
+  ["threat escalation", testThreatEscalation],
+  ["the authority hook", testAuthorityHook],
+  ["damage response fires once", testDamageResponseFiresOnce],
 ];
 
 export function run() {

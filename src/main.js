@@ -16,6 +16,14 @@ import { AIM9, createMissileSystem } from "./missile.js";
 import { createGun, leadSolution } from "./gun.js";
 import { createCombatHud } from "./combat-hud.js";
 import { createCombatFx } from "./combat-fx.js";
+import { HOSTILE_MISSILE, createHostile } from "./hostile.js";
+import {
+  authorityFor,
+  createEvasion,
+  createThreatMonitor,
+  wouldHaveHit,
+} from "./threat.js";
+import { createDamageResponse, playerDamageEvent } from "./damage.js";
 import { quatForward } from "./flight.js";
 import { buildTerrainIndex, createPhysics } from "./physics.js";
 import { benchmarkIndex } from "./physics-benchmark.js";
@@ -84,17 +92,59 @@ const gun = createGun({
   addShake: (a) => rig.addShake(a),
 });
 
+const hostile = createHostile({
+  onLaunch: (from, forward) => {
+    missiles.fire({
+      config: HOSTILE_MISSILE,
+      owner: "hostile",
+      position: { ...from.position },
+      direction: forward,
+      speed: 205,
+      target: playerTarget,
+    });
+  },
+});
+const threatMonitor = createThreatMonitor();
+const evasion = createEvasion();
+
+// The player, published through the SAME target contract everything else uses,
+// so an enemy round needs no special case to chase it.
+const playerTarget = {
+  label: "PLAYER", alive: true, health: 100, maxHealth: 100, radius: 8,
+  hitAt: -Infinity,
+  position: state.position,
+  velocity: { x: 0, y: 0, z: 0 },
+};
+
+const damage = createDamageResponse({
+  addShake: (a) => rig.addShake(a),
+  onFeedback: () => {
+    message = "HIT";
+    messageUntil = clock + 1.2;
+  },
+});
+
 const missiles = createMissileSystem({
-  // The single counter-measure hook (§14). Nothing is attached yet -- stages 6
-  // and 8 hang the barrel roll, terrain masking and flares here, and the
-  // missile never learns what any of them are.
-  authorityFor: () => 1,
+  // THE single counter-measure hook (§14). The barrel roll attaches here and
+  // the missile never learns what a barrel roll is. Stage 8 composes terrain
+  // masking and flares onto this same function.
+  authorityFor: (m) => authorityFor(m, evasion),
   onEvent: (event) => {
-    if (event.kind === "hit") {
-      fx.burst(event.round.position, 30);
-      if (damageTarget(event.target, event.round.config.damage, clock)) {
-        onKill(event.target);
-      }
+    if (event.kind !== "hit") return;
+    fx.burst(event.round.position, 30);
+    if (event.target === playerTarget) {
+      // An EVENT, not a reset call. The response decides what it means, and
+      // swallows the re-entry a 22 m fuze produces on consecutive frames.
+      damage.handle(
+        playerDamageEvent({
+          source: "missile", at: clock, position: event.round.position,
+          amount: event.round.config.damage, owner: event.round.owner,
+        }),
+      );
+      return;
+    }
+    if (damageTarget(event.target, event.round.config.damage, clock)) {
+      onKill(event.target);
     }
   },
 });
@@ -221,6 +271,10 @@ function restartSortie() {
   targeting.clear();
   weapons?.reload();
   drone.reset();
+  threatMonitor.reset();
+  evasion.reset();
+  damage.reset();
+  hostile.setActive(false);
   if (launchClipSeconds !== null && carrierAnchors) startLaunch(launchClipSeconds);
   else rig.reset(state);
 }
@@ -339,6 +393,14 @@ function step(now) {
       // Drop any latch accumulated on the deck, so a key pressed during the
       // script does not fire on the handoff frame.
       input.dropLatches();
+      // Stage 7's mission director will own this. Until then, one encounter
+      // deploys on handoff so the dogfight is reachable.
+      hostile.deploy({
+        at: { x: state.position.x + 900, y: state.position.y + 140, z: state.position.z - 2400 },
+        heading: 0,
+        ammo: 2,
+        engageDelay: 6,
+      });
     }
     const gated = physics.getPolicy()?.overridesInput?.() ? NEUTRAL_STICK : axes;
     updateFlight(state, gated, dt);
@@ -366,7 +428,12 @@ function step(now) {
   const observer = { position: state.position, forward };
   // An empty candidate list is how targeting is switched OFF (§5) -- there is
   // deliberately no enabled flag, so the launch script simply offers nothing.
-  const candidates = !scripted && drone.target.alive ? [drone.target] : [];
+  const candidates = [];
+  if (!scripted) {
+    if (drone.target.alive) candidates.push(drone.target);
+    // An INACTIVE hostile is not offered to targeting at all (§12).
+    if (hostile.isActive() && hostile.target.alive) candidates.push(hostile.target);
+  }
   const track = targeting.update(dt, candidates, observer);
 
   if (!scripted && input.consumeLatch("weapon")) {
@@ -403,11 +470,57 @@ function step(now) {
     }
   }
 
+  // ── the hostile, the threat monitor, evasion ───────────────────────────
+  playerTarget.velocity.x = forward.x * state.speed;
+  playerTarget.velocity.y = forward.y * state.speed;
+  playerTarget.velocity.z = forward.z * state.speed;
+
+  if (!scripted && input.consumeLatch("evade")) evasion.request(state.mode);
+  evasion.update(dt);
+  damage.tick(dt);
+
+  hostile.update(dt, {
+    playerState: state,
+    playerAlive: true,
+    playerLockedOnMe:
+      track.lockState === LOCK && track.currentTarget === hostile.target,
+  });
+
+  // What the hostile is doing TO the player, published for the monitor.
+  const acquisitions = [];
+  if (hostile.isActive() && hostile.target.alive) {
+    const s = hostile.ai.state;
+    const level = s === "ACQUIRE" ? "TRACK" : s === "ATTACK" ? "LOCK" : "NONE";
+    if (level !== "NONE") {
+      acquisitions.push({
+        level, position: hostile.target.position, label: "HOSTILE",
+        progress: Math.min(1, hostile.ai.lockTimer / 1.25),
+      });
+    }
+  }
+  const t = threatMonitor.update(dt, state, acquisitions, missiles.rounds);
+  threat = t.label;
+
+  // EVADE is announced only for a miss that WAS going to be a hit -- otherwise
+  // the word teaches the player nothing about whether the roll worked.
+  const wereGoingToHit = evasion.isRolling()
+    ? missiles.rounds.filter((r) => r.owner !== "player" && wouldHaveHit(r, state.position))
+    : [];
+
   missiles.update(dt, clock);
+
+  if (wereGoingToHit.length && !wereGoingToHit.some((r) => r.detonated)) {
+    if (wereGoingToHit.some((r) => !missiles.rounds.includes(r) || !wouldHaveHit(r, state.position))) {
+      evasion.noteDefeated();
+      message = "EVADE";
+      messageUntil = clock + 1.4;
+    }
+  }
   fx.syncMissiles(missiles.rounds);
   fx.syncTracers(gun.tracers);
   fx.update(dt);
   updateDroneMesh();
+  updateHostileMesh();
 
   rig.update(dt, state);
   world.update(dt, state);
@@ -476,6 +589,8 @@ function paintRail(axes) {
     `LAUNCH    ${held ? "waiting for the deck" : launch ? (launch.isActive() ? `t=${launch.elapsed().toFixed(1)}/${launch.plan.total.toFixed(1)}` : "handed off") : "--"}`,
     `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
     `WEAPON    ${weapon}   AIM-9 ${weapons ? weapons.count : "--"}   GUN ${gun.rounds}`,
+    `HOSTILE   ${hostile.isActive() ? hostile.ai.state + " ammo " + hostile.ai.ammo : "off"}  threat ${threat || "--"}`,
+    `EVADE     ${evasion.isRolling() ? "ROLLING" : "--"}  defeated ${evasion.defeatedCount()}  hits ${damage.hitsTaken()}`,
     `TRACK     ${targeting.state().lockState} ${(targeting.state().lockProgress * 100).toFixed(0)}%  rounds ${missiles.rounds.length}`,
     `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
     `ERRORS    ${errorCount}`,
@@ -530,6 +645,29 @@ function updateDroneMesh() {
   // Flash on a hit: feedback that is not a number.
   const flash = Math.max(0, 1 - (clock - drone.target.hitAt) / 0.18);
   droneMesh.material.emissive.setRGB(flash, flash * 0.4, 0);
+}
+
+let hostileMesh = null;
+function updateHostileMesh() {
+  if (!hostileMesh) {
+    hostileMesh = new THREE.Mesh(
+      new THREE.ConeGeometry(4, 16, 6),
+      new THREE.MeshStandardMaterial({ color: 0x6b5a4e, roughness: 0.55, metalness: 0.35 }),
+    );
+    hostileMesh.rotation.x = -Math.PI / 2;
+    world.scene.add(hostileMesh);
+  }
+  // Inactive means NOT DRAWN, as well as not simulated and not targetable.
+  hostileMesh.visible = hostile.isActive() && hostile.target.alive;
+  if (!hostileMesh.visible) return;
+  const p = hostile.target.position;
+  hostileMesh.position.set(p.x, p.y, p.z);
+  const f = hostile.forward();
+  hostileMesh.quaternion.setFromUnitVectors(
+    new THREE.Vector3(0, 0, -1), new THREE.Vector3(f.x, f.y, f.z).normalize(),
+  );
+  const flash = Math.max(0, 1 - (clock - hostile.target.hitAt) / 0.18);
+  hostileMesh.material.emissive.setRGB(flash, flash * 0.4, 0);
 }
 
 function onResize() {
