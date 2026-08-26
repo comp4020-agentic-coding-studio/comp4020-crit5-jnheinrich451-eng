@@ -8,6 +8,14 @@
 import * as THREE from "three";
 import { heightAtIndex } from "./physics.js";
 
+// Moved with the benchmark: physics.js defines its own copy above the split,
+// and importing one for the other would couple two modules over a one-line
+// helper. Splitting the file left this behind the first time, which threw
+// "now is not defined" from inside the terrain load and surfaced as
+// "terrain load failed" -- the terrain was fine.
+const now = () =>
+  typeof performance !== "undefined" ? performance.now() : Date.now();
+
 // ── the benchmark (§8) ─────────────────────────────────────────────────────
 
 /**

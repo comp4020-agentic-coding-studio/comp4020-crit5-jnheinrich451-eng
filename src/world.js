@@ -423,6 +423,205 @@ export async function loadTerrain(scene) {
   return { report, group: norm.holder, triangles: tris };
 }
 
+// ── carrier (stage 4) ──────────────────────────────────────────────────────
+
+export const CARRIER_LENGTH = 332.8; // USS Eisenhower, CVN-69
+export const CARRIER_Z = -1600; // 6.0 km from the measured coast
+const CARRIER_URL = "./models/carrier/scene.gltf";
+
+// Where along the deck the catapult run begins and ends, as fractions of the
+// measured deck length. These two fractions are the only authored numbers
+// here: the RUN ITSELF is measured between the resulting anchors, which is
+// what §9 solves the stroke against. On this asset they give
+// (0.90 - 0.30) x 332.8 = 199.7 m, the figure §2 quotes -- but a shorter deck
+// simply produces a shorter run and the stroke re-solves for it.
+// The flight deck of a Nimitz-class carrier stands about 20 m above the
+// waterline. That is a real-world measurement of the real ship, in the same
+// way its 332.8 m length is, and it is what fixes the hull vertically: the
+// mesh carries no waterline marker, so the deck height is the measurable
+// thing to place. Everything else -- the parked pose, the launch reference
+// frame, the deck run -- hangs off the MEASURED deck plane, not off this.
+const DECK_ABOVE_SEA = 20;
+
+const LAUNCH_START_FRACTION = 0.3;
+const LAUNCH_END_FRACTION = 0.9;
+
+/**
+ * Find the flight deck by measuring, not by assuming.
+ *
+ * The deck is the largest horizontal surface on the ship. Histogram the AREA
+ * of up-facing triangles by height and take the heaviest bin: the hull sides
+ * are vertical and contribute nothing, and the island is tall but small.
+ * Using the bounding box top instead would put the deck on the mast.
+ */
+export function measureDeckPlane(triangles, binSize = 1) {
+  const bins = new Map();
+  for (let i = 0; i < triangles.length; i += 9) {
+    const ax = triangles[i], ay = triangles[i + 1], az = triangles[i + 2];
+    const bx = triangles[i + 3], by = triangles[i + 4], bz = triangles[i + 5];
+    const cx = triangles[i + 6], cy = triangles[i + 7], cz = triangles[i + 8];
+    // Cross product of two edges: its length is twice the area, and its y
+    // component tells us how much the face points upward.
+    const ux = bx - ax, uy = by - ay, uz = bz - az;
+    const vx = cx - ax, vy = cy - ay, vz = cz - az;
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    const len = Math.hypot(nx, ny, nz);
+    if (len === 0) continue;
+    if (ny / len < 0.85) continue; // not a horizontal, upward face
+    const area = len / 2;
+    const y = (ay + by + cy) / 3;
+    const bin = Math.round(y / binSize);
+    bins.set(bin, (bins.get(bin) ?? 0) + area);
+  }
+  let bestBin = null;
+  let bestArea = 0;
+  for (const [bin, area] of bins) {
+    if (area > bestArea) {
+      bestArea = area;
+      bestBin = bin;
+    }
+  }
+  return bestBin === null ? null : { y: bestBin * binSize, area: bestArea };
+}
+
+export async function loadCarrier(scene) {
+  const report = { ok: false, deckY: 0, runLength: 0 };
+  let gltf;
+  try {
+    gltf = await loadGLTF(CARRIER_URL);
+  } catch (err) {
+    recordFailure("carrier", err && err.message ? err.message : err);
+    // §4/stage 4: fall back to authored offsets on an assumed deck height so
+    // the mission stays flyable, and record that it happened.
+    return { report, group: null, anchors: fallbackAnchors() };
+  }
+
+  const model = gltf.scene;
+  // recentre "xz", NOT "xyz" -- the same trap the terrain fell into. Centring
+  // the hull vertically puts the middle of its BOUNDING BOX at y = 0, and
+  // since that box runs from the keel to the top of the mast, the flight deck
+  // lands 8 m UNDER the sea. The hull is placed by its measured deck instead.
+  const norm = normalise(model, {
+    targetLength: CARRIER_LENGTH,
+    axis: "z",
+    recentre: "xz",
+  });
+  if (!norm.ok) {
+    recordFailure("carrier", norm.reason);
+    return { report, group: null, anchors: fallbackAnchors() };
+  }
+
+  // Which end is the bow? Measured, not guessed: on a carrier the island is
+  // the tallest structure and sits AFT of midships, so the bow is the end
+  // away from the highest point. The launch must run toward -Z (§5), so the
+  // hull is turned if it is facing the other way.
+  let tris = collectTriangles(norm.holder);
+  let highestY = -Infinity;
+  let highestZ = 0;
+  for (let i = 0; i < tris.length; i += 3) {
+    if (tris[i + 1] > highestY) {
+      highestY = tris[i + 1];
+      highestZ = tris[i + 2];
+    }
+  }
+  const islandIsAft = highestZ > 0;
+  if (!islandIsAft) {
+    // Island forward of centre means the model points the other way; turn it.
+    model.rotateY(Math.PI);
+    norm.holder.updateWorldMatrix(true, true);
+    tris = collectTriangles(norm.holder);
+  }
+
+  const deck = measureDeckPlane(tris);
+  const deckInModel = deck ? deck.y : norm.size.y * 0.62;
+  if (!deck) recordFailure("carrier deck", "no horizontal deck surface found");
+  // Float the hull so its measured deck sits at deck height above the sea.
+  const lift = DECK_ABOVE_SEA - deckInModel;
+  const deckY = DECK_ABOVE_SEA;
+
+  // The deck's own extent along the hull, at the measured deck height.
+  let deckMinZ = Infinity;
+  let deckMaxZ = -Infinity;
+  for (let i = 0; i < tris.length; i += 3) {
+    if (Math.abs(tris[i + 1] - deckInModel) > 4) continue;
+    const z = tris[i + 2];
+    if (z < deckMinZ) deckMinZ = z;
+    if (z > deckMaxZ) deckMaxZ = z;
+  }
+  if (!(deckMaxZ > deckMinZ)) {
+    deckMinZ = -CARRIER_LENGTH / 2;
+    deckMaxZ = CARRIER_LENGTH / 2;
+  }
+  const deckLength = deckMaxZ - deckMinZ;
+
+  // Bow is -Z, stern is +Z, so the run goes from high z toward low z.
+  const startZ = deckMaxZ - LAUNCH_START_FRACTION * deckLength;
+  const endZ = deckMaxZ - LAUNCH_END_FRACTION * deckLength;
+
+  norm.holder.position.z = CARRIER_Z;
+  norm.holder.position.y = lift;
+  norm.holder.updateWorldMatrix(true, true);
+
+  const anchors = {
+    deck: { x: 0, y: deckY, z: CARRIER_Z },
+    launchStart: { x: 0, y: deckY, z: CARRIER_Z + startZ },
+    launchEnd: { x: 0, y: deckY, z: CARRIER_Z + endZ },
+    // Astern and below the deck: where stage 7's recovery run begins.
+    approach: { x: 0, y: deckY + 120, z: CARRIER_Z + deckMaxZ + 2400 },
+    runLength: Math.abs(endZ - startZ),
+    deckY,
+    deckLength,
+    measured: true,
+  };
+
+  report.ok = true;
+  report.deckY = deckY;
+  report.deckLength = deckLength;
+  report.runLength = anchors.runLength;
+  report.islandAft = islandIsAft;
+  report.size = { x: norm.size.x, y: norm.size.y, z: norm.size.z };
+
+  scene.add(norm.holder);
+
+  console.log(
+    `carrier: measured ${norm.sourceLength.toFixed(1)} -> ${CARRIER_LENGTH} m ` +
+      `(${norm.size.x.toFixed(1)} beam, ${norm.size.y.toFixed(1)} tall), ` +
+      `island ${islandIsAft ? "aft" : "forward -- hull turned"}`,
+  );
+  console.log(
+    `carrier deck: measured at y=${deckInModel.toFixed(1)} in the model ` +
+      `(${deck ? (deck.area / 1000).toFixed(1) + "k m2 of horizontal surface" : "FALLBACK"}), ` +
+      `hull lifted ${lift.toFixed(1)} m so the deck sits ${deckY} m above the sea; ` +
+      `deck runs z ${deckMinZ.toFixed(1)}..${deckMaxZ.toFixed(1)} (${deckLength.toFixed(1)} m)`,
+  );
+  console.log(
+    `carrier anchors: launchStart z=${anchors.launchStart.z.toFixed(1)}, ` +
+      `launchEnd z=${anchors.launchEnd.z.toFixed(1)}, ` +
+      `RUN ${anchors.runLength.toFixed(1)} m`,
+  );
+
+  return { report, group: norm.holder, anchors };
+}
+
+function fallbackAnchors() {
+  // Authored offsets on an assumed deck height, used only when the asset is
+  // missing. The run is still measured from these two points, so the stroke
+  // solver downstream needs no special case.
+  const deckY = 20;
+  return {
+    deck: { x: 0, y: deckY, z: CARRIER_Z },
+    launchStart: { x: 0, y: deckY, z: CARRIER_Z + 100 },
+    launchEnd: { x: 0, y: deckY, z: CARRIER_Z - 99.7 },
+    approach: { x: 0, y: deckY + 120, z: CARRIER_Z + 2600 },
+    runLength: 199.7,
+    deckY,
+    deckLength: 332.8,
+    measured: false,
+  };
+}
+
 /** Every triangle of an object as a flat world-space Float32Array (9 per tri). */
 export function collectTriangles(root) {
   const out = [];

@@ -50,6 +50,25 @@ import {
 } from "./framing.js";
 import { buildTerrainIndex, createPhysics, heightAtIndex } from "./physics.js";
 import { createDevelopmentRecovery, createNullResponse } from "./collision.js";
+import {
+  EASE,
+  HANDOFF_SPEED,
+  HANDOFF_THROTTLE,
+  ROTATE_PITCH,
+  STROKE_MAX,
+  STROKE_MIN,
+  V0,
+  V1,
+  buildLaunchPlan,
+  createLaunch,
+  deckDwellFor,
+  solveExitSpeed,
+  solveStroke,
+  solveStrokeTime,
+  strokeDistance,
+  strokePosition,
+  strokeSpeed,
+} from "./launch.js";
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -1671,6 +1690,388 @@ function testCollisionPolicies() {
   check("reset without keepPolicy resets the policy", resetCalls === 1);
 }
 
+// ── stage 4: the carrier and the catapult ─────────────────────────────────
+//
+// launch.js imports no three.js, so the curve and both its inverses are
+// exercised here directly. The reference deck is the MEASURED one from the
+// carrier asset: 199.7 m between the two anchors.
+
+const DECK_RUN = 199.68;
+
+const deckAnchors = (run = DECK_RUN, deckY = 20) => ({
+  deck: { x: 0, y: deckY, z: -1600 },
+  launchStart: { x: 0, y: deckY, z: -1533.4 },
+  launchEnd: { x: 0, y: deckY, z: -1533.4 - run },
+  approach: { x: 0, y: deckY + 120, z: -1200 },
+  runLength: run,
+  deckY,
+  deckLength: 332.8,
+  measured: true,
+});
+
+function testStrokeCurve() {
+  // Closed at both ends, and monotonic in between.
+  check("the ease starts at v0", strokeSpeed(0) === V0);
+  check("the ease ends at v1", Math.abs(strokeSpeed(1) - V1) < 1e-9);
+  let previous = -1;
+  let monotonic = true;
+  for (let u = 0; u <= 1.0001; u += 0.01) {
+    const v = strokeSpeed(u);
+    if (v < previous - 1e-12) monotonic = false;
+    previous = v;
+  }
+  check("the ease is monotonic", monotonic);
+  check("the ease clamps outside [0,1]", strokeSpeed(-1) === V0 && strokeSpeed(2) === V1);
+
+  // ACCELERATION INCREASES all the way to the deck edge -- that is the read
+  // the sequence is building to, and it is why the exponent is 1.25 and not
+  // some ease that flattens at the end.
+  const firstTenth = strokeSpeed(0.1) - strokeSpeed(0);
+  const lastTenth = strokeSpeed(1) - strokeSpeed(0.9);
+  check(
+    "the last tenth of the stroke covers more speed than the first",
+    lastTenth > firstTenth,
+    `first ${firstTenth.toFixed(2)} vs last ${lastTenth.toFixed(2)}`,
+  );
+
+  // A t^2 curve would need 3.56 s for this run, which is not "fast" -- assert
+  // the claim the comment makes, so a later edit to the exponent has to face it.
+  check(
+    "a squared ease would need about 3.56 s for the measured run",
+    Math.abs(solveStrokeTime(DECK_RUN, V0, V1, 2) - 3.56) < 0.02,
+    `${solveStrokeTime(DECK_RUN, V0, V1, 2).toFixed(3)} s`,
+  );
+}
+
+function testClosedFormMatchesItsOwnIntegral() {
+  // The closed form must match a NUMERIC integral of the very same curve, to
+  // within a few centimetres. This is the check that catches an algebra slip
+  // in the integral, which would otherwise show up only as a release point
+  // that drifts off the bow.
+  for (const T of [2.2, 2.7733, 3.1]) {
+    let sum = 0;
+    const steps = 20000;
+    for (let i = 0; i < steps; i++) {
+      sum += strokeSpeed((i + 0.5) / steps) * (T / steps);
+    }
+    const closed = strokeDistance(T);
+    check(
+      `closed-form distance matches a numeric integral at T=${T}`,
+      Math.abs(closed - sum) < 0.03,
+      `closed ${closed.toFixed(4)} vs numeric ${sum.toFixed(4)}`,
+    );
+  }
+
+  // strokePosition is the partial integral, so it must land on strokeDistance.
+  const T = 2.7733;
+  check(
+    "strokePosition at t=T equals the whole stroke distance",
+    Math.abs(strokePosition(T, T) - strokeDistance(T)) < 1e-9,
+  );
+  check("strokePosition at t=0 is zero", strokePosition(0, T) === 0);
+  check(
+    "strokePosition is monotonic",
+    (() => {
+      let prev = -1;
+      for (let t = 0; t <= T; t += T / 200) {
+        const s = strokePosition(t, T);
+        if (s < prev - 1e-12) return false;
+        prev = s;
+      }
+      return true;
+    })(),
+  );
+  check("a zero-duration stroke covers nothing", strokePosition(1, 0) === 0);
+}
+
+function testBothInverses() {
+  // solveStrokeTime inverts strokeDistance.
+  for (const d of [90, 150, DECK_RUN, 260]) {
+    const T = solveStrokeTime(d);
+    check(
+      `solveStrokeTime inverts strokeDistance at ${d} m`,
+      Math.abs(strokeDistance(T) - d) < 1e-9,
+      `${strokeDistance(T)}`,
+    );
+  }
+  // solveExitSpeed closes the same geometry from the other side.
+  for (const [d, T] of [[90, 2.2], [DECK_RUN, 2.7733], [400, 3.1]]) {
+    const v1 = solveExitSpeed(d, T);
+    check(
+      `solveExitSpeed closes ${d} m in ${T} s`,
+      Math.abs(strokeDistance(T, V0, v1) - d) < 1e-9,
+      `v1 ${v1.toFixed(2)}`,
+    );
+  }
+  check("solveExitSpeed on a zero duration does not divide by zero", Number.isFinite(solveExitSpeed(100, 0)));
+}
+
+function testSolveAgainstDecks() {
+  // The MEASURED deck solves inside the window and keeps the authored speed.
+  const measured = solveStroke(DECK_RUN);
+  check(
+    "the measured deck solves inside 2.2-3.1 s",
+    measured.time >= STROKE_MIN && measured.time <= STROKE_MAX,
+    `${measured.time.toFixed(4)} s`,
+  );
+  check("the measured deck keeps the authored exit speed", measured.exitSpeed === V1);
+  check("the measured deck is not clamped", measured.clamped === false);
+  check(
+    "the measured deck solves to about 2.77 s",
+    Math.abs(measured.time - 2.7733) < 0.01,
+    `${measured.time}`,
+  );
+  check(
+    "the solved stroke covers the run exactly",
+    Math.abs(strokeDistance(measured.time, V0, measured.exitSpeed) - DECK_RUN) < 1e-6,
+  );
+
+  // A SHORT deck clamps the time and re-solves the SPEED -- the geometry
+  // always closes, because the aircraft must leave at the release point on any
+  // deck, never before it and never past it.
+  const short = solveStroke(90);
+  check("a 90 m deck clamps the time", short.clamped === true);
+  check("a 90 m deck clamps to the minimum", Math.abs(short.time - STROKE_MIN) < 1e-9);
+  check(
+    "a 90 m deck re-solves a lower exit speed",
+    short.exitSpeed < V1,
+    `${short.exitSpeed.toFixed(1)} m/s`,
+  );
+  check(
+    "the short deck still closes exactly",
+    Math.abs(strokeDistance(short.time, V0, short.exitSpeed) - 90) < 1e-9,
+    `${strokeDistance(short.time, V0, short.exitSpeed)}`,
+  );
+
+  // And a very LONG deck clamps the other way.
+  const long = solveStroke(400);
+  check("a 400 m deck clamps to the maximum", Math.abs(long.time - STROKE_MAX) < 1e-9);
+  check("a 400 m deck re-solves a higher exit speed", long.exitSpeed > V1);
+  check(
+    "the long deck still closes exactly",
+    Math.abs(strokeDistance(long.time, V0, long.exitSpeed) - 400) < 1e-9,
+  );
+}
+
+function testDeckDwellIsMeasured() {
+  // The dwell is the start-up recording's own length at its playback rate --
+  // not an authored number. Replace the recording and the wait follows it.
+  check(
+    "a 22.99 s clip at double speed gives an 11.49 s dwell",
+    Math.abs(deckDwellFor(22.99) - 11.495) < 1e-9,
+    `${deckDwellFor(22.99)}`,
+  );
+  check("a longer clip lengthens the dwell", deckDwellFor(30) > deckDwellFor(22));
+  check("a missing clip falls back rather than firing instantly", deckDwellFor(0) > 5);
+
+  const plan = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 22.99 });
+  check("the catapult fires at the end of the dwell", plan.fireAt === plan.dwell);
+  check(
+    "the burner lights before the catapult fires",
+    plan.burnerAt < plan.fireAt && plan.fireAt - plan.burnerAt < 2,
+    `${plan.burnerAt} -> ${plan.fireAt}`,
+  );
+  // The ordering the whole sequence depends on.
+  check(
+    "ordering: fire -> release -> gear up -> handoff",
+    plan.fireAt < plan.releaseAt &&
+      plan.releaseAt < plan.gearUpAt &&
+      plan.gearUpAt < plan.handoffAt,
+    JSON.stringify(plan),
+  );
+  check(
+    "rotation begins before the gear comes up",
+    plan.rotateAt < plan.gearUpAt,
+    `${plan.rotateAt} vs ${plan.gearUpAt}`,
+  );
+}
+
+/** Run the whole scripted sequence at a fixed rate and record what happened. */
+function flyLaunch(hz, run = DECK_RUN) {
+  const anchors = deckAnchors(run);
+  const state = createFlightState();
+  const events = [];
+  const gear = [];
+  const fovs = [];
+  const rig = {
+    reset() {},
+    setShake() {},
+    blend(name, composition) {
+      if (composition.fov !== undefined) fovs.push(composition.fov);
+    },
+  };
+  const launch = createLaunch({
+    anchors,
+    clipSeconds: 22.99,
+    rig,
+    groundOffset: 2.95,
+    setGear: (down) => gear.push(down),
+    onEvent: (name) => events.push(name),
+  });
+  launch.start(state);
+
+  const dt = 1 / hz;
+  let handoffs = 0;
+  let maxAlong = 0;
+  let lateral = 0;
+  let pastRelease = 0;
+  let ticks = 0;
+  const parked = { ...state.position };
+
+  while (ticks < hz * 25) {
+    ticks++;
+    const before = launch.isActive();
+    launch.update(dt, state);
+    if (before && !launch.isActive()) handoffs++;
+    const along = anchors.launchStart.z - state.position.z;
+    if (along > maxAlong) maxAlong = along;
+    lateral = Math.max(lateral, Math.abs(state.position.x - anchors.launchStart.x));
+    if (launch.elapsed() <= launch.plan.releaseAt) {
+      pastRelease = Math.max(pastRelease, along - run);
+    }
+    if (!launch.isActive() && launch.hasHandedOff()) break;
+  }
+  return { launch, state, events, gear, fovs, handoffs, maxAlong, lateral, pastRelease, parked, anchors };
+}
+
+function testLaunchSequence() {
+  for (const hz of [60, 20]) {
+    const r = flyLaunch(hz);
+    check(`${hz} Hz: exactly one handoff`, r.handoffs === 1, `${r.handoffs}`);
+    check(
+      `${hz} Hz: the handoff happens at the planned time`,
+      Math.abs(r.launch.elapsed() - r.launch.plan.handoffAt) < 2 / hz,
+      `${r.launch.elapsed().toFixed(3)} vs ${r.launch.plan.handoffAt.toFixed(3)}`,
+    );
+    check(
+      `${hz} Hz: the stroke never runs past the release point`,
+      r.pastRelease <= 0.001,
+      `overshoot ${r.pastRelease.toFixed(4)} m`,
+    );
+    check(
+      `${hz} Hz: the stroke gets within one frame of the release point`,
+      DECK_RUN - Math.min(r.maxAlong, DECK_RUN) < 1e-6,
+      `reached ${Math.min(r.maxAlong, DECK_RUN).toFixed(4)} of ${DECK_RUN}`,
+    );
+    check(`${hz} Hz: no lateral drift`, r.lateral < 1e-9, `${r.lateral}`);
+    check(
+      `${hz} Hz: seeded at the handoff speed`,
+      Math.abs(r.state.speed - HANDOFF_SPEED) < 1e-9,
+      `${r.state.speed}`,
+    );
+    check(
+      `${hz} Hz: seeded at the handoff throttle, in burner`,
+      r.state.throttle === HANDOFF_THROTTLE && r.state.afterburner === true,
+      `${r.state.throttle}`,
+    );
+    check(
+      `${hz} Hz: nose-up at the handoff`,
+      Math.abs(r.state.pitch - ROTATE_PITCH) < 1e-9,
+      `${r.state.pitch}`,
+    );
+    check(`${hz} Hz: sink is zeroed at the handoff`, r.state.sink === 0);
+    check(
+      `${hz} Hz: the ordering held`,
+      r.events.join(",") === "burner,fire,release,gearUp,handoff",
+      r.events.join(","),
+    );
+    check(
+      `${hz} Hz: gear goes down on the deck and up after the release`,
+      r.gear[0] === true && r.gear[r.gear.length - 1] === false,
+      JSON.stringify(r.gear),
+    );
+  }
+
+  // THE frame-rate independence claim: the release point is computed from the
+  // closed-form integral, so 20 Hz must reach the same place as 60 Hz.
+  const fast = flyLaunch(60);
+  const slow = flyLaunch(20);
+  check(
+    "the release point is frame-rate independent",
+    Math.abs(Math.min(fast.maxAlong, DECK_RUN) - Math.min(slow.maxAlong, DECK_RUN)) < 1e-6,
+    `60 Hz ${fast.maxAlong.toFixed(4)} vs 20 Hz ${slow.maxAlong.toFixed(4)}`,
+  );
+}
+
+function testParkedPose() {
+  const anchors = deckAnchors();
+  const state = createFlightState();
+  const launch = createLaunch({ anchors, clipSeconds: 22.99, groundOffset: 2.95, setGear: () => {} });
+  launch.start(state);
+
+  check("the parked pose sits at the launch start", state.position.z === anchors.launchStart.z);
+  check(
+    "the parked pose sits ON the deck, not in it",
+    Math.abs(state.position.y - (anchors.deckY + 2.95)) < 1e-9,
+    `${state.position.y} vs deck ${anchors.deckY}`,
+  );
+  check("the parked pose is stationary", state.speed === 0);
+  check("the parked pose is level", state.pitch === 0 && state.bank === 0);
+  check(
+    "the parked pose heads along the launch axis",
+    state.heading === 0,
+    `${state.heading}`,
+  );
+
+  // Gear DOWN on the deck -- and the cache is seeded null so the very first
+  // call actually paints (stage 2's rule, exercised end to end here).
+  const gear = [];
+  const s2 = createFlightState();
+  createLaunch({ anchors, clipSeconds: 22.99, setGear: (d) => gear.push(d) }).start(s2);
+  check("gear is put down for the deck", gear[0] === true, JSON.stringify(gear));
+}
+
+function testLaunchCameraBlend() {
+  const r = flyLaunch(60);
+  check("the launch composition was blended in", r.fovs.length > 0);
+  const first = r.fovs[0];
+  const peak = Math.max(...r.fovs);
+  check("FOV opens from the deck value", Math.abs(first - 59) < 1e-9, `${first}`);
+  check("FOV opens toward the exit value", peak > 70 && peak <= 71 + 1e-9, `${peak}`);
+  check(
+    "FOV never opens past a comfortable maximum",
+    peak <= 71 + 1e-9,
+    `${peak}`,
+  );
+  // Weighted by the SQUARE of stroke progress, so it opens rather than drifts:
+  // at half the stroke it should still be near the bottom of the range.
+  const half = r.fovs[Math.floor(r.fovs.length * 0.5)];
+  check(
+    "FOV is still low at the midpoint (squared weighting, not linear)",
+    half < 59 + (71 - 59) * 0.5,
+    `${half}`,
+  );
+}
+
+function testLaunchOwnsTheAircraft() {
+  const anchors = deckAnchors();
+  const state = createFlightState();
+  const launch = createLaunch({ anchors, clipSeconds: 22.99, groundOffset: 2.95, setGear: () => {} });
+  launch.start(state);
+  check("the script owns the aircraft while running", launch.isActive() === true);
+
+  // No flight physics runs during the script: the state is WRITTEN, so a stick
+  // input must change nothing at all.
+  const before = JSON.stringify(state);
+  launch.update(1 / 60, state);
+  const scripted = JSON.stringify(state);
+  const other = createFlightState();
+  const l2 = createLaunch({ anchors, clipSeconds: 22.99, groundOffset: 2.95, setGear: () => {} });
+  l2.start(other);
+  updateFlight(other, stick({ x: 1, y: 1, throttle: 1 }), 0); // dt 0 -> no-op
+  l2.update(1 / 60, other);
+  check(
+    "the script writes the whole state regardless of input",
+    JSON.stringify(other) === scripted,
+    "scripted states diverged",
+  );
+  check("the state did advance", scripted !== before);
+
+  const r = flyLaunch(60);
+  check("the script releases the aircraft after the handoff", r.launch.isActive() === false);
+  check("the handoff is recorded", r.launch.hasHandedOff() === true);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -1706,6 +2107,15 @@ const SUITES = [
   ["fixed physics step", testFixedStep],
   ["safe-state history", testSafeStateHistory],
   ["collision policies", testCollisionPolicies],
+  ["stroke curve", testStrokeCurve],
+  ["closed form vs its own integral", testClosedFormMatchesItsOwnIntegral],
+  ["both stroke inverses", testBothInverses],
+  ["solving against decks", testSolveAgainstDecks],
+  ["deck dwell is measured", testDeckDwellIsMeasured],
+  ["launch sequence at 60 and 20 Hz", testLaunchSequence],
+  ["parked pose", testParkedPose],
+  ["launch camera blend", testLaunchCameraBlend],
+  ["the script owns the aircraft", testLaunchOwnsTheAircraft],
 ];
 
 export function run() {

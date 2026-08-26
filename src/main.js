@@ -5,8 +5,10 @@ import {
   COASTLINE_Z,
   createPlaceholderAircraft,
   createWorld,
+  loadCarrier,
   loadTerrain,
 } from "./world.js";
+import { createLaunch } from "./launch.js";
 import { buildTerrainIndex, createPhysics } from "./physics.js";
 import { benchmarkIndex } from "./physics-benchmark.js";
 import { createDevelopmentRecovery, createNullResponse } from "./collision.js";
@@ -47,6 +49,10 @@ let physicsDebug = null;
 let policies = [];
 let policyIndex = 0;
 let terrainReport = null;
+let carrierAnchors = null;
+let launch = null;
+let anchorHelper = null;
+let launchClipSeconds = null;
 
 loadTerrain(world.scene)
   .then(({ report, group, triangles }) => {
@@ -102,12 +108,68 @@ function installPolicies() {
 }
 installPolicies();
 
+// The carrier and the catapult. Every mode flies the launch (§11), so it is
+// started as soon as both the deck and the airframe are known.
+Promise.all([loadCarrier(world.scene), measureClip("./assets/audio/engine-start.mp3")])
+  .then(([{ anchors, report }, clipSeconds]) => {
+    carrierAnchors = anchors;
+    console.log(
+      `engine start-up measured ${clipSeconds.toFixed(2)} s -> deck dwell ` +
+        `${(clipSeconds / 2).toFixed(2)} s at double speed`,
+    );
+    launchClipSeconds = clipSeconds;
+    anchorHelper = createAnchorHelper(anchors);
+    world.scene.add(anchorHelper);
+    startLaunch(clipSeconds);
+  })
+  .catch((err) => console.error("carrier load failed", err));
+
+/**
+ * The deck dwell is the start-up recording's own length, not an authored
+ * number: the catapult fires on its last note, which makes the wait read as a
+ * countdown rather than a delay. Measuring it here keeps the two coupled
+ * values (§9) derived from one source.
+ */
+function measureClip(url) {
+  return new Promise((resolve) => {
+    const audio = new Audio();
+    audio.preload = "metadata";
+    const done = (v) => resolve(v);
+    audio.addEventListener("loadedmetadata", () => done(audio.duration || 22));
+    // Missing audio is a NORMAL state (§16). Fall back rather than hanging the
+    // whole launch on a file that may not be there.
+    audio.addEventListener("error", () => done(22));
+    setTimeout(() => done(audio.duration || 22), 4000);
+    audio.src = url;
+  });
+}
+
+function startLaunch(clipSeconds) {
+  if (!carrierAnchors) return;
+  launch = createLaunch({
+    anchors: carrierAnchors,
+    clipSeconds,
+    rig,
+    setGear: (down) => airframe?.setGearVisual(down),
+    groundOffset: airframe?.groundOffset() ?? 2.95,
+    onEvent: (name, plan) => console.log(`launch: ${name} at t=${plan[name + "At"] ?? "-"}`),
+  });
+  console.log("launch plan:", JSON.stringify(launch.plan));
+  launch.start(state);
+  // Steering is disabled outright while the script owns the aircraft, rather
+  // than asking the frame loop to remember to ignore the pointer (§7).
+  input.setPointerEnabled(false);
+}
+
 loadAircraft()
   .then((loaded) => {
     world.scene.remove(aircraft);
     aircraft = loaded.group;
     airframe = loaded;
     world.scene.add(aircraft);
+    // The airframe may arrive after the carrier; re-seat the launch so the
+    // parked pose uses the MEASURED wheel offset rather than the fallback.
+    if (launchClipSeconds !== null) startLaunch(launchClipSeconds);
   })
   .catch((err) => console.error("aircraft load failed", err));
 
@@ -131,6 +193,9 @@ window.addEventListener("keydown", (event) => {
     rig.reset(state);
   }
   if (event.code === "KeyP" && physicsDebug) physicsDebug.toggle();
+  if (event.code === "KeyO" && anchorHelper) {
+    anchorHelper.visible = !anchorHelper.visible;
+  }
   if (event.code === "KeyG") {
     // Swap the collision policy live. DETECTION is byte-identical under both;
     // only the response differs, which is the whole point of §4's split.
@@ -174,13 +239,27 @@ function step(now) {
   // A policy can neutralise the stick -- the input that flew into the
   // mountain must not be reapplied on the restore frame. The policy is asked;
   // it never reaches into input.js itself.
-  const gated = physics.getPolicy()?.overridesInput?.() ? NEUTRAL_STICK : axes;
-  updateFlight(state, gated, dt);
+  const scripted = launch?.update(dt, state) ?? false;
+  if (scripted) {
+    // §9: no flight physics runs during the launch, and §17.4 -- a branch that
+    // skips physics.update() must tick the response policy ITSELF, or the game
+    // freezes for the whole eleven seconds on the deck.
+    physics.getPolicy()?.tick(dt);
+  } else {
+    if (launch?.hasHandedOff() && !input.pointerEnabled()) {
+      input.setPointerEnabled(true);
+      // Drop any latch accumulated on the deck, so a key pressed during the
+      // script does not fire on the handoff frame.
+      input.dropLatches();
+    }
+    const gated = physics.getPolicy()?.overridesInput?.() ? NEUTRAL_STICK : axes;
+    updateFlight(state, gated, dt);
 
-  // §8: physics.update() also ticks the installed policy. Any branch that
-  // skips physics has to tick the policy itself, or the game freezes whenever
-  // physics is bypassed.
-  physics.update(dt, state);
+    // §8: physics.update() also ticks the installed policy. Any branch that
+    // skips physics has to tick the policy itself, or the game freezes
+    // whenever physics is bypassed.
+    physics.update(dt, state);
+  }
   physicsDebug?.update(state);
 
   aircraft.position.copy(state.position);
@@ -231,12 +310,39 @@ function paintRail(axes) {
     `POLICY    ${physics.getPolicy()?.name ?? "--"}  (G)`,
     `HISTORY   ${physics.historyLength()} safe states`,
     `COAST     z=${terrainReport?.ok ? terrainReport.nearEdgeZ : "--"}`,
+    `LAUNCH    ${launch ? (launch.isActive() ? `t=${launch.elapsed().toFixed(1)}/${launch.plan.total.toFixed(1)}` : "handed off") : "--"}`,
+    `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
     `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
     `ERRORS    ${errorCount}`,
     // §2: a fallback must be visible, or a build quietly flying the
     // placeholder looks like a build with a badly modelled aircraft.
     `ASSETS    ${assetFailures().length ? assetFailures().map((f) => f.name).join(", ") : "ok"}`,
   ].join("\n");
+}
+
+/** The four measured anchors, drawn on `O`. */
+function createAnchorHelper(anchors) {
+  const group = new THREE.Group();
+  group.visible = false;
+  const colours = { deck: 0x9fd7ff, launchStart: 0x8ef0c8, launchEnd: 0xffd400, approach: 0xff9b7a };
+  for (const [name, colour] of Object.entries(colours)) {
+    const a = anchors[name];
+    if (!a) continue;
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(4, 10, 8),
+      new THREE.MeshBasicMaterial({ color: colour }),
+    );
+    mesh.position.set(a.x, a.y, a.z);
+    group.add(mesh);
+  }
+  // The run itself, so "launched through the deck instead of along it" is
+  // visible rather than inferred.
+  const line = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(anchors.launchStart.x, anchors.launchStart.y, anchors.launchStart.z),
+    new THREE.Vector3(anchors.launchEnd.x, anchors.launchEnd.y, anchors.launchEnd.z),
+  ]);
+  group.add(new THREE.Line(line, new THREE.LineBasicMaterial({ color: 0xffd400 })));
+  return group;
 }
 
 function onResize() {
@@ -264,5 +370,8 @@ if (new URLSearchParams(location.search).has("test")) {
 globalThis.__vector = {
   get state() { return state; },
   get airframe() { return airframe; },
+  get launch() { return launch; },
+  get anchors() { return carrierAnchors; },
+  get physics() { return physics; },
   world, rig, input, THREE,
 };

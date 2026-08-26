@@ -45,6 +45,7 @@ export async function loadAircraft() {
 
   let report = null;
   let model = null;
+  let groundOffset = 2.95;
 
   try {
     const gltf = await loadGLTF(MODEL_URL);
@@ -90,6 +91,12 @@ export async function loadAircraft() {
       );
     }
 
+    // How far the wheels sit below the aircraft's ORIGIN, measured with the
+    // gear down. normalise() recentres the model on its bounding box, so the
+    // origin is the middle of the airframe -- parking it at deck height buries
+    // the lower half in the deck. Measured, because it depends on the model.
+    if (report.box) groundOffset = -report.box.min.y;
+
     gearUp = model.getObjectByName(GEAR_UP_NODE) ?? null;
     gearDown = model.getObjectByName(GEAR_DOWN_NODE) ?? null;
     gearLamp = model.getObjectByName(GEAR_LAMP_NODE) ?? null;
@@ -134,6 +141,8 @@ export async function loadAircraft() {
     group,
     setGearVisual,
     gearIsDown: () => gearCache === true,
+    // Add this to a surface height to park the wheels ON it rather than in it.
+    groundOffset: () => groundOffset,
     loaded: model !== null,
     report,
   };
