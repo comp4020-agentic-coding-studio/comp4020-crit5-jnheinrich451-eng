@@ -141,7 +141,10 @@ export function orientationFromLandmarks(root, { noseNode, downNode }) {
  * normalisation that silently produced the wrong scale looks exactly like a
  * camera bug.
  */
-export function normalise(object, { targetLength, axis = "z", orientation }) {
+export function normalise(
+  object,
+  { targetLength, axis = "z", orientation, recentre = "xyz", verticalScale },
+) {
   const holder = new THREE.Group();
   if (orientation) object.quaternion.copy(orientation);
   holder.add(object);
@@ -156,6 +159,10 @@ export function normalise(object, { targetLength, axis = "z", orientation }) {
 
   const scale = targetLength / sourceLength;
   object.scale.multiplyScalar(scale);
+  // A separate vertical scale, for a heightfield whose relief has to survive
+  // being shrunk horizontally. Still measured (target over measured), never
+  // typed: see loadTerrain for why the two axes cannot share one factor here.
+  if (verticalScale) object.scale.y *= verticalScale;
 
   // Re-measure after scaling and recentre on the origin, so the caller can
   // position the object by its middle rather than by whatever arbitrary point
@@ -163,7 +170,14 @@ export function normalise(object, { targetLength, axis = "z", orientation }) {
   // -52..142 on its own long axis, so its pivot is nowhere near its centre.
   const scaled = new THREE.Box3().setFromObject(holder);
   const centre = scaled.getCenter(new THREE.Vector3());
-  object.position.sub(centre);
+  // Recentring is per-axis on purpose. A heightfield must NOT be recentred
+  // vertically: its own y = 0 is sea level, and sliding that to the middle of
+  // the bounding box puts the shoreline hundreds of metres up a hillside --
+  // which then reads as "the coastline measurement is wrong" rather than as
+  // "the mesh was moved".
+  if (recentre.includes("x")) object.position.x -= centre.x;
+  if (recentre.includes("y")) object.position.y -= centre.y;
+  if (recentre.includes("z")) object.position.z -= centre.z;
 
   const final = new THREE.Box3().setFromObject(holder);
   return {

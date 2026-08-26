@@ -1,7 +1,16 @@
 // The orchestrator: wiring, frame loop, developer rail. CLAUDE.md §3, §17.3.
 
 import * as THREE from "three";
-import { createWorld, createPlaceholderAircraft } from "./world.js";
+import {
+  COASTLINE_Z,
+  createPlaceholderAircraft,
+  createWorld,
+  loadTerrain,
+} from "./world.js";
+import { buildTerrainIndex, createPhysics } from "./physics.js";
+import { benchmarkIndex } from "./physics-benchmark.js";
+import { createDevelopmentRecovery, createNullResponse } from "./collision.js";
+import { createPhysicsDebug } from "./physics-debug.js";
 import { createChaseCamera } from "./chase-camera.js";
 import { createInput } from "./input.js";
 import { loadAircraft } from "./aircraft.js";
@@ -32,6 +41,67 @@ let airframe = null;
 let state = createFlightState();
 rig.reset(state);
 
+// ── terrain, physics, the collision policy ───────────────────────────────
+let physics = createPhysics({});
+let physicsDebug = null;
+let policies = [];
+let policyIndex = 0;
+let terrainReport = null;
+
+loadTerrain(world.scene)
+  .then(({ report, group, triangles }) => {
+    terrainReport = report;
+    if (!report.ok || !triangles) return;
+
+    const index = buildTerrainIndex(triangles);
+    physics = createPhysics({ index });
+
+    // Sanity-check known coordinates and LOG them. A query that returns "no
+    // terrain" where terrain is present is the failure that eats a day: it
+    // does not announce itself, everything downstream just quietly treats the
+    // world as ocean, and every symptom points somewhere else.
+    const probes = [
+      ["just inside the coast", 0, COASTLINE_Z - 500],
+      ["4 km inland", 0, COASTLINE_Z - 4000],
+      ["9 km inland", 0, COASTLINE_Z - 9000],
+      ["offshore (should be sea)", 0, COASTLINE_Z + 3000],
+    ];
+    for (const [label, x, z] of probes) {
+      console.log(
+        `terrain sample ${label}: ground ${physics.groundAt(x, z).toFixed(1)} m, ` +
+          `${physics.isLandAt(x, z) ? "land" : "ocean"}`,
+      );
+    }
+
+    const meshes = [];
+    group.traverse((n) => n.isMesh && meshes.push(n));
+    // MUST update world matrices first. The terrain is shifted into place
+    // AFTER its triangles are snapshotted, and THREE.Raycaster reads
+    // matrixWorld -- so without this the raycaster tests the mesh at its
+    // pre-shift position, 22.6 km away. That is what made the first
+    // agreement run report 0/15 and "raycaster missed 45": the benchmark was
+    // comparing two different worlds, not two different algorithms.
+    world.scene.updateMatrixWorld(true);
+    benchmarkIndex(index, meshes);
+
+    installPolicies();
+    physicsDebug = createPhysicsDebug(world.scene, physics);
+  })
+  .catch((err) => console.error("terrain load failed", err));
+
+function installPolicies() {
+  policies = [
+    createDevelopmentRecovery({
+      physics,
+      getState: () => state,
+      onEvent: (e) => console.log(`collision policy: ${e.kind}`, e.event.type),
+    }),
+    createNullResponse(),
+  ];
+  physics.setPolicy(policies[policyIndex]);
+}
+installPolicies();
+
 loadAircraft()
   .then((loaded) => {
     world.scene.remove(aircraft);
@@ -60,8 +130,15 @@ window.addEventListener("keydown", (event) => {
     input.clear();
     rig.reset(state);
   }
-  // `G` swaps collision policies (stage 3) and `O` draws the carrier anchors
-  // (stage 4); both land with the systems they belong to.
+  if (event.code === "KeyP" && physicsDebug) physicsDebug.toggle();
+  if (event.code === "KeyG") {
+    // Swap the collision policy live. DETECTION is byte-identical under both;
+    // only the response differs, which is the whole point of §4's split.
+    policyIndex = (policyIndex + 1) % policies.length;
+    physics.setPolicy(policies[policyIndex]);
+    console.log(`collision policy -> ${policies[policyIndex].name}`);
+  }
+  // `O` draws the carrier anchors (stage 4), with the system it belongs to.
 });
 
 // The frame loop. §17.3 and stage 1's rule 1: schedule the NEXT frame FIRST,
@@ -94,15 +171,17 @@ function step(now) {
     rig.reset(state);
   }
 
-  updateFlight(state, axes, dt);
+  // A policy can neutralise the stick -- the input that flew into the
+  // mountain must not be reapplied on the restore frame. The policy is asked;
+  // it never reaches into input.js itself.
+  const gated = physics.getPolicy()?.overridesInput?.() ? NEUTRAL_STICK : axes;
+  updateFlight(state, gated, dt);
 
-  // Stage 1 has no terrain, so the only floor is the ocean. Stage 3 replaces
-  // this with real probes and a collision policy; until then, clamp rather
-  // than let the aircraft fly under the water where nothing is visible.
-  if (state.position.y < 30) {
-    state.position.y = 30;
-    state.sink = 0;
-  }
+  // §8: physics.update() also ticks the installed policy. Any branch that
+  // skips physics has to tick the policy itself, or the game freezes whenever
+  // physics is bypassed.
+  physics.update(dt, state);
+  physicsDebug?.update(state);
 
   aircraft.position.copy(state.position);
   aircraft.quaternion.set(
@@ -123,7 +202,10 @@ function step(now) {
   }
 }
 
+const NEUTRAL_STICK = { x: 0, y: 0, roll: 0, throttle: 0 };
+
 const deg = (r) => ((r * 180) / Math.PI).toFixed(1);
+const m = (v) => (Number.isFinite(v) ? v.toFixed(0) + " m" : "--");
 
 function paintRail(axes) {
   const held = input.heldKeys();
@@ -143,6 +225,12 @@ function paintRail(axes) {
     // A stuck axis is invisible in every other readout; this is the line that
     // makes it obvious. §7.
     `KEYS      ${held.length ? held.join(" ") : "--"}`,
+    `CLEAR     ${m(physics.telemetry.clearance)}  (${physics.telemetry.closest})`,
+    `AGL       ${m(physics.telemetry.agl)}  over ${physics.telemetry.surface}`,
+    `FWD HAZ   ${m(physics.telemetry.forwardHazard)}${physics.telemetry.forwardImminent ? "  IMMINENT" : ""}`,
+    `POLICY    ${physics.getPolicy()?.name ?? "--"}  (G)`,
+    `HISTORY   ${physics.historyLength()} safe states`,
+    `COAST     z=${terrainReport?.ok ? terrainReport.nearEdgeZ : "--"}`,
     `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
     `ERRORS    ${errorCount}`,
     // §2: a fallback must be visible, or a build quietly flying the

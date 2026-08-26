@@ -48,6 +48,8 @@ import {
   horizontalFov,
   widenForAspect,
 } from "./framing.js";
+import { buildTerrainIndex, createPhysics, heightAtIndex } from "./physics.js";
+import { createDevelopmentRecovery, createNullResponse } from "./collision.js";
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -1337,6 +1339,338 @@ function testMarkingViewports() {
   );
 }
 
+// ── stage 3: terrain index, probes, collision policy ──────────────────────
+//
+// physics.js imports no three.js precisely so this can run headlessly. The
+// terrain here is a SYNTHETIC ridge whose height is known in closed form, so
+// every query has an answer that does not come from the code under test --
+// §17.13, a test double that diverges from the real thing tests nothing, and
+// the double here is the terrain, not the index.
+
+// A ridge running along X, peaking at z = ridgeZ. Two triangles per quad.
+function makeRidge({ ridgeZ = 0, peak = 600, halfWidth = 2000, extent = 6000, step = 250 } = {}) {
+  const heightAt = (z) => {
+    const d = Math.abs(z - ridgeZ);
+    return d >= halfWidth ? 0 : peak * (1 - d / halfWidth);
+  };
+  const tris = [];
+  for (let x = -extent; x < extent; x += step) {
+    for (let z = -extent; z < extent; z += step) {
+      const x1 = x + step;
+      const z1 = z + step;
+      const a = [x, heightAt(z), z];
+      const b = [x1, heightAt(z), z];
+      const c = [x1, heightAt(z1), z1];
+      const d = [x, heightAt(z1), z1];
+      tris.push(...a, ...b, ...c, ...a, ...c, ...d);
+    }
+  }
+  return { triangles: new Float32Array(tris), heightAt };
+}
+
+function testTerrainIndex() {
+  const { triangles, heightAt } = makeRidge();
+  const index = buildTerrainIndex(triangles);
+
+  check("the index builds", index !== null && index.triCount > 0, `${index?.triCount}`);
+  check(
+    "cell occupancy lands near the figure §8 quotes",
+    index.perCell > 4 && index.perCell < 20,
+    `${index.perCell.toFixed(1)} per cell`,
+  );
+
+  // THE check that catches a broken index: agreement with an independently
+  // known answer, over the whole surface rather than at one lucky point.
+  let worst = 0;
+  let misses = 0;
+  for (let i = 0; i < 400; i++) {
+    // A deterministic spread -- a sampler using Math.random cannot be
+    // compared against its own previous run.
+    const x = -5900 + ((i * 613) % 11800);
+    const z = -5900 + ((i * 397) % 11800);
+    const got = heightAtIndex(index, x, z);
+    if (got === null) {
+      misses++;
+      continue;
+    }
+    worst = Math.max(worst, Math.abs(got - heightAt(z)));
+  }
+  check("the index never misses inside its own bounds", misses === 0, `${misses} misses`);
+  check(
+    "the index agrees with the known surface everywhere sampled",
+    worst < 1e-3,
+    `worst ${worst}`,
+  );
+
+  // Outside the mesh must be null, NOT zero. "No terrain here" and "the ground
+  // is at sea level" are different facts, and collapsing them is how a query
+  // failure disguises itself as open ocean.
+  check(
+    "outside the mesh returns null, not a height",
+    heightAtIndex(index, 99999, 0) === null &&
+      heightAtIndex(index, 0, 99999) === null,
+  );
+  check("a null index answers null", heightAtIndex(null, 0, 0) === null);
+
+  // The peak of the ridge is where relief matters most.
+  check(
+    "the ridge peak reads its full height",
+    Math.abs(heightAtIndex(index, 0, 0) - 600) < 1e-3,
+    `${heightAtIndex(index, 0, 0)}`,
+  );
+}
+
+function testProbesAndClearance() {
+  const { triangles, heightAt } = makeRidge();
+  const index = buildTerrainIndex(triangles);
+  const physics = createPhysics({ index });
+
+  // groundAt clamps to sea level, so flat water reads 0 rather than null.
+  check("ground over the ridge is the ridge", Math.abs(physics.groundAt(0, 0) - 600) < 1e-3);
+  check("ground off the ridge is sea level", physics.groundAt(0, 5000) === 0);
+  check("land is reported as land", physics.isLandAt(0, 0) === true);
+  check("sea is reported as sea", physics.isLandAt(0, 5000) === false);
+  check(
+    "ground outside the mesh falls back to sea level",
+    physics.groundAt(99999, 0) === 0 && physics.isLandAt(99999, 0) === false,
+  );
+
+  // All five probes must be queried, and the reported minimum must be the
+  // actual minimum -- a centre-only probe misses a wing tip on a ridge.
+  const state = createFlightState({ position: { x: 0, y: 900, z: 0 } });
+  physics.update(1 / 60, state);
+  check("all five probes are placed", physics.probes.length === 5);
+  const clearances = physics.probes.map((p) => p.clearance);
+  check(
+    "the reported clearance is the actual minimum across probes",
+    Math.abs(physics.telemetry.clearance - Math.min(...clearances)) < 1e-9,
+    `${physics.telemetry.clearance} vs ${Math.min(...clearances)}`,
+  );
+  check(
+    "the closest probe is named",
+    physics.probes.some((p) => p.name === physics.telemetry.closest),
+  );
+  check(
+    "AGL over the ridge is altitude minus the ridge",
+    Math.abs(physics.telemetry.agl - (900 - 600)) < 1e-3,
+    `${physics.telemetry.agl}`,
+  );
+  check("the surface under the ridge reads land", physics.telemetry.surface === "land");
+
+  // Bank the aircraft and a wing tip becomes the closest probe -- which is
+  // the entire reason there are five of them.
+  const banked = createFlightState({ position: { x: 0, y: 900, z: 0 } });
+  fly(banked, stick({ x: 1 }), 3);
+  const p2 = createPhysics({ index });
+  p2.update(1 / 60, banked);
+  check(
+    "a banked aircraft brings a wing tip closest",
+    p2.telemetry.closest === "wingL" || p2.telemetry.closest === "wingR",
+    p2.telemetry.closest,
+  );
+
+  // Over open water, AGL is altitude.
+  const atSea = createFlightState({ position: { x: 0, y: 400, z: 5000 } });
+  const p3 = createPhysics({ index });
+  p3.update(1 / 60, atSea);
+  check("AGL over the sea is the altitude", Math.abs(p3.telemetry.agl - 400) < 1e-3);
+  check("the surface over water reads ocean", p3.telemetry.surface === "ocean");
+}
+
+function testFixedStep() {
+  // Physics must advance the same number of ticks per second of SIMULATED
+  // time regardless of the render rate, or every tuned rate in the project
+  // becomes frame-rate dependent.
+  const counts = [];
+  for (const hz of [60, 20, 144]) {
+    const physics = createPhysics({});
+    const state = createFlightState({ position: { x: 0, y: 3000, z: 0 } });
+    const dt = 1 / hz;
+    for (let t = 0; t < 2; t += dt) physics.update(dt, state);
+    counts.push(physics.telemetry.ticks);
+  }
+  check(
+    "physics ticks match across 60, 20 and 144 Hz render rates",
+    Math.max(...counts) - Math.min(...counts) <= 2,
+    `ticks ${counts.join(", ")}`,
+  );
+  check(
+    "two seconds is about 120 physics ticks",
+    Math.abs(counts[0] - 120) <= 2,
+    `${counts[0]}`,
+  );
+}
+
+function testSafeStateHistory() {
+  const { triangles } = makeRidge();
+  const index = buildTerrainIndex(triangles);
+
+  // Well clear: history fills.
+  const high = createPhysics({ index });
+  const highState = createFlightState({ position: { x: 0, y: 4000, z: 5000 } });
+  for (let t = 0; t < 1; t += 1 / 60) high.update(1 / 60, highState);
+  check("safe flight records history", high.historyLength() > 30, `${high.historyLength()}`);
+
+  // Low over the ridge at speed: the threshold is speed-scaled, so the same
+  // clearance that is comfortable at 110 m/s records nothing at 250.
+  const low = createPhysics({ index });
+  const lowState = createFlightState({
+    position: { x: 0, y: 640, z: 0 },
+    speed: 250,
+  });
+  for (let t = 0; t < 1; t += 1 / 60) low.update(1 / 60, lowState);
+  check(
+    "flight too close to the ground records nothing",
+    low.historyLength() === 0,
+    `${low.historyLength()}`,
+  );
+
+  // reset() clears the history.
+  high.reset(highState);
+  check("reset clears the history", high.historyLength() === 0);
+
+  // The rewind target is OLD, not the newest entry -- the newest sits one
+  // query before the impact and restoring it re-flies the same crash.
+  const p = createPhysics({ index });
+  const s = createFlightState({ position: { x: 0, y: 4000, z: 6000 }, speed: 170 });
+  // Actually FLY it. physics.update() queries and records; it does not move
+  // the aircraft, so a version of this that only ticked physics compared a
+  // snapshot against an identical present and measured a distance of zero.
+  for (let t = 0; t < 2; t += 1 / 60) {
+    updateFlight(s, stick(), 1 / 60);
+    p.update(1 / 60, s);
+  }
+  const target = p.rewindTarget();
+  check("there is a rewind target", target !== null);
+  check(
+    "the rewind target is about 0.65 s behind, not the newest state",
+    target && Math.abs(target.position.z - s.position.z) > 170 * 0.4,
+    `dz ${target ? Math.abs(target.position.z - s.position.z).toFixed(0) : "-"}`,
+  );
+  check("an empty history has no rewind target", createPhysics({}).rewindTarget() === null);
+}
+
+function testCollisionPolicies() {
+  const { triangles } = makeRidge();
+  const index = buildTerrainIndex(triangles);
+
+  // ── the development policy: rewinds a contact, dodges a prediction ──
+  let state = createFlightState({ position: { x: 0, y: 4000, z: 6000 }, speed: 170 });
+  const physics = createPhysics({ index });
+  const events = [];
+  const dev = createDevelopmentRecovery({
+    physics,
+    getState: () => state,
+    onEvent: (e) => events.push(e.kind),
+  });
+  physics.setPolicy(dev);
+  check("the policy names itself", dev.name === "DevelopmentRecoveryResponse");
+
+  // Fly level and safe first so there is something to rewind INTO.
+  for (let t = 0; t < 2; t += 1 / 60) physics.update(1 / 60, state);
+  const safeZ = state.position.z;
+  check("history filled before the impact", physics.historyLength() > 30);
+
+  // Now put it inside the ridge: a real contact.
+  state.position.x = 0;
+  state.position.z = 0;
+  state.position.y = 601;
+  physics.update(1 / 60, state);
+  check("a contact triggers a recovery", events.includes("recover"), events.join(","));
+  check(
+    "the rewind caps speed",
+    state.speed <= 160 + 1e-9,
+    `${state.speed}`,
+  );
+  check("the rewind lands in flyable air", state.position.y > physics.groundAt(state.position.x, state.position.z) + 20,
+    `y ${state.position.y} ground ${physics.groundAt(state.position.x, state.position.z)}`);
+  check("the grace period neutralises input", dev.overridesInput() === true);
+  check("the rewind clears the history it came from", physics.historyLength() === 0);
+
+  // The grace expires.
+  for (let t = 0; t < 1; t += 1 / 60) dev.tick(1 / 60);
+  check("the grace period expires", dev.overridesInput() === false);
+
+  // A PREDICTION is dodged, not rewound: the impact has not happened.
+  const dodgeState = createFlightState({ position: { x: 0, y: 4000, z: 4000 }, speed: 200 });
+  const p2 = createPhysics({ index });
+  const kinds = [];
+  const dev2 = createDevelopmentRecovery({
+    physics: p2,
+    getState: () => dodgeState,
+    onEvent: (e) => kinds.push(e.kind),
+  });
+  p2.setPolicy(dev2);
+  const handled = dev2.handleCollision({
+    type: "terrain", predicted: true, position: { ...dodgeState.position },
+    speed: 200, clearance: 400, hazard: 90, probe: "nose", at: 1,
+  });
+  check("a prediction is handled", handled === true);
+  check("a prediction dodges rather than rewinding", kinds.includes("dodge") && !kinds.includes("recover"), kinds.join(","));
+  check("the dodge is running", dev2.isDodging() === true);
+  const pitchBefore = dodgeState.pitch;
+  for (let t = 0; t < 0.3; t += 1 / 60) dev2.tick(1 / 60);
+  check("the dodge commands a climb", dodgeState.pitch > pitchBefore, `${dodgeState.pitch}`);
+  check("a dodge does NOT neutralise input", dev2.overridesInput() === false);
+
+  // ── the null policy: declines, and physics still sets its own cooldown ──
+  const p3 = createPhysics({ index });
+  const nul = createNullResponse();
+  p3.setPolicy(nul);
+  const declining = createFlightState({ position: { x: 0, y: 601, z: 0 }, speed: 170 });
+  p3.update(1 / 60, declining);
+  check("a declined event still sets physics' own cooldown", p3.cooldown() > 0, `${p3.cooldown()}`);
+  check("the null policy recorded the decline", nul.stats().declined > 0);
+
+  // ── the swap: DETECTION must be byte-identical under both policies ──
+  const runDetection = (policy) => {
+    const s = createFlightState({ position: { x: 0, y: 700, z: 1500 }, speed: 200 });
+    const ph = createPhysics({ index });
+    ph.setPolicy(policy);
+    const seen = [];
+    for (let t = 0; t < 1.2; t += 1 / 60) {
+      ph.update(1 / 60, s);
+      seen.push(
+        `${ph.telemetry.contact ? 1 : 0}${ph.telemetry.forwardImminent ? 1 : 0}`,
+      );
+      // Hold the aircraft still so the two runs see identical geometry.
+      s.position.x = 0;
+      s.position.y = 700;
+      s.position.z = 1500;
+    }
+    return seen.join("");
+  };
+  const underNull = runDetection(createNullResponse());
+  const underDev = runDetection(
+    createDevelopmentRecovery({
+      physics: createPhysics({ index }),
+      getState: () => createFlightState(),
+    }),
+  );
+  check(
+    "detection is byte-identical under both policies",
+    underNull === underDev,
+    `${underNull.slice(0, 24)} vs ${underDev.slice(0, 24)}`,
+  );
+
+  // keepPolicy: a policy performing a restore must not cancel its own fade.
+  const p4 = createPhysics({ index });
+  let resetCalls = 0;
+  p4.setPolicy({
+    name: "counter",
+    handleCollision: () => true,
+    tick() {},
+    reset() {
+      resetCalls++;
+    },
+    overridesInput: () => false,
+  });
+  p4.reset(null, { keepPolicy: true });
+  check("reset with keepPolicy leaves the policy alone", resetCalls === 0);
+  p4.reset(null);
+  check("reset without keepPolicy resets the policy", resetCalls === 1);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -1367,6 +1701,11 @@ const SUITES = [
   ["mode change", testModeChange],
   ["pitch convention", testPitchConvention],
   ["marking viewports", testMarkingViewports],
+  ["terrain index", testTerrainIndex],
+  ["probes and clearance", testProbesAndClearance],
+  ["fixed physics step", testFixedStep],
+  ["safe-state history", testSafeStateHistory],
+  ["collision policies", testCollisionPolicies],
 ];
 
 export function run() {

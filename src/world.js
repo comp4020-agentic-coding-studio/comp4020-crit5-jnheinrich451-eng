@@ -5,6 +5,7 @@
 // this is the only place the scale of the world is decided.
 
 import * as THREE from "three";
+import { loadGLTF, normalise, recordFailure } from "./assets.js";
 
 export const OCEAN_EXTENT = 100000; // 100 km square
 export const CAMERA_NEAR = 0.5;
@@ -279,6 +280,168 @@ export function createWorld(canvas) {
     update,
     render: () => renderer.render(scene, camera),
   };
+}
+
+// ── terrain (stage 3) ──────────────────────────────────────────────────────
+
+export const TERRAIN_ACROSS = 30000; // 30 km, §5
+export const TERRAIN_PEAK = 643;  // §5, the target for the vertical scale
+export const COASTLINE_Z = -7600; // where the measured near edge is placed
+const TERRAIN_URL = "./models/terrain/scene.gltf";
+
+/**
+ * Load the heightfield, normalise it from measured bounds, and position it so
+ * its MEASURED coastline lands on COASTLINE_Z.
+ *
+ * §5: nothing hardcodes a world coordinate. -7600 is where the coast is *put*,
+ * not where the mesh happens to end -- the mesh carries seabed well past the
+ * waterline, so the bounding-box edge is not the coast. The report publishes
+ * what was actually measured, because the mission route, the SAM placement and
+ * the distance-to-coast readout all derive from it.
+ */
+export async function loadTerrain(scene) {
+  const report = {
+    ok: false,
+    nearEdgeZ: COASTLINE_Z,
+    across: TERRAIN_ACROSS,
+    peakAboveSea: 0,
+    verticalRange: 0,
+    triangles: 0,
+  };
+
+  let gltf;
+  try {
+    gltf = await loadGLTF(TERRAIN_URL);
+  } catch (err) {
+    recordFailure("terrain", err && err.message ? err.message : err);
+    console.warn("terrain missing -- the game stays playable over open water");
+    return { report, group: null };
+  }
+
+  const model = gltf.scene;
+  // Already Y-up with its long axis on Z (verified by composing the file's
+  // node matrices, not by reading raw accessors -- that mistake is what made
+  // the F-15 fly knife-edge). So no orientation correction, and the axis that
+  // gets normalised is the longest horizontal one.
+  //
+  // recentre "xz", NOT "xyz": this mesh carries real bathymetry, and its own
+  // y = 0 is sea level. Sliding that to the middle of the bounding box put
+  // the shoreline 321 m up a hillside and made the coast measurement below
+  // meaningless -- the samples then reported "land" three kilometres out to
+  // sea and every number after it was quietly wrong.
+  const norm = normalise(model, {
+    targetLength: TERRAIN_ACROSS,
+    axis: "z",
+    recentre: "xz",
+  });
+  if (!norm.ok) {
+    recordFailure("terrain", norm.reason);
+    return { report, group: null };
+  }
+
+  // The vertical scale is SEPARATE, and measured rather than typed.
+  //
+  // §5 asks for three things at once -- 30 km across, ~643 m peak above sea,
+  // ~2595 m total range -- and this asset cannot give all three under one
+  // uniform factor: shrinking Ireland's 486 km to 30 km also flattens its
+  // relief by the same 16x, leaving a 292 m peak and terrain with nothing to
+  // hide behind. Relief is not decoration here: §13's whole SAM mechanic is
+  // line-of-sight, and §10 surveys the route by looking for passes between
+  // flanks. So the horizontal scale comes from the 30 km target and the
+  // vertical from the 643 m one, each measured against what the mesh actually
+  // is. The ratio is reported, not assumed.
+  const peakBefore = norm.box.max.y;
+  const verticalScale = peakBefore > 0 ? TERRAIN_PEAK / peakBefore : 1;
+  model.scale.y *= verticalScale;
+  model.updateWorldMatrix(true, true);
+
+  // Collect world-space triangles once. They are needed for the coastline
+  // measurement here and for the grid index in physics.js, and walking the
+  // geometry twice would double the only expensive part of the load.
+  model.updateWorldMatrix(true, true);
+  const tris = collectTriangles(norm.holder);
+  report.triangles = tris.length / 9;
+
+  // Sea level is the model's own y = 0. Measure the coast as the largest z at
+  // which the surface is still above water -- NOT the bounding-box edge.
+  let coastZ = -Infinity;
+  let peak = -Infinity;
+  let lowest = Infinity;
+  for (let i = 0; i < tris.length; i += 3) {
+    const y = tris[i + 1];
+    const z = tris[i + 2];
+    if (y > peak) peak = y;
+    if (y < lowest) lowest = y;
+    if (y >= 0 && z > coastZ) coastZ = z;
+  }
+  if (!(coastZ > -Infinity)) coastZ = norm.box.max.z;
+
+  const shiftZ = COASTLINE_Z - coastZ;
+  norm.holder.position.z += shiftZ;
+  for (let i = 2; i < tris.length; i += 3) tris[i] += shiftZ;
+
+  report.ok = true;
+  report.nearEdgeZ = COASTLINE_Z;
+  report.measuredCoastZ = coastZ;
+  report.shiftZ = shiftZ;
+  report.peakAboveSea = peak;
+  report.seabed = lowest;
+  report.verticalRange = peak - lowest;
+  report.extent = { x: norm.size.x, y: norm.size.y * verticalScale, z: norm.size.z };
+  report.scale = norm.scale;
+  report.verticalScale = verticalScale;
+  report.exaggeration = verticalScale;
+
+  scene.add(norm.holder);
+
+  console.log(
+    `terrain: ${report.triangles.toLocaleString()} tris, ` +
+      `${(norm.size.x / 1000).toFixed(1)} x ${(norm.size.z / 1000).toFixed(1)} km, ` +
+      `peak ${peak.toFixed(0)} m above sea, seabed ${lowest.toFixed(0)} m, ` +
+      `range ${report.verticalRange.toFixed(0)} m`,
+  );
+  console.log(
+    `terrain scale: horizontal ${norm.scale.toExponential(3)} from the 30 km ` +
+      `target, vertical x${verticalScale.toFixed(2)} on top of it from the ` +
+      `${TERRAIN_PEAK} m peak target (peak measured ${peakBefore.toFixed(0)} m before)`,
+  );
+  console.log(
+    `terrain: coast measured at z=${coastZ.toFixed(0)}, shifted ${shiftZ.toFixed(0)} m ` +
+      `to put it on z=${COASTLINE_Z}`,
+  );
+  // §5 also quotes ~2595 m total range. That is NOT the target here -- the
+  // peak is -- so say plainly where the asset lands rather than letting a
+  // quiet mismatch turn into "the SAM ridges are wrong" three stages later.
+  if (Math.abs(report.verticalRange - 2595) > 400) {
+    console.warn(
+      `terrain: total range ${report.verticalRange.toFixed(0)} m against the ` +
+        `~2595 m §5 quotes. The peak is on target at ${peak.toFixed(0)} m; the ` +
+        `difference is all bathymetry, which nothing in the game can reach.`,
+    );
+  }
+
+  return { report, group: norm.holder, triangles: tris };
+}
+
+/** Every triangle of an object as a flat world-space Float32Array (9 per tri). */
+export function collectTriangles(root) {
+  const out = [];
+  const v = new THREE.Vector3();
+  root.updateWorldMatrix(true, true);
+  root.traverse((node) => {
+    if (!node.isMesh || !node.geometry) return;
+    const geom = node.geometry;
+    const pos = geom.attributes.position;
+    if (!pos) return;
+    const index = geom.index;
+    const count = index ? index.count : pos.count;
+    for (let i = 0; i < count; i++) {
+      const vi = index ? index.getX(i) : i;
+      v.fromBufferAttribute(pos, vi).applyMatrix4(node.matrixWorld);
+      out.push(v.x, v.y, v.z);
+    }
+  });
+  return new Float32Array(out);
 }
 
 // A stand-in airframe for stage 1, superseded by the normalised F-15E glTF in
