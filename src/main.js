@@ -9,6 +9,14 @@ import {
   loadTerrain,
 } from "./world.js";
 import { createLaunch } from "./launch.js";
+import { createWeapons } from "./weapons.js";
+import { createDrone, damageTarget } from "./enemy.js";
+import { createTargeting, LOCK } from "./targeting.js";
+import { AIM9, createMissileSystem } from "./missile.js";
+import { createGun, leadSolution } from "./gun.js";
+import { createCombatHud } from "./combat-hud.js";
+import { createCombatFx } from "./combat-fx.js";
+import { quatForward } from "./flight.js";
 import { buildTerrainIndex, createPhysics } from "./physics.js";
 import { benchmarkIndex } from "./physics-benchmark.js";
 import { createDevelopmentRecovery, createNullResponse } from "./collision.js";
@@ -59,6 +67,49 @@ let carrierAnchors = null;
 let launch = null;
 let anchorHelper = null;
 let launchClipSeconds = null;
+
+// ── combat (stage 5) ─────────────────────────────────────────────────────
+let weapons = null;
+let weapon = "AIM-9";
+const drone = createDrone({ centre: { x: 700, y: 950, z: -4600 } });
+const targeting = createTargeting();
+const fx = createCombatFx(world.scene);
+const hud = createCombatHud(document.body, world.camera);
+let clock = 0;
+
+const gun = createGun({
+  onHit: (target, damage, at) => {
+    if (damageTarget(target, damage, at)) onKill(target);
+  },
+  addShake: (a) => rig.addShake(a),
+});
+
+const missiles = createMissileSystem({
+  // The single counter-measure hook (§14). Nothing is attached yet -- stages 6
+  // and 8 hang the barrel roll, terrain masking and flares here, and the
+  // missile never learns what any of them are.
+  authorityFor: () => 1,
+  onEvent: (event) => {
+    if (event.kind === "hit") {
+      fx.burst(event.round.position, 30);
+      if (damageTarget(event.target, event.round.config.damage, clock)) {
+        onKill(event.target);
+      }
+    }
+  },
+});
+
+function onKill(target) {
+  fx.burst(target.position, 46);
+  // Clearing the lock on a kill is what stops the bracket sitting on a corpse.
+  targeting.clear();
+  message = `${target.label} DESTROYED`;
+  messageUntil = clock + 2.4;
+}
+
+let message = "";
+let messageUntil = 0;
+let threat = "";
 
 loadTerrain(world.scene)
   .then(({ report, group, triangles }) => {
@@ -161,6 +212,15 @@ function measureClip(url) {
 function restartSortie() {
   state = createFlightState();
   physics.reset(state);
+  // reset() reloads; clearFx() cleans up. They are separate for exactly this
+  // reason -- a restart wants both, a phase change wants only one.
+  gun.reset();
+  gun.clearFx();
+  missiles.clear();
+  fx.clear();
+  targeting.clear();
+  weapons?.reload();
+  drone.reset();
   if (launchClipSeconds !== null && carrierAnchors) startLaunch(launchClipSeconds);
   else rig.reset(state);
 }
@@ -189,6 +249,9 @@ loadAircraft()
     aircraft = loaded.group;
     airframe = loaded;
     world.scene.add(aircraft);
+    createWeapons(aircraft).then((w) => {
+      weapons = w;
+    });
     // The airframe may arrive after the carrier; re-seat the launch so the
     // parked pose uses the MEASURED wheel offset rather than the fallback.
     if (launchClipSeconds !== null) startLaunch(launchClipSeconds);
@@ -215,6 +278,7 @@ window.addEventListener("keydown", (event) => {
     rig.reset(state);
   }
   if (event.code === "KeyP" && physicsDebug) physicsDebug.toggle();
+  if (event.code === "KeyJ") hud.setVisible(!hud.isVisible());
   if (event.code === "KeyO" && anchorHelper) {
     anchorHelper.visible = !anchorHelper.visible;
   }
@@ -294,8 +358,83 @@ function step(now) {
     state.quat.w,
   );
 
+  // ── combat ─────────────────────────────────────────────────────────────
+  clock += dt;
+  drone.update(dt);
+
+  const forward = quatForward(state.quat);
+  const observer = { position: state.position, forward };
+  // An empty candidate list is how targeting is switched OFF (§5) -- there is
+  // deliberately no enabled flag, so the launch script simply offers nothing.
+  const candidates = !scripted && drone.target.alive ? [drone.target] : [];
+  const track = targeting.update(dt, candidates, observer);
+
+  if (!scripted && input.consumeLatch("weapon")) {
+    weapon = weapon === "AIM-9" ? "GUN" : "AIM-9";
+  }
+
+  const firing = !scripted && input.isFiring();
+  const lead =
+    track.currentTarget && weapon === "GUN"
+      ? leadSolution(state.position, track.currentTarget).point
+      : null;
+
+  if (weapon === "GUN") {
+    gun.update(dt, {
+      firing,
+      origin: state.position,
+      forward,
+      candidates,
+      now: clock,
+    });
+  } else if (firing && track.lockState === LOCK && weapons && weapons.count > 0) {
+    const released = weapons.release();
+    if (released) {
+      missiles.fire({
+        config: AIM9,
+        owner: "player",
+        position: released.position,
+        direction: forward,
+        speed: state.speed,
+        target: track.currentTarget,
+      });
+      message = "MISSILE AWAY";
+      messageUntil = clock + 1.6;
+    }
+  }
+
+  missiles.update(dt, clock);
+  fx.syncMissiles(missiles.rounds);
+  fx.syncTracers(gun.tracers);
+  fx.update(dt);
+  updateDroneMesh();
+
   rig.update(dt, state);
   world.update(dt, state);
+
+  if (clock > messageUntil) message = "";
+  if (hud.isVisible()) {
+    hud.update(dt, {
+      speed: state.speed,
+      altitude: state.position.y,
+      agl: physics.telemetry.agl,
+      afterburner: state.afterburner,
+      bank: state.bank,
+      pitch: state.pitch,
+      missiles: weapons ? weapons.count : 0,
+      gunRounds: gun.rounds,
+      weapon,
+      mode: state.mode,
+      target: track.currentTarget,
+      lockState: track.lockState,
+      lockProgress: track.lockProgress,
+      range: track.range,
+      lead,
+      threat,
+      message,
+    });
+  }
+
   world.render();
 
   railClock += dt;
@@ -336,6 +475,8 @@ function paintRail(axes) {
     `COAST     z=${terrainReport?.ok ? terrainReport.nearEdgeZ : "--"}`,
     `LAUNCH    ${held ? "waiting for the deck" : launch ? (launch.isActive() ? `t=${launch.elapsed().toFixed(1)}/${launch.plan.total.toFixed(1)}` : "handed off") : "--"}`,
     `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
+    `WEAPON    ${weapon}   AIM-9 ${weapons ? weapons.count : "--"}   GUN ${gun.rounds}`,
+    `TRACK     ${targeting.state().lockState} ${(targeting.state().lockProgress * 100).toFixed(0)}%  rounds ${missiles.rounds.length}`,
     `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
     `ERRORS    ${errorCount}`,
     // §2: a fallback must be visible, or a build quietly flying the
@@ -367,6 +508,28 @@ function createAnchorHelper(anchors) {
   ]);
   group.add(new THREE.Line(line, new THREE.LineBasicMaterial({ color: 0xffd400 })));
   return group;
+}
+
+// A visible drone: the target contract carries no mesh, on purpose, because
+// stage 8's SAM sites publish the same shape from a completely different body.
+let droneMesh = null;
+function updateDroneMesh() {
+  if (!droneMesh) {
+    droneMesh = new THREE.Mesh(
+      new THREE.ConeGeometry(3.2, 13, 6),
+      new THREE.MeshStandardMaterial({ color: 0x8d99a6, roughness: 0.5, metalness: 0.4 }),
+    );
+    droneMesh.rotation.x = -Math.PI / 2;
+    world.scene.add(droneMesh);
+  }
+  droneMesh.visible = drone.target.alive;
+  if (!drone.target.alive) return;
+  droneMesh.position.set(
+    drone.target.position.x, drone.target.position.y, drone.target.position.z,
+  );
+  // Flash on a hit: feedback that is not a number.
+  const flash = Math.max(0, 1 - (clock - drone.target.hitAt) / 0.18);
+  droneMesh.material.emissive.setRGB(flash, flash * 0.4, 0);
 }
 
 function onResize() {

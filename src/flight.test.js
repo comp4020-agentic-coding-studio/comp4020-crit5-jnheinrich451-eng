@@ -69,6 +69,20 @@ import {
   strokePosition,
   strokeSpeed,
 } from "./launch.js";
+import {
+  createDrone,
+  createTarget,
+  damageTarget,
+  isTargetable,
+} from "./enemy.js";
+import { createTargeting } from "./targeting.js";
+import {
+  AIM9,
+  createMissileSystem,
+  hasOvershot,
+  turnRadius,
+} from "./missile.js";
+import { createGun, leadSolution } from "./gun.js";
 
 // ── harness ────────────────────────────────────────────────────────────────
 
@@ -2072,6 +2086,357 @@ function testLaunchOwnsTheAircraft() {
   check("the handoff is recorded", r.launch.hasHandedOff() === true);
 }
 
+// ── stage 5: targeting, guns, one missile ─────────────────────────────────
+//
+// targeting.js, missile.js, gun.js and enemy.js all import no three.js, so the
+// rules are exercised here rather than inferred from a screenshot.
+
+const observerAt = (position, forward = { x: 0, y: 0, z: -1 }) => ({
+  position,
+  forward,
+});
+
+function testTargetContract() {
+  // §5: the contract is load-bearing. Stage 8's SAM sites publish this same
+  // shape, and targeting, the gun, the missile and the HUD bracket then work
+  // on ground targets with no special cases at all.
+  const t = createTarget({ label: "DRONE" });
+  for (const field of ["position", "velocity", "alive", "health", "maxHealth", "radius", "label", "hitAt"]) {
+    check(`the target contract exposes ${field}`, field in t);
+  }
+  check("a fresh target is targetable", isTargetable(t) === true);
+  check("a dead target is not targetable", (() => {
+    const d = createTarget();
+    d.alive = false;
+    return isTargetable(d) === false;
+  })());
+  check("a bare object is not targetable", isTargetable({}) === false);
+
+  // A stationary ground target satisfies the same contract -- the shape that
+  // makes stage 8 free.
+  const sam = createTarget({ label: "SAM", velocity: { x: 0, y: 0, z: 0 } });
+  check("a zero-velocity target still satisfies the contract", isTargetable(sam));
+
+  // damageTarget returns true ONCE, on the transition to dead, so a caller can
+  // award a kill exactly once however many rounds land in the same frame.
+  const victim = createTarget({ health: 20 });
+  check("damage below the threshold does not kill", damageTarget(victim, 5, 1) === false);
+  check("damage records the hit time", victim.hitAt === 1);
+  check("the killing blow returns true", damageTarget(victim, 100, 2) === true);
+  check("health floors at zero", victim.health === 0);
+  check("a dead target reports no second kill", damageTarget(victim, 100, 3) === false);
+
+  // The drone publishes a WRITTEN velocity, not one differenced from
+  // positions: the lead solution and the missile both read it, and a
+  // differenced velocity lags a frame at exactly the moment it matters.
+  const drone = createDrone({ centre: { x: 0, y: 900, z: -3000 } });
+  drone.update(1 / 60);
+  const speed = Math.hypot(drone.target.velocity.x, drone.target.velocity.z);
+  check("the drone publishes a real velocity", speed > 100, `${speed.toFixed(1)}`);
+  drone.target.alive = false;
+  drone.update(1 / 60);
+  check(
+    "a dead drone stops moving",
+    drone.target.velocity.x === 0 && drone.target.velocity.z === 0,
+  );
+}
+
+function testLockProgression() {
+  const targeting = createTargeting();
+  const target = createTarget({ position: { x: 0, y: 900, z: -2000 } });
+  const observer = observerAt({ x: 0, y: 900, z: 0 });
+
+  check("nothing is tracked before an update", targeting.state().lockState === "NONE");
+
+  // Lock progresses only while the SAME candidate is tracked.
+  let s = targeting.update(0.5, [target], observer);
+  check("tracking begins", s.lockState === "TRACK" && s.currentTarget === target);
+  check("progress is partial after half the lock time", s.lockProgress > 0.3 && s.lockProgress < 0.5, `${s.lockProgress}`);
+  s = targeting.update(0.9, [target], observer);
+  check("a steady track reaches lock", s.lockState === "LOCK", `${s.lockProgress}`);
+  check("progress saturates at 1", s.lockProgress === 1);
+
+  // AN EMPTY CANDIDATE LIST IS THE NORMAL WAY TO DISABLE IT (§5) -- there is
+  // deliberately no enabled flag, and stage 7 relies on this between
+  // encounters.
+  s = targeting.update(0.2, [], observer);
+  check("an empty list decays the lock", s.lockProgress < 1, `${s.lockProgress}`);
+  s = targeting.update(2, [], observer);
+  check("an empty list clears the lock", s.lockProgress === 0);
+  check("an empty list produces no target", s.currentTarget === null);
+  check("an empty list reports NONE", s.lockState === "NONE");
+
+  // Switching target RESTARTS the lock rather than inheriting progress.
+  const t2 = createTargeting();
+  const a = createTarget({ label: "A", position: { x: 0, y: 900, z: -2000 } });
+  const b = createTarget({ label: "B", position: { x: 60, y: 900, z: -1900 } });
+  t2.update(1.0, [a], observer);
+  const progressed = t2.state().lockProgress;
+  check("the first target progressed", progressed > 0.5);
+  a.alive = false;
+  const sw = t2.update(1 / 60, [a, b], observer);
+  check("switching target picks the live one", sw.currentTarget === b);
+  check("switching target restarts the lock", sw.lockProgress < 0.1, `${sw.lockProgress}`);
+
+  // Off the nose and out of range are both rejected.
+  const behind = createTarget({ position: { x: 0, y: 900, z: 2000 } });
+  check(
+    "a target behind the nose is not a candidate",
+    targeting.update(1, [behind], observer).currentTarget === null,
+  );
+  const far = createTarget({ position: { x: 0, y: 900, z: -40000 } });
+  check(
+    "a target beyond max range is not a candidate",
+    targeting.update(1, [far], observer).currentTarget === null,
+  );
+  // The nearer of two on the nose wins.
+  const near = createTarget({ label: "N", position: { x: 0, y: 900, z: -1200 } });
+  const distant = createTarget({ label: "F", position: { x: 0, y: 900, z: -5000 } });
+  const t3 = createTargeting();
+  check(
+    "the closer of two targets on the nose is selected",
+    t3.update(1 / 60, [distant, near], observer).currentTarget === near,
+  );
+}
+
+function testLeadSolution() {
+  const origin = { x: 0, y: 0, z: 0 };
+
+  // A STATIONARY target: the pipper is the target itself.
+  const still = createTarget({ position: { x: 0, y: 0, z: -1000 } });
+  const s = leadSolution(origin, still);
+  check("the lead on a stationary target is the target",
+    Math.abs(s.point.x - 0) < 1e-6 && Math.abs(s.point.z + 1000) < 1e-6,
+    JSON.stringify(s.point));
+  check("a stationary solution is solved", s.solved === true);
+
+  // A CROSSING target: the pipper leads it, on the side it is moving toward.
+  const crossing = createTarget({
+    position: { x: 0, y: 0, z: -1000 },
+    velocity: { x: 200, y: 0, z: 0 },
+  });
+  const c = leadSolution(origin, crossing);
+  check("the lead on a crossing target is ahead of it", c.point.x > 0, `${c.point.x}`);
+  check("the lead time is positive and short", c.time > 0 && c.time < 2, `${c.time}`);
+  check(
+    "the lead offset is about velocity x time",
+    Math.abs(c.point.x - 200 * c.time) < 1e-6,
+  );
+
+  // It works for a target crossing the other way, symmetrically.
+  const other = createTarget({
+    position: { x: 0, y: 0, z: -1000 },
+    velocity: { x: -200, y: 0, z: 0 },
+  });
+  check("the lead is symmetric", Math.abs(leadSolution(origin, other).point.x + c.point.x) < 1e-6);
+
+  // A target with no velocity field at all must not throw -- the SAM case.
+  const bare = { position: { x: 0, y: 0, z: -800 } };
+  check("a target with no velocity resolves to itself",
+    Math.abs(leadSolution(origin, bare).point.z + 800) < 1e-6);
+}
+
+function testMissileGuidance() {
+  // A round fired at a stationary target ahead should hit.
+  const events = [];
+  const sys = createMissileSystem({ onEvent: (e) => events.push(e.kind) });
+  const target = createTarget({ position: { x: 0, y: 0, z: -1500 }, radius: 9 });
+  sys.fire({
+    owner: "player",
+    position: { x: 0, y: 0, z: 0 },
+    direction: { x: 0, y: 0, z: -1 },
+    speed: 250,
+    target,
+  });
+  check("firing emits a fire event", events.includes("fire"));
+  check("the round is in the air", sys.rounds.length === 1);
+
+  for (let t = 0; t < 5 && sys.rounds.length; t += 1 / 60) sys.update(1 / 60, t);
+  check("a straight shot hits", events.includes("hit"), events.join(","));
+
+  // SEPARATION: the round flies straight before it guides, so it does not
+  // appear to steer out of the cockpit on frame one.
+  const sys2 = createMissileSystem({});
+  const offset = createTarget({ position: { x: 900, y: 0, z: -900 } });
+  const round = sys2.fire({
+    position: { x: 0, y: 0, z: 0 },
+    direction: { x: 0, y: 0, z: -1 },
+    speed: 250,
+    target: offset,
+  });
+  sys2.update(0.05, 0);
+  check(
+    "the round has not begun steering during separation",
+    Math.abs(round.velocity.x) < 1e-9,
+    `${round.velocity.x}`,
+  );
+  sys2.update(0.6, 0.6);
+  check("the round steers after separation", Math.abs(round.velocity.x) > 1, `${round.velocity.x}`);
+
+  // THE FUZE detonates within its radius and not outside it.
+  const sys3 = createMissileSystem({ onEvent: () => {} });
+  const near = createTarget({ position: { x: 0, y: 0, z: -30 }, radius: 0 });
+  const r3 = sys3.fire({
+    position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 },
+    speed: 200, target: near,
+  });
+  // Several frames, not one: the round leaves the rail at ~315 m/s and covers
+  // about 5 m per frame, so closing the last 8 m to the fuze radius takes more
+  // than a single update. A one-frame version of this failed for that reason
+  // and said nothing at all about the fuze.
+  for (let t = 0; t < 0.3 && !r3.detonated; t += 1 / 60) sys3.update(1 / 60, t);
+  check("the fuze fires inside its radius", r3.detonated === true, `${r3.detonated}`);
+
+  const sys4 = createMissileSystem({});
+  const wide = createTarget({ position: { x: 400, y: 0, z: -30 }, radius: 0 });
+  const r4 = sys4.fire({
+    position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 },
+    speed: 200, target: wide,
+  });
+  for (let t = 0; t < 0.3; t += 1 / 60) sys4.update(1 / 60, t);
+  check("the fuze does not fire outside its radius", r4.detonated !== true);
+
+  // Lifetime expiry.
+  const sys5 = createMissileSystem({ onEvent: (e) => events.push("e:" + e.reason) });
+  sys5.fire({ position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 1, z: 0 }, target: null });
+  for (let t = 0; t < 8; t += 1 / 60) sys5.update(1 / 60, t);
+  check("a round with no target expires on its lifetime", sys5.rounds.length === 0);
+}
+
+function testOvershootNeedsAngleAndOpeningRange() {
+  // THE SUBTLE RULE (§14). Angle alone falsely calls an overshoot on a round
+  // still closing through a crossing geometry, and the round then coasts past
+  // a target it would have hit.
+  const closingWide = {
+    position: { x: 0, y: 0, z: 0 },
+    velocity: { x: 0, y: 0, z: -800 },
+  };
+  const beside = createTarget({ position: { x: 900, y: 0, z: 30 } });
+  // Well past the overshoot ANGLE, but the range is still closing.
+  check(
+    "a wide angle with a CLOSING range is not an overshoot",
+    hasOvershot(closingWide, beside, -12) === false,
+  );
+  check(
+    "a wide angle with an OPENING range is an overshoot",
+    hasOvershot(closingWide, beside, +12) === true,
+  );
+  // A narrow angle is never an overshoot, whatever the range is doing.
+  const ahead = createTarget({ position: { x: 0, y: 0, z: -900 } });
+  check(
+    "a target dead ahead is never an overshoot",
+    hasOvershot(closingWide, ahead, +12) === false,
+  );
+  check("no target is never an overshoot", hasOvershot(closingWide, null, 5) === false);
+}
+
+function testDefeatedRoundKeepsFlying() {
+  // A defeated round keeps flying its curve and can still get lucky on the
+  // fuze, so a miss reads as a miss rather than as the round switching off.
+  const sys = createMissileSystem({ authorityFor: () => 0 });
+  const target = createTarget({ position: { x: 2000, y: 0, z: -2000 } });
+  const round = sys.fire({
+    position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 },
+    speed: 300, target,
+  });
+  const before = { ...round.position };
+  for (let t = 0; t < 1; t += 1 / 60) sys.update(1 / 60, t);
+  check("a fully defeated round is still in the air", sys.rounds.length === 1);
+  check(
+    "a fully defeated round is still moving",
+    Math.abs(round.position.z - before.z) > 100,
+    `${round.position.z}`,
+  );
+  check(
+    "authority is floored above zero, so the round still curves",
+    round.authority > 0,
+    `${round.authority}`,
+  );
+}
+
+function testExpireOwner() {
+  const sys = createMissileSystem({});
+  const target = createTarget({ position: { x: 0, y: 0, z: -3000 } });
+  sys.fire({ owner: "player", position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 }, target });
+  sys.fire({ owner: "hostile", position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 }, target });
+  sys.fire({ owner: "hostile", position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 }, target });
+  check("three rounds are up", sys.rounds.length === 3);
+  check("player has one", sys.countFor("player") === 1);
+
+  const retired = sys.expireOwner("hostile");
+  check("expireOwner retires only that owner", retired === 2 && sys.rounds.length === 1);
+  check("the player's round is untouched", sys.countFor("player") === 1);
+  check("expiring an unknown owner retires nothing", sys.expireOwner("sam") === 0);
+}
+
+function testMissileTurnRadius() {
+  // §14's fairness claim is stated in radii: the F-15 turns at 1000 m at
+  // 250 m/s, so a hard crossing manoeuvre must be able to defeat these.
+  const r = turnRadius(AIM9);
+  check(
+    "the AIM-9 turn radius is in §14's expected range",
+    r > 850 && r < 1000,
+    `${r.toFixed(0)} m`,
+  );
+  check(
+    "the AIM-9 is out-turnable by the F-15 at the top of its envelope",
+    r >= TURN_RADIUS_REF * 0.85,
+    `missile ${r.toFixed(0)} vs aircraft ${TURN_RADIUS_REF}`,
+  );
+}
+
+function testGunMagazineAndFx() {
+  const hits = [];
+  const gun = createGun({ onHit: (t) => hits.push(t) });
+  check("the magazine starts full", gun.rounds === 500);
+
+  const target = createTarget({ position: { x: 0, y: 0, z: -600 }, radius: 9, health: 1e6 });
+  gun.update(0.5, {
+    firing: true,
+    origin: { x: 0, y: 0, z: 0 },
+    forward: { x: 0, y: 0, z: -1 },
+    candidates: [target],
+  });
+  check("holding the trigger spends rounds", gun.rounds < 500, `${gun.rounds}`);
+  check("rounds on target register hits", hits.length > 0, `${hits.length}`);
+  check("tracers are drawn for some rounds, not all",
+    gun.tracers.length > 0 && gun.tracers.length < 500 - gun.rounds,
+    `${gun.tracers.length} tracers for ${500 - gun.rounds} rounds`);
+
+  // A target off the nose is not hit.
+  const gun2 = createGun({ onHit: () => hits.push("wide") });
+  const wide = createTarget({ position: { x: 900, y: 0, z: -600 }, radius: 9 });
+  const before = hits.length;
+  gun2.update(0.5, {
+    firing: true, origin: { x: 0, y: 0, z: 0 },
+    forward: { x: 0, y: 0, z: -1 }, candidates: [wide],
+  });
+  check("a target well off the nose is not hit", hits.length === before);
+
+  // THE SEPARATION THAT MATTERS: clearFx() does not touch ammunition;
+  // reset() does. Conflating them silently disarms the player at every phase
+  // change in stage 7.
+  const spent = gun.rounds;
+  gun.clearFx();
+  check("clearFx removes the tracers", gun.tracers.length === 0);
+  check("clearFx does NOT touch the ammunition", gun.rounds === spent, `${gun.rounds}`);
+  gun.reset();
+  check("reset reloads the magazine", gun.rounds === 500);
+
+  // Empty means empty.
+  const gun3 = createGun({ magazine: 3 });
+  gun3.update(5, {
+    firing: true, origin: { x: 0, y: 0, z: 0 },
+    forward: { x: 0, y: 0, z: -1 }, candidates: [],
+  });
+  check("the magazine empties", gun3.rounds === 0 && gun3.isEmpty() === true);
+  gun3.update(5, {
+    firing: true, origin: { x: 0, y: 0, z: 0 },
+    forward: { x: 0, y: 0, z: -1 }, candidates: [],
+  });
+  check("an empty gun cannot go negative", gun3.rounds === 0);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -2116,6 +2481,15 @@ const SUITES = [
   ["parked pose", testParkedPose],
   ["launch camera blend", testLaunchCameraBlend],
   ["the script owns the aircraft", testLaunchOwnsTheAircraft],
+  ["target contract", testTargetContract],
+  ["lock progression", testLockProgression],
+  ["lead solution", testLeadSolution],
+  ["missile guidance", testMissileGuidance],
+  ["overshoot needs angle AND opening range", testOvershootNeedsAngleAndOpeningRange],
+  ["a defeated round keeps flying", testDefeatedRoundKeepsFlying],
+  ["expireOwner", testExpireOwner],
+  ["missile turn radius", testMissileTurnRadius],
+  ["gun magazine and fx", testGunMagazineAndFx],
 ];
 
 export function run() {
