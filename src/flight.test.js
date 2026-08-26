@@ -35,7 +35,13 @@ import {
   updateFlight,
   wrapAngle,
 } from "./flight.js";
-import { createInput } from "./input.js";
+import {
+  POINTER_DEAD_ZONE,
+  POINTER_FULL_STICK,
+  POINTER_GAIN,
+  createInput,
+  pointerStick,
+} from "./input.js";
 import {
   FOV_VERTICAL_MAX,
   REF_ASPECT,
@@ -87,6 +93,24 @@ class KeyEvent extends Event {
   }
 }
 
+class PointerEvt extends Event {
+  constructor(type, opts) {
+    super(type);
+    const o = opts || {};
+    this.clientX = o.x || 0;
+    this.clientY = o.y || 0;
+    this.button = o.button || 0;
+    this.deltaY = o.deltaY || 0;
+    this.view = { innerWidth: o.w || VW, innerHeight: o.h || VH };
+  }
+}
+
+// The desktop marking viewport, used as the default frame for pointer tests.
+const VW = 1920;
+const VH = 1080;
+const MID_X = VW / 2;
+const MID_Y = VH / 2;
+
 function inputHarness() {
   const target = new EventTarget();
   const doc = new EventTarget();
@@ -98,6 +122,11 @@ function inputHarness() {
     doc,
     down: (code, key) => target.dispatchEvent(new KeyEvent("keydown", code, key ?? code)),
     up: (code, key) => target.dispatchEvent(new KeyEvent("keyup", code, key ?? code)),
+    move: (x, y, w, h) =>
+      target.dispatchEvent(new PointerEvt("pointermove", { x, y, w, h })),
+    press: (button) => target.dispatchEvent(new PointerEvt("pointerdown", { button })),
+    release: (button) => target.dispatchEvent(new PointerEvt("pointerup", { button })),
+    wheel: (deltaY) => target.dispatchEvent(new PointerEvt("wheel", { deltaY })),
     tick: (seconds, hz = 60) => {
       const dt = 1 / hz;
       let axes;
@@ -536,42 +565,343 @@ function testStuckKeyClearing() {
   );
 }
 
-function testNoPointerPath() {
-  // §17.6 and §17.14: assert the MECHANISM, not the symptom. Dispatching a
-  // pointer event and finding the axes unmoved would also pass if a pointer
-  // listener existed but happened not to write an axis on that frame. The
-  // real requirement is structural -- there is no code path from a pointer
-  // event to a flight axis -- so assert that no such listener is registered.
-  const h = inputHarness();
-  const types = h.input.listenerTypes();
-  const pointerish = types.filter((t) => /pointer|mouse|touch|wheel|drag/i.test(t));
+// ── stage 1: pointer steering (§7, §17.6) ─────────────────────────────────
+//
+// This replaces an earlier suite that asserted the OPPOSITE invariant -- that
+// no pointer listener existed at all. §17.6 now reads the other way: pointer
+// steering is positional from a fixed, visible centre, and it is the only
+// self-teaching control the game has, which is what makes the
+// no-instructions rule satisfiable. The old checks are deleted rather than
+// left passing against a rule that no longer exists (§18: a suite that only
+// grows is not being maintained).
+
+function testPointerStickGeometry() {
+  const at = (x, y) => pointerStick(x, y, VW, VH);
+
   check(
-    "input registers no pointer, mouse, touch or wheel listener",
-    pointerish.length === 0,
-    `found ${pointerish.join(", ")}`,
-  );
-  check(
-    "input registers the keyboard and focus listeners it does need",
-    types.includes("keydown") && types.includes("keyup") && types.includes("blur"),
-    `types ${types.join(", ")}`,
+    "dead centre commands nothing",
+    at(MID_X, MID_Y).x === 0 && at(MID_X, MID_Y).y === 0,
   );
 
-  // The symptom test as well, because the two together also catch a listener
-  // registered somewhere other than through this module.
-  for (const type of ["pointermove", "pointerdown", "mousemove", "wheel"]) {
-    const evt = new Event(type);
-    evt.movementX = 250;
-    evt.movementY = -180;
-    evt.clientX = 900;
-    evt.clientY = 40;
-    h.target.dispatchEvent(evt);
-  }
-  const axes = h.tick(0.5);
+  // The dead zone is the whole reason this control has a neutral. Without one
+  // there is no way to let go, which is the defect that made the earlier
+  // relative-origin design unfixable.
+  const justInside = at(MID_X + MID_X * POINTER_DEAD_ZONE * 0.9, MID_Y);
   check(
-    "no pointer gesture produces any control input",
-    axes.x === 0 && axes.y === 0 && axes.roll === 0 && axes.throttle === 0,
-    `x ${axes.x} y ${axes.y} roll ${axes.roll} thr ${axes.throttle}`,
+    "inside the dead zone commands nothing",
+    justInside.x === 0 && justInside.y === 0,
+    JSON.stringify(justInside),
   );
+  const justOutside = at(MID_X + MID_X * POINTER_DEAD_ZONE * 1.1, MID_Y);
+  check(
+    "just outside the dead zone commands a little",
+    Math.abs(justOutside.x) > 0 && Math.abs(justOutside.x) < 0.2,
+    JSON.stringify(justOutside),
+  );
+
+  const full = at(MID_X + MID_X * POINTER_FULL_STICK, MID_Y);
+  check(
+    "the full-stick radius reaches the gain",
+    near(Math.abs(full.x), POINTER_GAIN, 1e-9),
+    String(full.x),
+  );
+  const past = at(VW, MID_Y);
+  check(
+    "past full stick is clamped to the gain, not extrapolated",
+    near(Math.abs(past.x), POINTER_GAIN, 1e-9),
+    String(past.x),
+  );
+  const corner = at(VW, 0);
+  check(
+    "a screen corner is still clamped to the gain",
+    near(Math.hypot(corner.x, corner.y), POINTER_GAIN, 1e-9),
+    JSON.stringify(corner),
+  );
+
+  // Directions. Cursor right banks RIGHT, which is negative here; cursor up
+  // pitches the nose UP.
+  check("cursor right banks right (negative x)", at(VW * 0.9, MID_Y).x < 0);
+  check("cursor left banks left (positive x)", at(VW * 0.1, MID_Y).x > 0);
+  check("cursor up pitches the nose up", at(MID_X, VH * 0.1).y > 0);
+  check("cursor down pitches the nose down", at(MID_X, VH * 0.9).y < 0);
+
+  const left = at(MID_X - 400, MID_Y);
+  const right = at(MID_X + 400, MID_Y);
+  check(
+    "deflection is symmetric about the centre",
+    near(left.x, -right.x, 1e-12) && near(left.y, right.y, 1e-12),
+  );
+
+  // Monotonic between the dead zone and full stick, or the control has a flat
+  // spot the player can feel but not see.
+  let previous = -1;
+  let monotonic = true;
+  for (let f = POINTER_DEAD_ZONE; f <= POINTER_FULL_STICK; f += 0.02) {
+    const mag = Math.abs(at(MID_X + MID_X * f, MID_Y).x);
+    if (mag < previous - 1e-12) monotonic = false;
+    previous = mag;
+  }
+  check("deflection grows monotonically out to full stick", monotonic);
+
+  // Degenerate viewports must not produce NaN and poison the flight model.
+  const degenerate = [
+    [0, 1080],
+    [1920, 0],
+    [0, 0],
+  ];
+  for (const [w, h] of degenerate) {
+    const s = pointerStick(100, 100, w, h);
+    check(
+      `a ${w}x${h} viewport yields zero, not NaN`,
+      s.x === 0 && s.y === 0,
+      JSON.stringify(s),
+    );
+  }
+
+  // Both marking viewports: full stick is the same FRACTION of the frame, so
+  // the control feels the same at 1920x1080 and at 390x844.
+  const phone = pointerStick(195 + 195 * POINTER_FULL_STICK, 422, 390, 844);
+  check(
+    "full stick is the same fraction of the frame on the phone viewport",
+    near(Math.abs(phone.x), POINTER_GAIN, 1e-9),
+    String(phone.x),
+  );
+}
+
+function testPointerCentreIsNotSynthesised() {
+  // §17.6 and §17.14: assert the MECHANISM. The centre is the screen centre,
+  // permanently -- never a claimed origin derived from relative movement. The
+  // observable consequence is that the command depends ONLY on where the
+  // cursor is, never on how it got there. A drifting origin gives different
+  // answers for the same final position after different paths.
+  const a = inputHarness();
+  const b = inputHarness();
+
+  const wander = [
+    [10, 10],
+    [1900, 1000],
+    [960, 20],
+    [40, 700],
+    [1500, 900],
+  ];
+  for (const [x, y] of wander) {
+    a.move(x, y);
+    a.tick(0.2);
+  }
+  a.move(1200, 400);
+  a.tick(0.2);
+
+  b.move(1200, 400);
+  b.tick(0.2);
+
+  check(
+    "the command depends only on cursor POSITION, not on the path taken",
+    near(a.input.axes.x, b.input.axes.x, 1e-12) &&
+      near(a.input.axes.y, b.input.axes.y, 1e-12),
+    `wandered ${a.input.axes.x},${a.input.axes.y} vs direct ${b.input.axes.x},${b.input.axes.y}`,
+  );
+
+  // Returning to the centre must return to neutral -- there is no accumulated
+  // offset anywhere for the aircraft to keep flying against.
+  a.move(MID_X, MID_Y);
+  a.tick(0.5);
+  check(
+    "returning the cursor to the centre returns to neutral",
+    a.input.axes.x === 0 && a.input.axes.y === 0,
+    `${a.input.axes.x},${a.input.axes.y}`,
+  );
+
+  // A parked off-centre cursor KEEPS commanding. That is correct rather than a
+  // bug: it is a stick held over, and it looks like one.
+  b.tick(3);
+  check(
+    "a parked off-centre cursor keeps commanding",
+    Math.abs(b.input.axes.x) > 0,
+    String(b.input.axes.x),
+  );
+}
+
+function testPointerAndKeyboardCombine() {
+  // "Whichever axis is asking for more" (§7), so a held key always overrides a
+  // resting cursor and neither input needs to know the other exists.
+  const h = inputHarness();
+  h.move(MID_X + MID_X * 0.16, MID_Y);
+  h.tick(0.3);
+  const gentle = Math.abs(h.input.axes.x);
+  check(
+    "a gentle cursor deflection commands a little",
+    gentle > 0 && gentle < 0.4,
+    String(gentle),
+  );
+
+  h.down("KeyA");
+  const combined = h.tick(1.5);
+  check("a held key overrides a resting cursor", combined.x === 1, String(combined.x));
+
+  h.up("KeyA");
+  const released = h.tick(1.5);
+  check(
+    "releasing the key hands control back to the cursor",
+    near(Math.abs(released.x), gentle, 1e-9),
+    `${released.x} vs ${gentle}`,
+  );
+
+  // And the other way: a hard cursor deflection beats a key still ramping.
+  const h2 = inputHarness();
+  h2.move(VW, MID_Y);
+  h2.down("KeyA");
+  const oneFrame = h2.input.update(1 / 60);
+  check(
+    "a hard cursor deflection beats a key that is still ramping",
+    oneFrame.x < 0,
+    String(oneFrame.x),
+  );
+}
+
+function testPointerLifecycle() {
+  // The pointer position is a physical fact about where the player's hand is,
+  // not a latch. Clearing it on reset would snap the aircraft to an attitude
+  // nobody commanded.
+  const h = inputHarness();
+  h.move(VW * 0.85, MID_Y);
+  h.tick(0.3);
+  const before = h.input.axes.x;
+  h.input.clear();
+  const after = h.tick(0.3);
+  check(
+    "clear() does not forget where the cursor is",
+    h.input.pointerPosition() !== null && near(after.x, before, 1e-9),
+    `${before} -> ${after.x}`,
+  );
+
+  // Steering is switched off outright while the launch script or the crash
+  // presentation owns the aircraft.
+  h.input.setSteeringEnabled(false);
+  const disabled = h.tick(0.3);
+  check("disabled steering commands nothing", disabled.x === 0, String(disabled.x));
+  check(
+    "the cursor is still remembered while steering is disabled",
+    h.input.pointerPosition() !== null,
+  );
+  h.input.setSteeringEnabled(true);
+  check(
+    "re-enabling restores the same command",
+    near(h.tick(0.3).x, before, 1e-9),
+  );
+
+  // The pitch convention is ONE sign flip at the boundary, so it governs the
+  // pointer as well as the keyboard.
+  const h2 = inputHarness();
+  h2.move(MID_X, VH * 0.1);
+  const noseUp = h2.tick(0.3).y;
+  check("cursor high pitches up by default", noseUp > 0, String(noseUp));
+  h2.down("KeyI");
+  const flipped = h2.tick(0.3).y;
+  check(
+    "the pitch convention flips the POINTER axis too",
+    near(flipped, -noseUp, 1e-9),
+    `${noseUp} -> ${flipped}`,
+  );
+}
+
+function testMouseButtons() {
+  const h = inputHarness();
+  check("nothing is firing at rest", h.input.isFiring() === false);
+
+  h.press(0);
+  check("the left button fires", h.input.isFiring() === true);
+  h.release(0);
+  check("releasing the left button stops firing", h.input.isFiring() === false);
+
+  // Discrete bindings: holding one must do nothing extra.
+  h.press(2);
+  check("the right button latches a weapon switch", h.input.consumeLatch("weapon") === true);
+  check("the weapon latch is consumed once", h.input.consumeLatch("weapon") === false);
+  h.tick(1);
+  check(
+    "holding the right button does not repeat the switch",
+    h.input.consumeLatch("weapon") === false,
+  );
+
+  h.press(1);
+  check("the middle button latches flares", h.input.consumeLatch("flares") === true);
+
+  // Two sources, ONE latch, so both behave identically.
+  const h2 = inputHarness();
+  h2.down("KeyZ");
+  check("Z latches the same flare action", h2.input.consumeLatch("flares") === true);
+  h2.press(1);
+  check("the middle button feeds the same latch", h2.input.consumeLatch("flares") === true);
+
+  // Keyboard repeat must not spam a latch: a second keydown with no keyup in
+  // between is the OS repeating, not the player pressing again.
+  const h3 = inputHarness();
+  h3.down("KeyZ");
+  h3.input.consumeLatch("flares");
+  h3.down("KeyZ");
+  check(
+    "an auto-repeat keydown does not re-latch",
+    h3.input.consumeLatch("flares") === false,
+  );
+  h3.up("KeyZ");
+  h3.down("KeyZ");
+  check("a genuine second press does latch", h3.input.consumeLatch("flares") === true);
+
+  const t = inputHarness();
+  t.down("KeyF");
+  const firingByKey = t.input.isFiring();
+  t.up("KeyF");
+  check("F also fires, and releasing it stops", firingByKey && t.input.isFiring() === false);
+}
+
+function testWheelThrottle() {
+  // A wheel notch is an impulse, but the flight model reads throttle as a
+  // RATE, so a notch charges a small decaying value rather than jumping the
+  // lever. One throttle model regardless of input source.
+  const h = inputHarness();
+  check("no wheel input is no throttle rate", h.tick(0.1).throttle === 0);
+
+  h.wheel(-100);
+  const pushed = h.input.update(1 / 60);
+  check(
+    "a wheel notch pushes the throttle forward",
+    pushed.throttle > 0,
+    String(pushed.throttle),
+  );
+
+  const pulled = inputHarness();
+  pulled.wheel(100);
+  check("wheel down pulls the throttle back", pulled.input.update(1 / 60).throttle < 0);
+
+  // It decays, or one notch would be a permanent throttle command.
+  const h2 = inputHarness();
+  h2.wheel(-100);
+  h2.input.update(1 / 60);
+  const decayed = h2.tick(2);
+  check("the wheel charge decays away", decayed.throttle === 0, String(decayed.throttle));
+
+  // The rate stays inside the range the flight model expects.
+  const h3 = inputHarness();
+  for (let i = 0; i < 40; i++) h3.wheel(-100);
+  const spun = h3.input.update(1 / 60);
+  check(
+    "spinning the wheel hard stays within the rate range",
+    spun.throttle <= 1 && spun.throttle >= -1,
+    String(spun.throttle),
+  );
+}
+
+function testContextMenuDoubleDuty() {
+  // §7: the contextmenu listener suppresses the menu AND clears held keys,
+  // because a menu opening swallows the keyup of anything held.
+  const h = inputHarness();
+  h.down("KeyW");
+  h.down("KeyA");
+  h.tick(1);
+  h.target.dispatchEvent(new Event("contextmenu"));
+  const axes = h.input.update(1 / 60);
+  check("contextmenu clears held keys", h.input.heldKeys().length === 0);
+  check("contextmenu zeroes the axes", axes.x === 0 && axes.y === 0);
 }
 
 function testLatches() {
@@ -583,6 +913,7 @@ function testLatches() {
 
   // Stage 4 drops latches accumulated during the catapult script so a key
   // pressed on the deck does not fire on the handoff frame.
+  h.up("KeyR");
   h.down("KeyR");
   h.input.dropLatches();
   check("dropLatches discards a pending latch", h.input.consumeLatch("restart") === false);
@@ -983,7 +1314,13 @@ const SUITES = [
   ["input ramping", testInputRamping],
   ["event.code robustness", testEventCodeRobustness],
   ["stuck-key clearing", testStuckKeyClearing],
-  ["no pointer path", testNoPointerPath],
+  ["pointer stick geometry", testPointerStickGeometry],
+  ["pointer centre is not synthesised", testPointerCentreIsNotSynthesised],
+  ["pointer + keyboard combine", testPointerAndKeyboardCombine],
+  ["pointer lifecycle", testPointerLifecycle],
+  ["mouse buttons", testMouseButtons],
+  ["wheel throttle", testWheelThrottle],
+  ["contextmenu double duty", testContextMenuDoubleDuty],
   ["latches", testLatches],
   ["expert: no bank->heading", testExpertHasNoBankToHeading],
   ["expert: local axes", testExpertIsLocal],

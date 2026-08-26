@@ -21,7 +21,24 @@ const FOV_FAST = 71;
 
 export const STANDARD = {
   height: 6.5,
-  framingY: -0.18,
+  // §16's camera table quotes framingY -0.18, and that value is left in place
+  // for every BLENDED composition. The standard chase sits at 0 instead,
+  // because §17.6 is now an invariant and it is stated in screen space:
+  // "pointer steering is positional from a fixed, visible centre -- the
+  // AIRCRAFT AT SCREEN CENTRE, with a dead zone over it".
+  //
+  // Those two cannot both hold. At -0.18 the camera looks 0.18 x standoff
+  // BELOW the aircraft, which combined with the 6.5 m height offset put the
+  // airframe roughly a third of the way up the frame -- well outside the 0.10
+  // dead-zone radius. The player's neutral would then sit on empty sky, and
+  // "hovering on the aircraft holds attitude" (§7) would simply be false.
+  //
+  // The invariant wins over the table: the dead zone is only meaningful if it
+  // lands where the aircraft is drawn. With the look target on the aircraft
+  // the 6.5 m height still tips the camera ~15 degrees down, so the ground
+  // ahead stays visible and the horizon sits in the upper third anyway --
+  // which is what the -0.18 was buying in the first place.
+  framingY: 0,
   lagScale: 1,
 };
 
