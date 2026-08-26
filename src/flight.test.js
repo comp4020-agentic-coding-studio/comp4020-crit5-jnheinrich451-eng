@@ -127,6 +127,7 @@ function inputHarness() {
     press: (button) => target.dispatchEvent(new PointerEvt("pointerdown", { button })),
     release: (button) => target.dispatchEvent(new PointerEvt("pointerup", { button })),
     wheel: (deltaY) => target.dispatchEvent(new PointerEvt("wheel", { deltaY })),
+    leave: () => target.dispatchEvent(new Event("pointerleave")),
     tick: (seconds, hz = 60) => {
       const dt = 1 / hz;
       let axes;
@@ -758,6 +759,40 @@ function testPointerAndKeyboardCombine() {
   );
 }
 
+function testPointerLeavesTheWindow() {
+  // An UNTOUCHED pointer commands nothing: there is no position yet, and
+  // assuming one (the centre, say) would be inventing an input.
+  const fresh = inputHarness();
+  const idle = fresh.tick(1);
+  check(
+    "an untouched pointer commands nothing",
+    idle.x === 0 && idle.y === 0,
+    `${idle.x},${idle.y}`,
+  );
+  check("an untouched pointer has no position", fresh.input.pointerPosition() === null);
+
+  // Leaving the window RELEASES the stick. This is the one case where the
+  // position is genuinely forgotten -- unlike a reset, the hand really has
+  // left the controls.
+  const h = inputHarness();
+  h.move(VW * 0.9, MID_Y);
+  const deflected = h.tick(0.5);
+  check("a deflected cursor commands", Math.abs(deflected.x) > 0.5, String(deflected.x));
+  h.leave();
+  const released = h.tick(0.5);
+  check(
+    "leaving the window releases the stick",
+    released.x === 0 && released.y === 0,
+    `${released.x},${released.y}`,
+  );
+  check("leaving the window forgets the position", h.input.pointerPosition() === null);
+
+  // Coming back re-establishes it from the new position, not the old one.
+  h.move(VW * 0.1, MID_Y);
+  const back = h.tick(0.5);
+  check("returning re-establishes the stick from the new position", back.x > 0.5, String(back.x));
+}
+
 function testPointerLifecycle() {
   // The pointer position is a physical fact about where the player's hand is,
   // not a latch. Clearing it on reset would snap the aircraft to an attitude
@@ -776,14 +811,14 @@ function testPointerLifecycle() {
 
   // Steering is switched off outright while the launch script or the crash
   // presentation owns the aircraft.
-  h.input.setSteeringEnabled(false);
+  h.input.setPointerEnabled(false);
   const disabled = h.tick(0.3);
   check("disabled steering commands nothing", disabled.x === 0, String(disabled.x));
   check(
     "the cursor is still remembered while steering is disabled",
     h.input.pointerPosition() !== null,
   );
-  h.input.setSteeringEnabled(true);
+  h.input.setPointerEnabled(true);
   check(
     "re-enabling restores the same command",
     near(h.tick(0.3).x, before, 1e-9),
@@ -1317,6 +1352,7 @@ const SUITES = [
   ["pointer stick geometry", testPointerStickGeometry],
   ["pointer centre is not synthesised", testPointerCentreIsNotSynthesised],
   ["pointer + keyboard combine", testPointerAndKeyboardCombine],
+  ["pointer leaves the window", testPointerLeavesTheWindow],
   ["pointer lifecycle", testPointerLifecycle],
   ["mouse buttons", testMouseButtons],
   ["wheel throttle", testWheelThrottle],

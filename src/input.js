@@ -260,7 +260,20 @@ export function createInput(options = {}) {
     if (doc && doc.visibilityState === "hidden") clear();
   });
 
+  // Leaving the window RELEASES the stick. A parked off-centre cursor keeps
+  // commanding on purpose (it is a stick held over, and it looks like one),
+  // but a cursor that has left the window entirely is a hand that has left
+  // the controls -- and unlike a reset, that is a real change in where the
+  // player's hand is, so forgetting the position is the truthful thing to do.
+  const release = () => {
+    pointer = null;
+  };
+
   on(target, "pointermove", onPointerMove);
+  on(target, "pointerleave", release);
+  on(target, "mouseleave", release);
+  on(doc, "pointerleave", release);
+  on(doc, "mouseleave", release);
   on(target, "pointerdown", onPointerDown);
   on(target, "pointerup", onPointerUp);
   on(target, "pointercancel", onPointerUp);
@@ -347,10 +360,11 @@ export function createInput(options = {}) {
     // Steering is switched off outright while the launch script or the crash
     // presentation owns the aircraft, rather than asking each of those
     // branches to remember to ignore the pointer.
-    setSteeringEnabled(on) {
+    setPointerEnabled(on) {
       steeringEnabled = !!on;
     },
-    steeringEnabled: () => steeringEnabled,
+    pointerEnabled: () => steeringEnabled,
+    releasePointer: release,
     pointerPosition: () => (pointer ? { ...pointer } : null),
     pointerAxes,
 

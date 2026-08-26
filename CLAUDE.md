@@ -55,17 +55,193 @@ tests.html           loads src/flight.test.js and prints a pass/fail count
 src/*.js             the modules listed in §3
 src/flight.test.js   plain assertions, no test framework
 ```
-__Adjustable__
 
-**Method:** build in the order of §3's dependency groups — world and flight
-first, then physics, then combat, then mission and presentation. After each
-group, add assertions for its rules to `src/flight.test.js` and confirm the count
-is green before continuing. The test suite is the only gate; a red count blocks
-further work.
+**Method:** build in the order of §0.1. Each stage ends in a **runnable state** and
+a **test gate** — something you can open and fly, plus assertions for the rules
+just added. Do not proceed past a red count.
 
 Write comments that record *why*, especially where an obvious alternative was
 rejected. §17 lists the traps; when you implement code that one of those covers,
 say so in a comment so the constraint survives the next edit.
+
+---
+
+## 0.1 Build order
+
+Ten stages. Every one of them produces something you can open in a browser and
+look at — there is never a phase where you are assembling modules that do not yet
+run. That matters more than it sounds: this design has several systems whose bugs
+are only visible in motion.
+
+### Three things to get right in stage 1, because retrofitting them is painful
+
+1. **`requestAnimationFrame` is scheduled FIRST in the frame, with the body in a
+   `try`/`catch`** (§17.3). Added later, this is a rewrite of the loop; added now,
+   it costs four lines. Without it, any thrown frame silently ends the session and
+   you will spend a long time thinking a feature is broken when the loop is simply
+   dead.
+2. **`flight.js` must not import three.js**, and `flightState.quat` is a plain
+   `{x,y,z,w}` record (§17.1). If three.js leaks in early it will be load-bearing
+   by stage 5.
+3. **Axis keys by `event.code`, and no arrow keys** (§17.5). A stuck axis is
+   indistinguishable from a flight-model bug, and you will chase the wrong one.
+4. **Pointer steering is positional from the screen centre, with a dead zone over
+   the aircraft** (§7). It is the only self-teaching control the game has, and
+   §16's "no instructions" rule depends on it existing. Never steer from a
+   synthesised or drifting origin.
+
+### Stage 1 — A shape flying over water
+
+```
+flight-lab.html   canvas, import map, resize, #loading
+src/world.js      scene, ocean plane, sky, fog, lighting
+src/flight.js     ASSISTED mode only
+src/input.js      keyboard axes, throttle lever
+src/chase-camera.js  the one rig
+src/main.js       frame loop, wiring
+```
+
+Use a placeholder box for the aircraft. **Runnable:** you can fly it, turn by
+banking, and the throttle holds its position.
+**Gate:** envelope limits, bank→heading coupling, throttle-as-lever, snapshot
+round-trip, input axis ramping, `event.code` robustness, stuck-key clearing.
+
+### Stage 2 — The real airframe, and Expert mode
+
+```
+src/aircraft.js   load + normalise the F-15, gear node swap
+src/flight.js     add EXPERT quaternion integration, M toggle
+src/input.js      add the I pitch-convention toggle
+```
+
+**Runnable:** the F-15 flies in both modes; Expert can hold inverted.
+**Gate:** Expert has **no** bank→heading term (assert its absence); the pitch
+convention flips a held key immediately and survives a reset.
+
+### Stage 3 — Terrain, probes, and being rewound
+
+```
+src/world.js         terrain load/normalise + terrain report
+src/physics.js       grid index, five probes, 60 Hz, safe-state history, benchmark
+src/collision.js     CollisionEvent + DevelopmentRecoveryResponse
+src/physics-debug.js probe visualisation (P)
+```
+
+**Runnable:** you can fly into Ireland and be rewound 0.65 s.
+**Gate:** the index agrees with `THREE.Raycaster` on the same rays; the benchmark
+logs both costs; clearance and AGL are correct over land and sea.
+
+### Stage 4 — The carrier and the catapult
+
+```
+src/world.js    carrier load + the four measured anchors
+src/launch.js   the solved stroke, LAUNCH_VIEW blend
+```
+
+**Runnable:** every session now begins with a launch and hands you the aircraft at
+172 m/s. This is the single most valuable milestone in the build — it is also what
+teaches the throttle and camera, so get it feeling right before adding combat.
+**Gate:** the closed-form stroke distance matches a numeric integral of its own
+curve; both inverses; the clamp path; a full 60 Hz **and** 20 Hz sequence
+asserting one handoff, the release point, and deck-edge → gear → handoff ordering.
+
+### Stage 5 — Targeting, guns, one missile
+
+```
+src/weapons.js    hardpoints, mounted stores
+src/enemy.js      the drone airframe
+src/targeting.js  candidates, lock progression
+src/missile.js    ONE implementation, AIM-9 config only
+src/gun.js        hitscan + tracers + lead pipper
+src/combat-hud.js the three layers, bracket, lock diamond, instruments
+```
+
+**Runnable:** you can lock a passive drone and kill it with either weapon.
+**Gate:** lock progression and decay, the lead solution, the overshoot rule
+(angle **and** opening range), `clearFx()` separate from `reset()`.
+
+### Stage 6 — An enemy that fights back
+
+```
+src/hostile.js  the 8-state FSM, HOSTILE_MISSILE config
+src/threat.js   TRACK/LOCK/MISSILE escalation, the authority hook
+src/damage.js   PlayerDamageEvent + feedback response
+```
+
+Add the barrel roll here, as the first consumer of guidance authority.
+**Runnable:** a real dogfight you can lose.
+**Gate:** the whole transition table; DEFEND's fleeting-lock rule,
+non-interruptible ATTACK and cooldown; the latched break direction; the fairness
+assertion on turn radii.
+
+### Stage 7 — The sortie
+
+```
+src/mission.js    phases, transition table, route survey, triggers, checkpoints,
+                  autopilot
+src/collision.js  add MissionCheckpointResponse (G swaps the two)
+src/combat-hud.js add nav marker, phase cue
+flight-lab.html   add #fade and the #complete screen
+```
+
+**Runnable:** the full nine-phase mission completes.
+**Gate:** the transition table across every phase, floor and fallback; the
+INTERCEPT/COASTLINE non-overlap; `bandFeature` using the weaker flank; zoning
+against a clustered field; three end-to-end runs (direct, combat ignored, one
+failure) each asserting COMPLETE and the phase order.
+
+### Stage 8 — Ground threats, countermeasures, modes
+
+```
+src/sam.js     sites, line of sight, the network
+src/flares.js  the infrared countermeasure
+src/rearm.js   automatic replenishment
+src/modes.js   the MISSION/FREE/PEACE rules table + sandbox driver
+src/combat-hud.js add the radar
+```
+
+**Runnable:** the terrain run is dangerous, and `T` cycles three modes.
+**Gate:** line of sight over a ridge and the clearance margin; `samTransition`
+including spent sites and the loss grace; placement rejecting the sea; `seduces`
+with a **moving** aircraft plus head-on and committed cases; rearm starting at
+empty; the modes table; a parked director never completing a mission.
+
+### Stage 9 — Dying well, and sound
+
+```
+src/crash-fx.js  the procedural crash presentation
+src/audio.js     the 11-cue director
+flight-lab.html  add #crash-flash
+```
+
+The crash reuses `MissionCheckpointResponse`'s `hold` stage — do not add a state
+machine (§15).
+**Runnable:** crashing produces ~2.3 s of destruction and an automatic flyable
+respawn.
+**Gate:** the crash timeline and budgets; duplicate suppression on every frame of
+the window; the ocean variant going under rather than skating; audio priority,
+ducking, round-robin takes, and the availability rule from §16.
+
+### Stage 10 — Verify against §19
+
+Walk §19 as a checklist. Then measure three human runs and record the times — a
+bot flying straight lines gives you a lower bound on the route, not a playtest,
+and no amount of green tests substitutes for it.
+
+### Where the schedule risk actually is
+
+Not in the flight model. In this order, the systems most likely to cost you a day
+are, in descending order:
+
+1. **Terrain queries** (stage 3) — the grid index is simple but the failure mode
+   (silently reporting no terrain) is invisible until something depends on it.
+   Log the benchmark and sanity-check ground heights at known coordinates.
+2. **The crash/respawn handoff** (stage 9) — three separate owners of the aircraft
+   transform (flight model, launch script, crash presentation) and one stale flag
+   between them is enough to strand the player. §17.2 is the specific trap.
+3. **Anything with a stored position** (stage 7) — a checkpoint captured in one
+   place and restored into different terrain. §15's respawn rule exists because of
+   this.
 
 ---
 
@@ -94,7 +270,8 @@ F-15E airframe    glTF. Normalise to 19.4 m length.
 Carrier (CVN)     glTF. Normalise to 332.8 m length. Must expose deck anchors.
 Terrain           glTF heightfield-style mesh. Normalise to 30 km across.
 AIM-9 missile     glTF. Normalise to 2.85 m.
-Audio             11 files, see §16. The game must run silent if absent.
+Audio             14 files in assets/audio/ — the manifest is in §16.
+                  The game must run silent if absent.
 ```
 
 Every asset is **normalised at load from measured bounds**, never scaled by a
@@ -112,7 +289,7 @@ offsets and record the fallback in a failure list shown on the developer rail.
 
 ---
 
-## 3. Proposed structure (Not fixed)
+## 3. Modules to create
 
 ```
 flight-lab.html      canvas, #loading, #fade, #crash-flash, #complete,
@@ -286,16 +463,74 @@ Keyboard for flight. The mouse is a trigger and nothing else.
 W S        pitch                  L-Shift / L-Ctrl   throttle
 A D        bank                   Space              barrel roll / evade
 Q E        roll rate              I                  pitch convention toggle
-LMB / F    fire (hold for gun)    X                  weapon select
-Z          flares                 M                  Assisted / Expert
+LMB / F    fire (hold for gun)    X / RMB            weapon select
+Z / MMB    flares                 M                  Assisted / Expert
 R          restart                C                  clear stuck keys
+wheel      throttle
 ```
+
+The mouse carries four things: **move** steers, **left** fires, **right** switches
+weapon, **middle** dispenses flares, **wheel** moves the throttle. All four
+non-steering bindings are discrete, which is why they are buttons rather than
+axes — holding any of them must do nothing extra.
+
+Each mouse binding must `preventDefault()`: the middle button otherwise triggers
+autoscroll, the right button opens the context menu, and the wheel scrolls the
+page. The `contextmenu` listener does double duty — it suppresses the menu **and**
+clears held keys, since a menu opening swallows the keyup of anything held.
+
+A wheel notch is an impulse, but the flight model reads throttle as a **rate**, so
+each notch charges a small decaying value rather than jumping the lever. That
+keeps one throttle model regardless of input source.
+
+Flares have two sources (`Z` and the middle button) feeding **one latch**, polled
+in the frame loop rather than in a key handler, so both behave identically.
 
 Developer keys: `H` rail · `J` HUD · `K` audio mute · `P` probes · `O` carrier
 anchors · `N` nav route · `G` collision policy · `T` game mode · `1 2 3` camera
 roll influence.
 
-Three requirements, each load-bearing:
+### Pointer steering — the aircraft is the centre
+
+The aircraft sits at the middle of the viewport and follows the cursor. Deflection
+is distance from centre:
+
+```
+dead zone   0.10 of the half-viewport   — hovering on the aircraft holds attitude
+full stick  0.52 of the half-viewport
+gain        0.95
+```
+
+Provide `pointerStick(px, py, w, h)` as a pure function, and combine it with the
+keyboard by taking **whichever axis is asking for more**, so a held key always
+overrides a resting cursor and neither input needs to know the other exists.
+
+Three properties are load-bearing:
+
+1. **The centre is not synthesised.** It is the screen centre, permanently. An
+   earlier version of this project tried to steer from a *claimed* origin derived
+   from relative movement, and it failed six times — see below.
+2. **A dead zone over the aircraft is the way to let go.** Without it there is no
+   neutral, which is the defect that made the earlier attempt unfixable.
+3. **The cursor stays visible.** The player can always see what they are
+   commanding. A parked off-centre cursor *does* keep turning the aircraft, and
+   that is correct rather than a bug — it is a stick held over, and it looks like
+   one.
+
+Steering is disabled outright while the launch script or the crash presentation
+owns the aircraft, rather than having those branches remember to ignore it. The
+pointer position is **not** cleared on reset: it is a physical position, not a
+latch, and pretending the player moved their hand would be a lie.
+
+**What not to build.** Do not steer from relative movement with a synthesised
+centre. That design was tried and abandoned after six fixes — a claimed origin,
+movement-gated edge drift, keyboard claim revocation, a settle timer,
+pointer-lock deltas and a spring return — each of which fixed a real defect and
+none of which closed the bug, because a synthesised centre has no detent the
+player can see or feel. If steering ever needs changing, change the mapping from
+position; do not reintroduce an origin that moves.
+
+Three further requirements, each load-bearing:
 
 1. **Track axis keys by `event.code`, never `event.key`.** `key` can differ
    between the keydown and keyup of the same physical press (modifiers, caps lock,
@@ -305,12 +540,9 @@ Three requirements, each load-bearing:
 2. **Arrow keys must not be flight axes.** Browser and embed chrome steal them,
    so their keyup goes missing, producing a phantom "the aircraft turns on its
    own" fault.
-3. **Do not implement mouse steering.** There must be no `pointermove` listener.
-   A screen position cannot be a stick: it has no centre, no detent and no
-   spring, and every attempt to synthesise those from coordinates (relative
-   origin, edge drift, claim revocation, settle timers, pointer lock, spring
-   return) fixes one failure mode and leaves the others. The flight axes must be
-   unreachable from the pointer as a structural property.
+3. **Do not steer from relative movement.** See the pointer-steering note above:
+   position from a fixed visible centre is the design; a synthesised origin is
+   not.
 
 Also required: clear all held keys on `blur`, `visibilitychange` (hidden),
 `pagehide` and `contextmenu` — each is a way a held key stops being held without a
@@ -363,13 +595,29 @@ whole flight state and the renderer reads it, so the handoff has nothing to
 reconcile. No wheel physics, no suspension, no throttle input.
 
 ```
-0.0–3.4   parked. Engine start plays alone. Camera shake ramps 0.02 → 0.16.
-2.8       afterburner lights (shake ×1.5)
-3.4       catapult fires. Start sound cut; engine loop takes over.
-6.2       release point — exactly the measured deck run. 152 m/s.
-6.6       rotate to 12° pitch, gear up
-7.1       control handoff at 172 m/s, throttle 0.92, afterburner lit
+0.0–11.0   parked. The engine start-up plays IN FULL at double speed (a ~22 s
+           recording finishing in ~11 s), fired once. Shake ramps 0.02 → 0.16.
+9.6        afterburner lights (shake ×1.5)
+11.0       catapult fires on the start-up's last note. Engine loop takes over.
+13.8       release point — exactly the measured deck run. 152 m/s.
+14.2       rotate to 12° pitch, gear up
+14.7       control handoff at 172 m/s, throttle 0.92, afterburner lit
 ```
+
+**The deck must be HELD until audio is armed.** A browser will not start audio
+before a user gesture, and the launch begins on the first frame of a fresh load —
+so an unheld deck fires the engine start-up into a blocked audio context, marks it
+played, and runs the whole opening silent. (The symptom is confusing: cycling game
+mode appears to "fix" it, because by then a keypress has armed the director.) Give
+`update(dt, hold)` a hold flag, pass `!audio.state.armed`, and let the aircraft sit
+on the deck shaking until the countdown can actually be heard. The hold must apply
+**only at t = 0** — it can delay a launch, never pause one in progress.
+
+**The deck dwell is the length of the engine start-up, not an authored number.**
+The sound runs to its end and the catapult fires on the last note, which makes the
+wait read as a countdown rather than a delay. This couples two values in different
+files — if the recording changes, re-derive `deckDwell ≈ clipDuration / rate`
+together with the cue's playback rate.
 
 **Solve the stroke duration from the geometry; do not author it.** The speed curve
 is `lerp(8, 152, u^1.25)`. Its closed-form distance over duration `T` is
@@ -515,13 +763,44 @@ exactly one place so no caller can start it elsewhere.
 A rules table, not three copies of the game. `T` cycles and restarts.
 
 ```
-             phases  timer  nav  hostiles  sams  respawn
-MISSION        yes    yes   yes    yes      yes  crash-relative
-FREE           no     no    no     yes      yes  carrier
-PEACE          no     no    no     no       no   carrier
+             phases  timer  nav  hostiles  sams  respawn         lives
+MISSION        yes    yes   yes    yes      yes  crash-relative  5
+FREE           no     no    no     yes      yes  carrier         —
+PEACE          no     no    no     no       no   carrier         —
 ```
 
-Anything that reads like a mode check elsewhere should be a lookup in this table.
+### Lives, and the loss ending
+
+The sortie must be **losable**. Five pilots in MISSION; a death spends one, and
+running out ends the run on a `Mission Failed` screen.
+
+```
+start              5
+respawn altitude   4000 m, fixed
+```
+
+- **The count is shown top-right** — `5 LIVES REMAINING` — and shifts amber at 2,
+  salmon at 1. It is not instruction; it is the squadron's state.
+- **Spend the pilot at the restore, not at the impact.** The number is what the
+  player has left to fly, so it drops when the replacement is dispatched.
+- Announce it diegetically: `A NEW PILOT IS NOW DEPLOYED TO YOUR LOCATION`. The
+  aircraft you were flying is gone, and so is whoever was in it.
+- **A fixed 4000 m respawn replaces the escalating one.** Escalation existed to
+  climb its way out of terrain over repeated deaths; with a finite pilot count that
+  is no longer an acceptable way to converge, because each attempt costs one. The
+  island peaks at 643 m, so 4000 m takes terrain out of the question. 2000 m was
+  tried and the aircraft was still reported ending up in the sea — which is
+  geometrically impossible for an absolute-altitude floor, so verify the invariant
+  with a **post-condition check after the respawn** and log loudly when it fails.
+  Raising the floor hides that bug; the check names it.
+- **The loss screen mirrors the win screen** — same furniture, salmon instead of
+  green — so a win and a loss read as the same kind of event. It carries the same
+  summary rows and `R` / Enter restarts.
+- **The time fallbacks stay.** You still cannot lose on the clock and nothing
+  soft-locks; you can only run out of aircraft.
+
+**Lives are MISSION only.** FREE and PEACE are practice, and counting deaths in a
+sandbox turns it into a test.
 
 Two rules identical across all three modes:
 
@@ -842,6 +1121,32 @@ touching position or phase.
 
 ## 16. Presentation
 
+### No instructions, anywhere
+
+The game must teach itself: **no instruction text on screen or off.** There is no
+control legend, no tutorial, no key list in the repository's player-facing docs.
+
+What teaches instead:
+
+- **The catapult launch runs itself** and demonstrates the throttle climbing and
+  the burner lighting before the player has touched anything.
+- **The aircraft is at screen centre and follows the cursor**, which is
+  discoverable in about a second. This is the main reason pointer steering was
+  reintroduced — WASD alone is not self-teaching.
+- **The nav diamond** says where to go without words.
+- **Consequence teaches the rest.** Fly into a hill and you lose a pilot.
+
+The HUD is **not** instruction — it is instrumentation, and reading an instrument
+is part of flying. Threat words (`LOCK`, `MISSILE`, `PULL UP`) are information
+about the world, not directions to the player.
+
+Accept the consequence: a first-time player will probably never discover flares,
+the weapon switch or the pitch-convention toggle. That is the cost of the rule,
+and the rule is the requirement. Do not add a legend behind a toggle — that only
+puts the violation one keypress away.
+
+Every key still works; it is simply undocumented in-game.
+
 ### HUD (`combat-hud.js`)
 
 SVG overlay in three explicit layers, in paint order: screen-fixed, attitude,
@@ -953,7 +1258,7 @@ telling the player what has locked them; a score would sit on top of all three a
 make the warnings less audible.
 
 ```
-ENGINE_START   deck spool          AMBIENT    one-shot, stoppable
+ENGINE_START   deck spool          AMBIENT    one-shot, stoppable, rate ×2
 ENGINE_LOOP    throttle > 2%       AMBIENT    loop, gain + pitch from the lever
 GUN            trigger held        WEAPON     loop
 LOCK           threat = LOCK       WARNING    3 takes, 3.2 s floor, ducks to 0.45
@@ -1015,8 +1320,9 @@ Ground proximity is two levels, both **AGL, not altitude above sea level**:
 220 m AGL. So 200 m over the ocean is quiet and 200 m into a 600 m ridge is not.
 
 The engine loop must **not** run during the deck phase — the start-up plays alone
-while the aircraft shakes in place, and is cut the instant the catapult fires,
-which is where the loop takes over.
+while the aircraft shakes in place, at double playback rate so the whole recording
+finishes exactly as the catapult fires. The loop takes over from there, which is
+also the first moment there is something for a loop to sustain.
 
 The fly-by fires **once per pass**: it needs a range that crossed the threshold
 *this frame* and at least 120 m/s of closure, so a slow drift past is not a fly-by
@@ -1048,7 +1354,9 @@ Each of these describes a real failure. Violating one reproduces it.
    trapped.
 4. **If you skip `physics.update()`, tick the response policy yourself.**
 5. **Axis keys by `event.code`, never `event.key`.** No arrow keys as axes.
-6. **No mouse steering.** Ever.
+6. **Pointer steering is positional from a fixed, visible centre** — the aircraft
+   at screen centre, with a dead zone over it. Never a synthesised or drifting
+   origin.
 7. **One missile implementation.** New rounds are configs, not files.
 8. **Enemies publish the target contract** — then targeting, gun, HUD and missile
    work with no special cases.
@@ -1122,4 +1430,4 @@ running at all.
 ### Deliberately out of scope
 
 No landing, no mesh fracture, no pilot ejection, no damage subsystem, no
-persistent wreckage, no wingmen, no scoring system, no music, no mouse steering.
+persistent wreckage, no wingmen, no scoring system, no music.

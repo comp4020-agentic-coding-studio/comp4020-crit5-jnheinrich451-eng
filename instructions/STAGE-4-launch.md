@@ -57,20 +57,24 @@ state and the renderer reads it, so the handoff has nothing to reconcile.
 No wheel physics, no suspension, no throttle input. The player watches.
 
 ```
-0.0–3.4   parked. Engine start plays alone. Camera shake ramps 0.02 → 0.16.
-2.8       afterburner lights (shake ×1.5)
-3.4       catapult fires. Start sound cut; engine loop takes over.
-6.2       release point — exactly the measured deck run. 152 m/s.
-6.6       rotate to 12° pitch, gear up
-7.1       control handoff at 172 m/s, throttle 0.92, afterburner lit
+0.0–11.0   parked. The engine start-up plays IN FULL at double speed (a ~22 s
+           recording finishing in ~11 s). Camera shake ramps 0.02 → 0.16.
+9.6        afterburner lights (shake ×1.5)
+11.0       catapult fires on the start-up's last note. Engine loop takes over.
+13.8       release point — exactly the measured deck run. 152 m/s.
+14.2       rotate to 12° pitch, gear up
+14.7       control handoff at 172 m/s, throttle 0.92, afterburner lit
 ```
 
-**The deck dwell is 3.4 s, not less.** The temptation is to shorten it — nothing
-is happening. But the one moment the aircraft is stationary and shaking is what
-the whole sequence builds its tension out of, and at 1.7 s the engine start-up is
-still spooling when the catapult fires. Ramp the shake across the dwell rather
-than holding it flat; a constant vibration for three seconds reads as a rendering
-artefact rather than an engine winding up.
+**The deck dwell is the LENGTH OF THE ENGINE START-UP**, played at double speed —
+not an authored number. The sound runs to its end and the catapult fires on its
+last note, which makes the wait read as a countdown rather than a delay.
+
+This couples two values in different files: if the recording is replaced,
+re-derive `deckDwell ≈ clipDuration / rate` together with the cue's playback rate.
+
+Ramp the shake across the dwell rather than holding it flat; a constant vibration
+for ten seconds reads as a rendering artefact rather than an engine winding up.
 
 Hand over **in afterburner at lever 0.92**, not at the lever position that merely
 sustains 172 m/s. The plume must not die on the frame the player takes over, and
@@ -186,5 +190,17 @@ arrives.
 - **The same at 20 Hz** — the release point is frame-rate independent.
 - **The parked pose** sits on the measured deck with gear down and heading along
   the launch axis.
+- **The dwell matches the start-up clip** at its declared playback rate, so the
+  catapult fires as the sound ends.
+- **The start-up cue fires exactly ONCE per launch.** Trigger it from a flag reset
+  when the aircraft is placed on the deck — not every frame governed by the cue's
+  `minInterval`. An interval floor is a rate limiter for a cue that fires
+  occasionally; a clip whose whole purpose is to run to its end once will retrigger
+  mid-play the moment the dwell exceeds the interval, and copies overlap.
+- **A held deck does not advance, and the hold cannot pause a launch already
+  rolling.** `update(dt, hold)` freezes the sequence at t = 0 only. Pass
+  `!audio.state.armed`: a browser blocks audio until a user gesture, and the launch
+  starts on frame one of a fresh load, so without the hold the entire opening plays
+  silent and the start-up is consumed against a blocked context.
 - FOV opens from the deck value toward the exit value and never past a comfortable
   maximum.
