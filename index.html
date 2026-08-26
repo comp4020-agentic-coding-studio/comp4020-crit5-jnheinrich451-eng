@@ -167,6 +167,59 @@
         }
       }
 
+      #fade {
+        position: fixed;
+        inset: 0;
+        background: #000;
+        opacity: 0;
+        z-index: 18;
+        pointer-events: none;
+      }
+
+      #complete {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-content: center;
+        gap: 1.1rem;
+        text-align: center;
+        background: rgb(4 8 12 / 0.86);
+        z-index: 19;
+      }
+
+      #complete[hidden] {
+        display: none;
+      }
+
+      #complete-title {
+        margin: 0;
+        font-size: clamp(1.1rem, 3.2vw, 1.8rem);
+        letter-spacing: 0.36em;
+        text-indent: 0.36em;
+        color: var(--green);
+      }
+
+      #complete-rows {
+        margin: 0;
+        display: grid;
+        grid-template-columns: auto auto;
+        gap: 0.35rem 1.6rem;
+        font-size: 0.78rem;
+        letter-spacing: 0.14em;
+        color: var(--cyan);
+      }
+
+      #complete-rows dt {
+        text-align: right;
+        opacity: 0.65;
+      }
+
+      #complete-rows dd {
+        margin: 0;
+        text-align: left;
+        color: var(--green);
+      }
+
       nav {
         position: fixed;
         right: 0.75rem;
@@ -200,6 +253,17 @@
     <div id="loading">
       <h1>Operation Vector</h1>
       <p>F-15E</p>
+    </div>
+
+    <!-- The failure fade. The checkpoint restore happens at FULL BLACK, so
+         the player never sees the teleport. -->
+    <div id="fade"></div>
+
+    <!-- The completion screen. `R` or Enter restarts -- Enter ONLY from here,
+         because it is a fire key in flight. -->
+    <div id="complete" hidden>
+      <p id="complete-title">SORTIE COMPLETE</p>
+      <dl id="complete-rows"></dl>
     </div>
 
     <pre id="rail" hidden></pre>

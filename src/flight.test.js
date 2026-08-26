@@ -49,7 +49,18 @@ import {
   widenForAspect,
 } from "./framing.js";
 import { buildTerrainIndex, createPhysics, heightAtIndex } from "./physics.js";
-import { createDevelopmentRecovery, createNullResponse } from "./collision.js";
+import {
+  createDevelopmentRecovery,
+  createMissionCheckpointResponse,
+  createNullResponse,
+} from "./collision.js";
+import {
+  COMPLETE, DECK, DEFENSIVE, EGRESS, EXTRACTION, FINAL, INTERCEPT, LAUNCH,
+  PHASES, TERRAIN,
+  autopilotStick, bandFeature, blendStick, buildRoute, captureCheckpoint,
+  createMission, inVolume, missionTransition, pickZonedFeatures,
+  surveyTerrainRoute, volumesOverlap,
+} from "./mission.js";
 import {
   EASE,
   HANDOFF_SPEED,
@@ -2832,6 +2843,558 @@ function testDamageResponseFiresOnce() {
   check("resetAll clears the tally", damage.hitsTaken() === 0);
 }
 
+// ── stage 7: the sortie ───────────────────────────────────────────────────
+//
+// The dangerous thing in this stage is anything with a STORED POSITION -- a
+// checkpoint captured in one place and restored into different terrain -- and
+// that is only testable against a synthetic height field with no scene.
+
+const MCTX = (over = {}) => ({
+  fired: false, handedOff: false, legReached: false, killedAt: null,
+  magazineSpent: false, cinematicDone: false, phaseTime: 0, ...over,
+});
+
+function testMissionTransitionTable() {
+  const T = missionTransition;
+
+  check("DECK waits for the catapult", T({ phase: DECK }, MCTX()) === DECK);
+  check("DECK advances when it fires", T({ phase: DECK }, MCTX({ fired: true })) === LAUNCH);
+  check("LAUNCH waits for the handoff", T({ phase: LAUNCH }, MCTX()) === LAUNCH);
+  check("LAUNCH advances on the handoff", T({ phase: LAUNCH }, MCTX({ handedOff: true })) === EGRESS);
+  check("EGRESS waits for its waypoint", T({ phase: EGRESS }, MCTX({ phaseTime: 10 })) === EGRESS);
+  check("EGRESS advances on the waypoint", T({ phase: EGRESS }, MCTX({ legReached: true })) === INTERCEPT);
+
+  // THE FLOORS ARE REQUIRED, NOT DECORATIVE. Without them the combat phases end
+  // in about twelve seconds: the coastline volume that serves as their "next
+  // region" is close enough that flying straight through clears both
+  // encounters before either reads as one.
+  check(
+    "INTERCEPT will not advance below its floor even at the waypoint",
+    T({ phase: INTERCEPT }, MCTX({ legReached: true, phaseTime: 10 })) === INTERCEPT,
+  );
+  check(
+    "INTERCEPT advances at the waypoint above its floor",
+    T({ phase: INTERCEPT }, MCTX({ legReached: true, phaseTime: 30 })) === DEFENSIVE,
+  );
+  // The KILL floor is much shorter: an encounter the player WON should not
+  // hold them -- it only needs to let the explosion land.
+  check(
+    "a kill shortens the floor to 6 s",
+    T({ phase: INTERCEPT }, MCTX({ killedAt: 8, phaseTime: 14.1 })) === DEFENSIVE,
+  );
+  check(
+    "a kill still respects its own 6 s",
+    T({ phase: INTERCEPT }, MCTX({ killedAt: 8, phaseTime: 11 })) === INTERCEPT,
+  );
+
+  // DEFENSIVE also advances on a spent magazine.
+  check(
+    "DEFENSIVE advances on a spent magazine",
+    T({ phase: DEFENSIVE }, MCTX({ magazineSpent: true, phaseTime: 35 })) === TERRAIN,
+  );
+
+  check("TERRAIN advances on its last leg", T({ phase: TERRAIN }, MCTX({ legReached: true })) === FINAL);
+  check("FINAL advances on the seaward leg", T({ phase: FINAL }, MCTX({ legReached: true })) === EXTRACTION);
+  check(
+    "EXTRACTION waits for the cinematic",
+    T({ phase: EXTRACTION }, MCTX({ phaseTime: 5 })) === EXTRACTION,
+  );
+  check(
+    "EXTRACTION completes when the cinematic ends",
+    T({ phase: EXTRACTION }, MCTX({ cinematicDone: true })) === COMPLETE,
+  );
+  check("COMPLETE is terminal", T({ phase: COMPLETE }, MCTX({ legReached: true })) === COMPLETE);
+
+  // EVERY PHASE NEEDS A TIME FALLBACK (§17.10). No combination of missed shots
+  // or ignored enemies may soft-lock a sortie.
+  for (const [phase, next] of [
+    [EGRESS, INTERCEPT], [INTERCEPT, DEFENSIVE], [DEFENSIVE, TERRAIN],
+    [TERRAIN, FINAL], [FINAL, EXTRACTION], [EXTRACTION, COMPLETE],
+  ]) {
+    const fallback = PHASES[phase].fallback;
+    check(
+      `${phase} has a finite fallback`,
+      Number.isFinite(fallback),
+      `${fallback}`,
+    );
+    check(
+      `${phase} falls through on time alone`,
+      T({ phase }, MCTX({ phaseTime: fallback + 0.1 })) === next,
+    );
+  }
+
+  // The transition function is PURE.
+  const m = { phase: INTERCEPT };
+  const before = JSON.stringify(m);
+  T(m, MCTX({ phaseTime: 99 }));
+  check("missionTransition does not mutate the mission", JSON.stringify(m) === before);
+}
+
+function testTriggerVolumes() {
+  const v = { name: "TEST", x: 100, z: -2000, radius: 1300 };
+  check("dead centre is inside", inVolume(v, { x: 100, y: 900, z: -2000 }));
+  check("50 m off-line still counts", inVolume(v, { x: 150, y: 900, z: -2000 }));
+  check("just inside the rim counts", inVolume(v, { x: 100 + 1290, y: 900, z: -2000 }));
+  check("just outside does not", inVolume(v, { x: 100 + 1310, y: 900, z: -2000 }) === false);
+
+  // ALTITUDE MUST NOT GATE A ROUTE WAYPOINT: a player flying the whole sortie
+  // on the deck still progresses.
+  check("altitude does not gate a route waypoint at 30 m", inVolume(v, { x: 100, y: 30, z: -2000 }));
+  check("nor at 9 km", inVolume(v, { x: 100, y: 9000, z: -2000 }));
+
+  // The recovery volume is the ONLY one with a band: arriving home at 12 km is
+  // not arriving home.
+  const rec = { name: "RECOVERY", x: 0, z: -1200, radius: 2400, band: { min: 80, max: 3800 } };
+  check("the recovery band admits a sane altitude", inVolume(rec, { x: 0, y: 600, z: -1200 }));
+  check("the recovery band rejects the deck", inVolume(rec, { x: 0, y: 20, z: -1200 }) === false);
+  check("the recovery band rejects the stratosphere", inVolume(rec, { x: 0, y: 9000, z: -1200 }) === false);
+
+  // §7: "Assert that INTERCEPT and COASTLINE do not overlap. This check exists
+  // because they did touch." If they touch, entering the intercept area
+  // instantly satisfies "reached the next region" for a fight that has not
+  // started.
+  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
+  const byName = Object.fromEntries(route.legs.map((l) => [l.name, l]));
+  check(
+    "INTERCEPT and COASTLINE volumes do not overlap",
+    volumesOverlap(byName.INTERCEPT, byName.COASTLINE) === false,
+    `gap ${(Math.abs(byName.INTERCEPT.z - byName.COASTLINE.z) - byName.INTERCEPT.radius - byName.COASTLINE.radius).toFixed(0)} m`,
+  );
+  check("volumesOverlap detects an actual overlap", volumesOverlap(
+    { x: 0, z: 0, radius: 100 }, { x: 0, z: 150, radius: 100 },
+  ) === true);
+}
+
+// A synthetic height field: a genuine pass (low ground with high ground BOTH
+// sides) at x = -2000, and a one-sided coastal slope at x = +3000 that a
+// stronger-flank score would wrongly prefer.
+function syntheticTerrain(x, z) {
+  const pass = 600 - 520 * Math.exp(-((x + 2000) ** 2) / (2 * 700 ** 2));
+  const slope = Math.max(0, Math.min(900, (x - 1500) * 0.35));
+  return Math.max(pass, slope);
+}
+
+function testBandFeatureUsesTheWeakerFlank() {
+  // A genuine pass: high, low, high.
+  const pass = bandFeature([500, 500, 80, 500, 500], 2);
+  check("a genuine pass scores positively", pass.score > 300, `${pass.score}`);
+  check("the pass is found at its centre", pass.index === 2, `${pass.index}`);
+
+  // A ONE-SIDED SLOPE: high on the left, sea level on the right. A score using
+  // the STRONGER flank would rate this as highly as the pass; using the weaker
+  // one rates it at zero, which is the whole point.
+  const slope = bandFeature([900, 900, 80, 0, 0], 2);
+  check(
+    "a one-sided slope scores at or below zero",
+    slope.score <= 0,
+    `${slope.score}`,
+  );
+  check(
+    "the genuine pass beats the one-sided slope",
+    pass.score > slope.score,
+    `pass ${pass.score} vs slope ${slope.score}`,
+  );
+
+  // And on the synthetic field, the surveyed waypoint must land on the pass
+  // side rather than out on the coastal slope.
+  const route = surveyTerrainRoute(syntheticTerrain, 0, { rows: 9, cols: 41, span: 4 });
+  check("the survey returns three legs", route.length === 3, `${route.length}`);
+  check(
+    "every surveyed leg sits on the pass, not the one-sided slope",
+    route.every((leg) => leg.x < 0),
+    route.map((l) => l.x.toFixed(0)).join(", "),
+  );
+
+  check("a band too short to have flanks yields nothing", bandFeature([1, 2], 3) === null);
+}
+
+function testZoningSpreadsAClusteredField() {
+  // ZONE BEFORE SCORING. Greedy scoring alone clusters: the deepest passes
+  // tend to sit in one massif, leaving most of the corridor without a
+  // waypoint and the route doubling back on itself.
+  //
+  // This field puts the three BEST scores adjacent at the start, so pure
+  // scoring would take all three from one place.
+  const bands = [];
+  for (let i = 0; i < 30; i++) {
+    const score = i < 3 ? 900 - i : 100 + (i % 7);
+    bands.push({ z: -i * 300, feature: { index: 5, score, centre: 0 } });
+  }
+  const picked = pickZonedFeatures(bands, 3);
+  check("zoning returns one feature per third", picked.length === 3);
+  const zones = picked.map((b) => Math.floor(bands.indexOf(b) / 10));
+  check(
+    "the three picks land in three different thirds",
+    new Set(zones).size === 3,
+    `zones ${zones.join(",")}`,
+  );
+  // Pure greedy would have taken indices 0, 1, 2 -- all in the first third.
+  check(
+    "zoning did NOT take all three from the cluster",
+    !(bands.indexOf(picked[1]) < 3 && bands.indexOf(picked[2]) < 3),
+  );
+  check("an empty field yields nothing", pickZonedFeatures([], 3).length === 0);
+}
+
+function testRoutePlan() {
+  const surveyed = buildRoute({
+    carrierZ: -1600, coastZ: -7600, sampleHeight: syntheticTerrain,
+  });
+  check("a surveyed route is marked surveyed", surveyed.surveyed === true);
+  check("the route has eight legs", surveyed.legs.length === 8, `${surveyed.legs.length}`);
+
+  // Every navigating phase gets at least one leg.
+  for (const phase of [EGRESS, INTERCEPT, DEFENSIVE, TERRAIN, FINAL, EXTRACTION]) {
+    check(
+      `${phase} has at least one leg`,
+      surveyed.legs.some((l) => l.phase === phase),
+    );
+  }
+  check("TERRAIN has three legs", surveyed.legs.filter((l) => l.phase === TERRAIN).length === 3);
+
+  // The legs run inland then back out to sea, in order.
+  const zs = surveyed.legs.map((l) => l.z);
+  check("the route runs inland", zs[3] < zs[0], `${zs[0]} -> ${zs[3]}`);
+  check("and turns back out to sea", zs[7] > zs[5], `${zs[5]} -> ${zs[7]}`);
+
+  // Terrain anchors clear the ground they sit over.
+  for (const leg of surveyed.legs.filter((l) => l.phase === TERRAIN)) {
+    check(
+      `${leg.name} sits over ground it can clear`,
+      leg.ground < 700,
+      `${leg.ground?.toFixed(0)}`,
+    );
+  }
+
+  // A NO-TERRAIN BUILD STILL GETS A FULL ROUTE. The mission must remain
+  // completable when the asset failed to load.
+  const authored = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
+  check("a no-terrain build is marked authored", authored.surveyed === false);
+  check("a no-terrain build still has eight legs", authored.legs.length === 8);
+  check(
+    "a no-terrain build still has three inland legs",
+    authored.legs.filter((l) => l.phase === TERRAIN).length === 3,
+  );
+}
+
+// A point aircraft that simply flies to whatever leg it is given.
+function flyMission({ ignoreCombat = false, failAt = null } = {}) {
+  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: syntheticTerrain });
+  const seen = [];
+  const mission = createMission({ route, onPhase: (to) => seen.push(to) });
+  const position = { x: 0, y: 900, z: -1600 };
+  let extraction = 0;
+  let failed = false;
+
+  const dt = 1 / 30;
+  for (let t = 0; t < 400; t += dt) {
+    const leg = mission.currentLeg();
+    if (leg) {
+      // Fly straight at the current leg at a plausible speed.
+      const dx = leg.x - position.x;
+      const dz = leg.z - position.z;
+      const d = Math.hypot(dx, dz) || 1;
+      position.x += (dx / d) * 210 * dt;
+      position.z += (dz / d) * 210 * dt;
+      position.y = leg.band ? 600 : 900;
+    }
+    if (mission.mission.phase === EXTRACTION) extraction += dt;
+
+    // A kill in the combat phases, unless combat is being ignored entirely.
+    if (
+      !ignoreCombat &&
+      (mission.mission.phase === INTERCEPT || mission.mission.phase === DEFENSIVE) &&
+      mission.mission.phaseTime > 4 &&
+      mission.mission.killedAt === null
+    ) {
+      mission.noteKill("air");
+    }
+
+    if (failAt && !failed && mission.mission.phase === failAt) {
+      failed = true;
+      // A failure in the middle: the checkpoint restore puts the aircraft
+      // back, but the mission must still reach COMPLETE.
+      mission.addCheckpoint(
+        captureCheckpoint(
+          { position, heading: 0, pitch: 0.4, bank: 0.9, speed: 240, throttle: 0.6, sink: 3, mode: "ASSISTED", afterburner: false, quat: { x: 0, y: 0, z: 0, w: 1 } },
+          { groundAhead: 500, weapon: "GUN", missiles: 1, gunRounds: 220, phase: failAt },
+        ),
+      );
+    }
+
+    mission.update(dt, {
+      position,
+      fired: t > 1,
+      handedOff: t > 2,
+      magazineSpent: ignoreCombat,
+      cinematicDone: extraction >= 7.2,
+    });
+    if (mission.mission.phase === COMPLETE) break;
+  }
+  return { mission, seen, position };
+}
+
+function testEndToEndMissions() {
+  // 1. A direct run.
+  const direct = flyMission();
+  check("a direct run completes", direct.mission.mission.phase === COMPLETE, direct.seen.join(" -> "));
+  check(
+    "a direct run visits the phases in order",
+    direct.seen.join(",") === [LAUNCH, EGRESS, INTERCEPT, DEFENSIVE, TERRAIN, FINAL, EXTRACTION, COMPLETE].join(","),
+    direct.seen.join(","),
+  );
+
+  // 2. IGNORING ALL COMBAT still completes the mission. This is the run that
+  // proves no combination of missed shots or ignored enemies soft-locks it.
+  const pacifist = flyMission({ ignoreCombat: true });
+  check(
+    "ignoring combat entirely still completes",
+    pacifist.mission.mission.phase === COMPLETE,
+    pacifist.seen.join(" -> "),
+  );
+  check(
+    "the pacifist run recorded no kills",
+    pacifist.mission.mission.stats.airKills === 0,
+  );
+
+  // 3. A failure in the middle still completes.
+  const failed = flyMission({ failAt: TERRAIN });
+  check(
+    "a failure in the middle still completes",
+    failed.mission.mission.phase === COMPLETE,
+    failed.seen.join(" -> "),
+  );
+
+  // Four checkpoints in a run that records them at the boundaries.
+  const cps = flyMission();
+  for (const phase of [LAUNCH, INTERCEPT, TERRAIN, FINAL]) {
+    cps.mission.addCheckpoint({ phase, snapshot: {}, weapon: "AIM-9", missiles: 2, gunRounds: 500 });
+  }
+  check("four checkpoints are recorded", cps.mission.mission.checkpoints.length === 4);
+  check("the latest checkpoint is the last recorded", cps.mission.latestCheckpoint().phase === FINAL);
+
+  // A LATER PHASE'S VOLUME CANNOT PULL THE MISSION FORWARD: only the current
+  // leg is checked.
+  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: syntheticTerrain });
+  const skipper = createMission({ route });
+  const recovery = route.legs[route.legs.length - 1];
+  for (let i = 0; i < 60; i++) {
+    skipper.update(1 / 30, {
+      position: { x: recovery.x, y: 600, z: recovery.z },
+      fired: false, handedOff: false, magazineSpent: false, cinematicDone: false,
+    });
+  }
+  check(
+    "sitting inside the LAST volume does not skip the route",
+    skipper.mission.legIndex === 0,
+    `legIndex ${skipper.mission.legIndex}`,
+  );
+  check("and the phase is still DECK", skipper.mission.phase === DECK);
+}
+
+function testMissionClock() {
+  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
+  const m = createMission({ route });
+  check("the clock is not running on the deck", m.mission.running === false);
+  m.update(1, { position: { x: 0, y: 20, z: -1600 }, fired: false, handedOff: false });
+  check("the clock stays at zero before the catapult", m.elapsed() === 0);
+
+  // THE CLOCK STARTS AT THE CATAPULT, stated in exactly one place.
+  m.update(1 / 30, { position: { x: 0, y: 20, z: -1600 }, fired: true, handedOff: false });
+  check("the catapult starts the clock", m.mission.running === true);
+  for (let i = 0; i < 30; i++) {
+    m.update(1 / 30, { position: { x: 0, y: 20, z: -1600 }, fired: true, handedOff: false });
+  }
+  check("the clock advances", m.elapsed() > 0.9, `${m.elapsed()}`);
+
+  // And STOPS at COMPLETE: the reported time is the stopped clock.
+  m.mission.phase = EXTRACTION;
+  m.mission.phaseTime = 0;
+  m.update(1 / 30, { position: { x: 0, y: 600, z: -1600 }, cinematicDone: true });
+  check("COMPLETE stops the clock", m.mission.running === false);
+  const stopped = m.elapsed();
+  for (let i = 0; i < 60; i++) {
+    m.update(1 / 30, { position: { x: 0, y: 600, z: -1600 }, cinematicDone: true });
+  }
+  check("the reported time is the STOPPED clock", m.elapsed() === stopped, `${m.elapsed()} vs ${stopped}`);
+}
+
+function testCheckpointIsFlyable() {
+  // A checkpoint must be a state the player can fly OUT of. Recording a
+  // mid-dive attitude 120 m over a ridge means restoring it re-flies the same
+  // impact, and the run then fails in the same place forever.
+  const diving = {
+    position: { x: 0, y: 620, z: -9000 },
+    heading: 1.2, pitch: -0.6, bank: 1.1, speed: 250, throttle: 0.9,
+    sink: 40, mode: "ASSISTED", afterburner: true,
+    quat: { x: 0, y: 0, z: 0, w: 1 },
+  };
+  const cp = captureCheckpoint(diving, {
+    groundAhead: 600, weapon: "GUN", missiles: 1, gunRounds: 210, phase: TERRAIN,
+  });
+
+  check("the checkpoint is LEVELLED", cp.snapshot.pitch === 0 && cp.snapshot.bank === 0);
+  check("the sink is zeroed", cp.snapshot.sink === 0);
+  check(
+    "the checkpoint is LIFTED above the ground AHEAD",
+    cp.snapshot.position.y >= 600 + 400,
+    `${cp.snapshot.position.y}`,
+  );
+  check("the heading being travelled is kept", cp.snapshot.heading === 1.2);
+  check("it carries the selected weapon", cp.weapon === "GUN");
+  check("it carries BOTH magazines", cp.missiles === 1 && cp.gunRounds === 210);
+  // Restoring the loadout it RECORDED, not a full one -- otherwise crashing is
+  // the cheapest way to refill the rails.
+  check("the recorded loadout is not silently a full one", cp.missiles !== 2);
+
+  // A checkpoint over open water is not needlessly lifted.
+  const level = captureCheckpoint(
+    { ...diving, position: { x: 0, y: 900, z: -3000 } },
+    { groundAhead: 0, weapon: "AIM-9", missiles: 2, gunRounds: 500, phase: INTERCEPT },
+  );
+  check("a high checkpoint over water keeps its altitude", level.snapshot.position.y === 900);
+}
+
+function testMissionFailurePolicy() {
+  const restores = [];
+  const fades = [];
+  const policy = createMissionCheckpointResponse({
+    onRestore: () => restores.push(1),
+    onFade: (v) => fades.push(v),
+  });
+  const contact = { type: "terrain", predicted: false, position: { x: 0, y: 0, z: 0 }, speed: 200 };
+
+  check("the policy names itself", policy.name === "MissionCheckpointResponse");
+  check("the first hit is accepted", policy.handleCollision(contact) === true);
+  // A proximity fuze or a terrain probe trips on CONSECUTIVE frames; without
+  // this the fade restarts every frame and the screen never clears.
+  check("a simultaneous second is refused", policy.handleCollision(contact) === false);
+  check("the stick is neutralised", policy.overridesInput() === true);
+  check("no restore yet", restores.length === 0);
+
+  // RESTORE AT FULL BLACK, so the player never sees the teleport.
+  let fadeAtRestore = null;
+  // A SEPARATE tally: the policy above was triggered but never ticked, so it
+  // never restored. Sharing one array counted its non-restore as a restore.
+  const p2Restores = [];
+  const p2 = createMissionCheckpointResponse({
+    onRestore: () => {
+      fadeAtRestore = p2.fade();
+      p2Restores.push(1);
+    },
+  });
+  p2.handleCollision(contact);
+  for (let t = 0; t < 3; t += 1 / 60) p2.tick(1 / 60);
+  check("the restore fired exactly once", p2Restores.length === 1, `${p2Restores.length}`);
+  check("a policy that is never ticked never restores", restores.length === 0);
+  check("the restore happened at FULL BLACK", fadeAtRestore === 1, `${fadeAtRestore}`);
+  check("the policy returns to idle", p2.isActive() === false);
+  check("the stick is handed back", p2.overridesInput() === false);
+  check("the fade is clear again", p2.fade() === 0);
+
+  // Refused during the settling cooldown.
+  const p3 = createMissionCheckpointResponse({});
+  p3.handleCollision(contact);
+  for (let t = 0; t < 1.45; t += 1 / 60) p3.tick(1 / 60);
+  check("still refused during the settling cooldown", p3.handleCollision(contact) === false, p3.stage());
+  for (let t = 0; t < 1; t += 1 / 60) p3.tick(1 / 60);
+  check("accepted once fully settled", p3.handleCollision(contact) === true);
+
+  // A PREDICTED IMPACT DOES NOT FAIL THE MISSION; REAL CONTACT DOES. Failing a
+  // run for a crash that has not happened is the worst class of failure.
+  const p4 = createMissionCheckpointResponse({});
+  check(
+    "a predicted impact is declined",
+    p4.handleCollision({ ...contact, predicted: true }) === false,
+  );
+  check("and leaves the policy idle", p4.isActive() === false);
+  check("real contact a moment later does fail", p4.handleCollision(contact) === true);
+
+  // Both policies share the interface, which is what makes the `G` swap safe.
+  const dev = createDevelopmentRecovery({
+    physics: createPhysics({}), getState: () => createFlightState(),
+  });
+  for (const method of ["handleCollision", "tick", "reset", "overridesInput"]) {
+    check(`both policies implement ${method}`,
+      typeof dev[method] === "function" && typeof p4[method] === "function");
+  }
+}
+
+function testAutopilot() {
+  const level = { heading: 0, pitch: 0, altitude: 620, speed: 190 };
+
+  // ON TARGET IT COMMANDS NOTHING.
+  const still = autopilotStick(level, { heading: 0, altitude: 620, speed: 190 });
+  check(
+    "on target the autopilot commands nothing",
+    Math.abs(still.x) < 1e-9 && Math.abs(still.y) < 1e-9 && Math.abs(still.throttle) < 1e-9,
+    JSON.stringify(still),
+  );
+
+  // A heading error banks -- and THE SHORT WAY ROUND THE +-180 SEAM. Without
+  // the wrap a goal one degree the other side of north banks 359 degrees.
+  const justPast = autopilotStick(
+    { ...level, heading: Math.PI - 0.05 },
+    { heading: -Math.PI + 0.05, altitude: 620, speed: 190 },
+  );
+  check(
+    "a goal across the +-180 seam banks the SHORT way",
+    justPast.x > 0 && justPast.x <= 1,
+    `${justPast.x}`,
+  );
+  check(
+    "a plain left goal banks left",
+    autopilotStick(level, { heading: 0.4, altitude: 620, speed: 190 }).x > 0,
+  );
+  check(
+    "a plain right goal banks right",
+    autopilotStick(level, { heading: -0.4, altitude: 620, speed: 190 }).x < 0,
+  );
+
+  // Below the goal it pulls up.
+  check(
+    "below the goal altitude it pulls up",
+    autopilotStick({ ...level, altitude: 200 }, { altitude: 620, speed: 190, heading: 0 }).y > 0,
+  );
+  check(
+    "above the goal altitude it pushes down",
+    autopilotStick({ ...level, altitude: 1400 }, { altitude: 620, speed: 190, heading: 0 }).y < 0,
+  );
+
+  // A NOSE-HIGH ATTITUDE DAMPS rather than porpoising: it must not keep
+  // pulling while already climbing hard, overshoot, and push just as hard back.
+  const noseHigh = autopilotStick(
+    { heading: 0, pitch: 0.5, altitude: 560, speed: 190 },
+    { heading: 0, altitude: 620, speed: 190 },
+  );
+  check(
+    "already nose-high and slightly low, it damps rather than pulling",
+    noseHigh.y < 0,
+    `${noseHigh.y}`,
+  );
+
+  // Throttle chases the speed goal.
+  check(
+    "slow commands throttle up",
+    autopilotStick({ ...level, speed: 140 }, { speed: 190, altitude: 620, heading: 0 }).throttle > 0,
+  );
+  check(
+    "fast commands throttle back",
+    autopilotStick({ ...level, speed: 240 }, { speed: 190, altitude: 620, heading: 0 }).throttle < 0,
+  );
+
+  // blendStick: k = 0 is the player, k = 1 is the autopilot.
+  const player = { x: -1, y: 0.5, roll: 0.3, throttle: 1 };
+  const auto = { x: 1, y: -0.5, roll: 0, throttle: -1 };
+  const at0 = blendStick(player, auto, 0, {});
+  check("k=0 is the player", at0.x === player.x && at0.throttle === player.throttle);
+  const at1 = blendStick(player, auto, 1, {});
+  check("k=1 is the autopilot", at1.x === auto.x && at1.throttle === auto.throttle);
+  const half = blendStick(player, auto, 0.5, {});
+  check("k=0.5 is halfway", Math.abs(half.x) < 1e-9, `${half.x}`);
+  check("k is clamped", blendStick(player, auto, 9, {}).x === auto.x);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -2896,6 +3459,16 @@ const SUITES = [
   ["threat escalation", testThreatEscalation],
   ["the authority hook", testAuthorityHook],
   ["damage response fires once", testDamageResponseFiresOnce],
+  ["mission transition table", testMissionTransitionTable],
+  ["trigger volumes", testTriggerVolumes],
+  ["bandFeature uses the weaker flank", testBandFeatureUsesTheWeakerFlank],
+  ["zoning spreads a clustered field", testZoningSpreadsAClusteredField],
+  ["the route plan", testRoutePlan],
+  ["end-to-end missions", testEndToEndMissions],
+  ["the mission clock", testMissionClock],
+  ["a checkpoint is flyable", testCheckpointIsFlyable],
+  ["the mission failure policy", testMissionFailurePolicy],
+  ["the extraction autopilot", testAutopilot],
 ];
 
 export function run() {

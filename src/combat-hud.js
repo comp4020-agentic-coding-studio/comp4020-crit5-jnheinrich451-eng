@@ -82,6 +82,15 @@ export function createCombatHud(host, camera) {
     "font-family": "ui-monospace, monospace", "font-size": 17,
     "letter-spacing": 3,
   });
+  // The phase name: once, large, for 2.7 s after a transition, eased in and
+  // out. THAT IS THE ONLY MISSION TEXT. No tutorial text anywhere.
+  const phaseCue = el("text", {
+    x: 0, y: 0, fill: COLOURS.cyan, "text-anchor": "middle",
+    "font-family": "ui-monospace, monospace", "font-size": 30,
+    "letter-spacing": 12,
+  });
+  fixed.append(phaseCue);
+
   const message = el("text", {
     x: 0, y: 0, fill: COLOURS.cyan, "text-anchor": "middle",
     "font-family": "ui-monospace, monospace", "font-size": 14,
@@ -103,6 +112,25 @@ export function createCombatHud(host, camera) {
   attitude.append(horizon);
 
   // ── layer 3: world-tracked ───────────────────────────────────────────────
+  //
+  // THE NAV MARKER IS APPENDED FIRST, so the target bracket always paints over
+  // it. Priority expressed as PAINT ORDER rather than as a rule someone has to
+  // remember -- a hostile covering a waypoint is then a structural guarantee.
+  //
+  // Yellow, NOT orange, deliberately: orange sits between the amber warning and
+  // the salmon danger, and a bright orange waypoint reads as a threat.
+  const navDiamond = el("path", {
+    fill: "none", stroke: COLOURS.yellow, "stroke-width": 2,
+  });
+  const navText = el("text", {
+    fill: COLOURS.yellow, "text-anchor": "middle",
+    "font-family": "ui-monospace, monospace", "font-size": 11,
+  });
+  const navChevron = el("path", {
+    fill: "none", stroke: COLOURS.yellow, "stroke-width": 2.4,
+  });
+  world.append(navDiamond, navText, navChevron);
+
   const bracket = el("rect", {
     fill: "none", stroke: COLOURS.amber, "stroke-width": 2, rx: 2,
   });
@@ -249,6 +277,78 @@ export function createCombatHud(host, camera) {
             hide(diamond);
           }
         }
+      }
+
+      // ── nav ────────────────────────────────────────────────────────────
+      // SUPPRESSED ENTIRELY while a missile is inbound: at that moment the
+      // player needs one piece of information and it is not the waypoint.
+      const navSuppressed = view.threatLevel === "MISSILE";
+      const nav = navSuppressed ? null : view.nav;
+      if (!nav) {
+        hide(navDiamond);
+        hide(navText);
+        hide(navChevron);
+        smooth.delete("nav");
+      } else {
+        const dx = nav.x - view.position.x;
+        const dz = nav.z - view.position.z;
+        const navRange = Math.hypot(dx, dz);
+        const raw = project({ x: nav.x, y: view.position.y, z: nav.z }, w, h);
+        // Hidden inside 260 m: at that range the player is on top of it and
+        // the diamond is just clutter over the thing they are flying at.
+        if (navRange < 260) {
+          hide(navDiamond);
+          hide(navText);
+          hide(navChevron);
+        } else if (raw.behind || raw.x < 0 || raw.x > w || raw.y < 0 || raw.y > h) {
+          // Offscreen: a chevron at the viewport edge pointing the way round.
+          hide(navDiamond);
+          hide(navText);
+          show(navChevron);
+          const ex = w * 0.24;
+          const ey = h * 0.22;
+          let ax = raw.x - cx;
+          let ay = raw.y - cy;
+          if (raw.behind) {
+            ax = -ax;
+            ay = -ay;
+          }
+          const angle = Math.atan2(ay, ax);
+          const px = cx + Math.cos(angle) * ex;
+          const py = cy + Math.sin(angle) * ey;
+          const c = Math.cos(angle);
+          const sn = Math.sin(angle);
+          const t1 = 13;
+          navChevron.setAttribute(
+            "d",
+            `M${px - sn * t1} ${py + c * t1} L${px + c * t1} ${py + sn * t1} L${px + sn * t1} ${py - c * t1}`,
+          );
+        } else {
+          hide(navChevron);
+          const p = damp("nav", raw, dt);
+          show(navDiamond);
+          show(navText);
+          const d = 12;
+          navDiamond.setAttribute(
+            "d",
+            `M${p.x} ${p.y - d} L${p.x + d} ${p.y} L${p.x} ${p.y + d} L${p.x - d} ${p.y} Z`,
+          );
+          navText.setAttribute("x", p.x);
+          navText.setAttribute("y", p.y + d + 14);
+          navText.textContent = `${nav.name} ${(navRange / 1000).toFixed(1)}k`;
+        }
+      }
+
+      // The phase cue: eased in and out over its 2.7 s.
+      phaseCue.setAttribute("x", cx);
+      phaseCue.setAttribute("y", h * 0.36);
+      if (view.phaseCue && view.phaseCueAge < 2.7) {
+        const u = view.phaseCueAge / 2.7;
+        const ease = Math.min(1, Math.min(u / 0.18, (1 - u) / 0.28));
+        phaseCue.textContent = view.phaseCue;
+        phaseCue.setAttribute("opacity", Math.max(0, ease).toFixed(3));
+      } else {
+        phaseCue.textContent = "";
       }
 
       if (view.lead && view.weapon === "GUN") {

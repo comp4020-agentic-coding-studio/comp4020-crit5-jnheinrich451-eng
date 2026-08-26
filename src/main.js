@@ -24,10 +24,15 @@ import {
   wouldHaveHit,
 } from "./threat.js";
 import { createDamageResponse, playerDamageEvent } from "./damage.js";
+import {
+  COMPLETE, DECK, DEFENSIVE, EXTRACTION, FINAL, INTERCEPT, LAUNCH, TERRAIN,
+  autopilotStick, blendStick, buildRoute, captureCheckpoint, createMission,
+} from "./mission.js";
+import { applyFlightState } from "./flight.js";
 import { quatForward } from "./flight.js";
 import { buildTerrainIndex, createPhysics } from "./physics.js";
 import { benchmarkIndex } from "./physics-benchmark.js";
-import { createDevelopmentRecovery, createNullResponse } from "./collision.js";
+import { createDevelopmentRecovery, createMissionCheckpointResponse } from "./collision.js";
 import { createPhysicsDebug } from "./physics-debug.js";
 import { createChaseCamera } from "./chase-camera.js";
 import { createInput } from "./input.js";
@@ -151,6 +156,7 @@ const missiles = createMissileSystem({
 
 function onKill(target) {
   fx.burst(target.position, 46);
+  mission?.noteKill(target.label === "SAM" ? "sam" : "air");
   // Clearing the lock on a kill is what stops the bracket sitting on a corpse.
   targeting.clear();
   message = `${target.label} DESTROYED`;
@@ -160,6 +166,22 @@ function onKill(target) {
 let message = "";
 let messageUntil = 0;
 let threat = "";
+let mission = null;
+let route = null;
+let phaseCue = "";
+let phaseCueAge = 99;
+let extraction = 0;
+let routeHelper = null;
+const fadeEl = document.getElementById("fade");
+const completeEl = document.getElementById("complete");
+const completeRows = document.getElementById("complete-rows");
+
+// Deploy the stage-6 hostile per phase (§7). One instance, three encounters.
+const ENCOUNTERS = {
+  [INTERCEPT]: { ammo: 0, engageDelay: 3.0 },
+  [DEFENSIVE]: { ammo: 2, engageDelay: 2.0 },
+  [FINAL]: { ammo: 1, engageDelay: 1.5 },
+};
 
 loadTerrain(world.scene)
   .then(({ report, group, triangles }) => {
@@ -199,19 +221,56 @@ loadTerrain(world.scene)
 
     installPolicies();
     physicsDebug = createPhysicsDebug(world.scene, physics);
+    buildMission();
   })
   .catch((err) => console.error("terrain load failed", err));
 
 function installPolicies() {
   policies = [
+    // The SHIPPED policy: a collision fails the run and restores a checkpoint.
+    createMissionCheckpointResponse({
+      onFail: () => {
+        message = "MISSION FAILED";
+        messageUntil = clock + 2.2;
+      },
+      onRestore: () => restoreCheckpoint(),
+      onFade: (v) => {
+        if (fadeEl) fadeEl.style.opacity = String(v);
+      },
+    }),
+    // The DEVELOPMENT policy from stage 3, still here and still swappable.
     createDevelopmentRecovery({
       physics,
       getState: () => state,
       onEvent: (e) => console.log(`collision policy: ${e.kind}`, e.event.type),
     }),
-    createNullResponse(),
   ];
   physics.setPolicy(policies[policyIndex]);
+}
+
+/**
+ * Restore the latest checkpoint. Note the SURGICAL cleanup: expireOwner and
+ * clearFx, never missiles.clear() or gun.reset() -- the first would delete the
+ * player's in-flight shot and the second would refill the magazine, making a
+ * crash the cheapest way to rearm.
+ */
+function restoreCheckpoint() {
+  const cp = mission?.latestCheckpoint();
+  if (cp) {
+    applyFlightState(state, cp.snapshot);
+    weapon = cp.weapon;
+    // setCount(n), NOT reload() -- a checkpoint restores the loadout it
+    // RECORDED (§7).
+    weapons?.setCount(cp.missiles);
+    gun.setRounds(cp.gunRounds);
+  }
+  missiles.expireOwner("hostile");
+  gun.clearFx();
+  threatMonitor.reset();
+  damage.reset();
+  evasion.reset();
+  physics.reset(state, { keepPolicy: true });
+  rig.reset(state);
 }
 installPolicies();
 
@@ -273,10 +332,123 @@ function restartSortie() {
   drone.reset();
   threatMonitor.reset();
   evasion.reset();
-  damage.reset();
+  damage.resetAll();
   hostile.setActive(false);
+  mission?.reset();
+  extraction = 0;
+  phaseCue = "";
+  phaseCueAge = 99;
+  if (completeEl) completeEl.hidden = true;
+  if (fadeEl) fadeEl.style.opacity = "0";
+  policies.forEach((p) => p.resetAll?.() ?? p.reset?.());
   if (launchClipSeconds !== null && carrierAnchors) startLaunch(launchClipSeconds);
   else rig.reset(state);
+}
+
+function buildMission() {
+  if (!carrierAnchors) return;
+  route = buildRoute({
+    carrierZ: carrierAnchors.deck.z,
+    coastZ: terrainReport?.ok ? terrainReport.nearEdgeZ : COASTLINE_Z,
+    // The survey is handed the height field as a FUNCTION, which is why it is
+    // testable against a synthetic one with no scene (§4).
+    sampleHeight: terrainReport?.ok ? (x, z) => physics.groundAt(x, z) : null,
+  });
+  console.log(
+    `route: ${route.surveyed ? "surveyed" : "AUTHORED FALLBACK"}, ` +
+      route.legs.map((l) => `${l.name}@${l.z.toFixed(0)}`).join(" -> "),
+  );
+  mission = createMission({
+    route,
+    onPhase: (to, from) => {
+      phaseCue = to;
+      phaseCueAge = 0;
+      onPhaseChange(to, from);
+    },
+  });
+  routeHelper = createRouteHelper(route);
+  world.scene.add(routeHelper);
+}
+
+function onPhaseChange(to, from) {
+  // At EVERY phase transition: the surgical cleanup, for the same reason as
+  // the restore above.
+  missiles.expireOwner("hostile");
+  gun.clearFx();
+  threatMonitor.reset();
+  damage.reset();
+
+  const encounter = ENCOUNTERS[to];
+  if (encounter) {
+    // Deploy ~2400 m ahead, ~900 m to an ALTERNATING side, ~140 m above,
+    // facing back down the player's course -- a head-on pass announces an
+    // intercept and puts it on screen without a hunt.
+    const side = hostile.ai.encounters % 2 === 0 ? 1 : -1;
+    const f = quatForward(state.quat);
+    hostile.deploy({
+      at: {
+        x: state.position.x + f.x * 2400 + side * 900,
+        y: Math.max(400, state.position.y + 140),
+        z: state.position.z + f.z * 2400,
+      },
+      heading: Math.atan2(-(-f.x), -(-f.z)),
+      ammo: encounter.ammo,
+      engageDelay: encounter.engageDelay,
+    });
+  } else {
+    // Outside those phases it is switched off ENTIRELY and handed no
+    // candidates -- not simulated, not drawn, not targetable.
+    hostile.setActive(false);
+  }
+
+  // Four checkpoints, at phase boundaries: deck, open sea, terrain entry,
+  // final approach.
+  const CHECKPOINT_AT = [LAUNCH, INTERCEPT, TERRAIN, FINAL];
+  if (CHECKPOINT_AT.includes(to)) {
+    const f = quatForward(state.quat);
+    // Lifted above the ground AHEAD, not the ground below: a levelled attitude
+    // over a valley floor with a ridge 1.5 km ahead is not a flyable state.
+    let ground = 0;
+    for (let d = 0; d <= 4000; d += 400) {
+      ground = Math.max(
+        ground,
+        physics.groundAt(state.position.x + f.x * d, state.position.z + f.z * d),
+      );
+    }
+    mission.addCheckpoint(
+      captureCheckpoint(state, {
+        groundAhead: ground,
+        weapon,
+        missiles: weapons ? weapons.count : 2,
+        gunRounds: gun.rounds,
+        phase: to,
+      }),
+    );
+  }
+
+  if (to === EXTRACTION) extraction = 0;
+  if (to === COMPLETE) showComplete();
+}
+
+function showComplete() {
+  if (!completeEl || !completeRows) return;
+  const s = mission.mission.stats;
+  const rows = [
+    ["TIME", `${mission.elapsed().toFixed(1)} s`],
+    ["AIR KILLS", String(s.airKills)],
+    ["SAM SITES", String(s.samKills)],
+    ["AIM-9", `${s.missilesFired} / ${(weapons?.capacity ?? 2)}`],
+    ["GUN ROUNDS", String(s.gunFired)],
+  ];
+  completeRows.replaceChildren();
+  for (const [k, v] of rows) {
+    const dt = document.createElement("dt");
+    dt.textContent = k;
+    const dd = document.createElement("dd");
+    dd.textContent = v;
+    completeRows.append(dt, dd);
+  }
+  completeEl.hidden = false;
 }
 
 function startLaunch(clipSeconds) {
@@ -333,6 +505,12 @@ window.addEventListener("keydown", (event) => {
   }
   if (event.code === "KeyP" && physicsDebug) physicsDebug.toggle();
   if (event.code === "KeyJ") hud.setVisible(!hud.isVisible());
+  if (event.code === "KeyN" && routeHelper) {
+    routeHelper.visible = !routeHelper.visible;
+  }
+  // Enter restarts ONLY from the completion screen -- it is a fire key in
+  // flight, and a player pulling the trigger should never restart the sortie.
+  if (event.code === "Enter" && completeEl && !completeEl.hidden) restartSortie();
   if (event.code === "KeyO" && anchorHelper) {
     anchorHelper.visible = !anchorHelper.visible;
   }
@@ -402,7 +580,27 @@ function step(now) {
         engageDelay: 6,
       });
     }
-    const gated = physics.getPolicy()?.overridesInput?.() ? NEUTRAL_STICK : axes;
+    let gated = physics.getPolicy()?.overridesInput?.() ? NEUTRAL_STICK : axes;
+
+    // EXTRACTION is a VIRTUAL STICK, not a transform override: it flies
+    // through the ordinary flight model and obeys the same envelope, bank sink
+    // and camera rig the player was just using, and control is handed AWAY
+    // over 1.3 s rather than switched off.
+    if (mission && mission.mission.phase === EXTRACTION && carrierAnchors) {
+      const home = carrierAnchors.approach;
+      const dx = home.x - state.position.x;
+      const dz = home.z - state.position.z;
+      const auto = autopilotStick(
+        {
+          heading: state.heading, pitch: state.pitch,
+          altitude: state.position.y, speed: state.speed,
+        },
+        { heading: Math.atan2(-dx, -dz), altitude: 620, speed: 190 },
+      );
+      gated = blendStick(gated, auto, Math.min(1, extraction / 1.3), {});
+      rig.blend("recovery", RECOVERY_VIEW, Math.min(1, extraction / 1.3));
+    }
+
     updateFlight(state, gated, dt);
 
     // §8: physics.update() also ticks the installed policy. Any branch that
@@ -501,6 +699,21 @@ function step(now) {
   const t = threatMonitor.update(dt, state, acquisitions, missiles.rounds);
   threat = t.label;
 
+  // ── the mission ────────────────────────────────────────────────────────
+  phaseCueAge += dt;
+  let navLeg = null;
+  if (mission) {
+    const result = mission.update(dt, {
+      position: state.position,
+      fired: launch ? launch.elapsed() >= launch.plan.fireAt : false,
+      handedOff: launch ? launch.hasHandedOff() : false,
+      magazineSpent: hostile.spent(missiles.countFor("hostile")),
+      cinematicDone: extraction >= EXTRACTION_SECONDS,
+    });
+    navLeg = result.leg;
+    if (mission.mission.phase === EXTRACTION) extraction += dt;
+  }
+
   // EVADE is announced only for a miss that WAS going to be a hit -- otherwise
   // the word teaches the player nothing about whether the roll worked.
   const wereGoingToHit = evasion.isRolling()
@@ -544,7 +757,12 @@ function step(now) {
       range: track.range,
       lead,
       threat,
+      threatLevel: t.level,
       message,
+      position: state.position,
+      nav: navLeg,
+      phaseCue,
+      phaseCueAge,
     });
   }
 
@@ -558,6 +776,12 @@ function step(now) {
 }
 
 const NEUTRAL_STICK = { x: 0, y: 0, roll: 0, throttle: 0 };
+// A fourth blended composition (§7). Never a second camera.
+const RECOVERY_VIEW = { standoff: 44, height: 13, framingY: -0.1, lagScale: 1.5 };
+// Level out, turn home, settle, hold 4.4 s, fade 1.5 s. No touchdown is shown:
+// the player has already demonstrated skill and landing must not become
+// another test.
+const EXTRACTION_SECONDS = 1.3 + 4.4 + 1.5;
 
 const deg = (r) => ((r * 180) / Math.PI).toFixed(1);
 const m = (v) => (Number.isFinite(v) ? v.toFixed(0) + " m" : "--");
@@ -586,6 +810,9 @@ function paintRail(axes) {
     `POLICY    ${physics.getPolicy()?.name ?? "--"}  (G)`,
     `HISTORY   ${physics.historyLength()} safe states`,
     `COAST     z=${terrainReport?.ok ? terrainReport.nearEdgeZ : "--"}`,
+    `PHASE     ${mission ? `${mission.mission.phase} ${mission.mission.phaseTime.toFixed(1)}s` : "--"}`,
+    `NAV       ${mission?.currentLeg()?.name ?? "--"}  clock ${mission ? mission.elapsed().toFixed(1) : "--"}s`,
+    `ROUTE     ${route ? (route.surveyed ? "surveyed" : "authored") : "--"}  checkpoints ${mission?.mission.checkpoints.length ?? 0}`,
     `LAUNCH    ${held ? "waiting for the deck" : launch ? (launch.isActive() ? `t=${launch.elapsed().toFixed(1)}/${launch.plan.total.toFixed(1)}` : "handed off") : "--"}`,
     `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
     `WEAPON    ${weapon}   AIM-9 ${weapons ? weapons.count : "--"}   GUN ${gun.rounds}`,
@@ -645,6 +872,24 @@ function updateDroneMesh() {
   // Flash on a hit: feedback that is not a number.
   const flash = Math.max(0, 1 - (clock - drone.target.hitAt) / 0.18);
   droneMesh.material.emissive.setRGB(flash, flash * 0.4, 0);
+}
+
+/** Every trigger volume, drawn on `N`. */
+function createRouteHelper(route) {
+  const group = new THREE.Group();
+  group.visible = false;
+  for (const leg of route.legs) {
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(leg.radius - 24, leg.radius, 48),
+      new THREE.MeshBasicMaterial({
+        color: 0xffd400, side: THREE.DoubleSide, transparent: true, opacity: 0.45,
+      }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(leg.x, (leg.ground ?? 0) + 60, leg.z);
+    group.add(ring);
+  }
+  return group;
 }
 
 let hostileMesh = null;

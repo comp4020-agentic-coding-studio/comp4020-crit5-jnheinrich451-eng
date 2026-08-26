@@ -112,6 +112,120 @@ export function createDevelopmentRecovery({ physics, getState, onEvent }) {
   };
 }
 
+// ── MissionCheckpointResponse (stage 7) ────────────────────────────────────
+
+export const MC = {
+  hold: 0.28, // stage 9 lengthens this to cover the crash presentation
+  fadeOut: 0.5,
+  fadeIn: 0.62,
+  cooldown: 0.55,
+};
+
+export const IDLE = "IDLE";
+export const HOLD = "HOLD";
+export const FADE_OUT = "FADE_OUT";
+export const FADE_IN = "FADE_IN";
+export const COOLING = "COOLING";
+
+/**
+ * The second policy: a collision FAILS the run and restores a checkpoint.
+ *
+ * Same handleCollision / tick interface as the development policy, so `G`
+ * swaps the two with BYTE-IDENTICAL DETECTION -- only the response differs,
+ * which is the whole point of §4's split.
+ *
+ *   trigger -> hold -> fadeOut -> restore at FULL BLACK -> fadeIn -> settled
+ *
+ * Missile hits are served through this same policy, so one failure model
+ * covers both and there is no second place for a failure to be decided.
+ */
+export function createMissionCheckpointResponse({ onRestore, onFail, onFade } = {}) {
+  let stage = IDLE;
+  let timer = 0;
+  let failures = 0;
+  let pending = null;
+
+  function fade() {
+    // 0 = clear, 1 = full black.
+    if (stage === FADE_OUT) return timer / MC.fadeOut;
+    if (stage === FADE_IN) return 1 - timer / MC.fadeIn;
+    if (stage === HOLD) return 0;
+    return 0;
+  }
+
+  return {
+    name: "MissionCheckpointResponse",
+
+    handleCollision(event) {
+      // DECLINE FORWARD PREDICTIONS. Detection fires on
+      // `physicalContact || forwardImminent`, and the second is a PREDICTION.
+      // Stage 3's development policy acts on it -- that is its automatic
+      // dodge. Failing a mission for a crash that has not happened is the
+      // worst class of failure there is, so this policy fails on CONTACT only.
+      // If the prediction was right, real contact arrives a moment later and
+      // fails the run for something the player can actually see.
+      if (event.predicted) return false;
+      return this.trigger(event);
+    },
+
+    /**
+     * REFUSES RE-ENTRY while active or cooling down. A proximity fuze inside a
+     * 22 m sphere, or a terrain probe grinding along a slope, trips on
+     * consecutive frames; without this the fade restarts every frame and the
+     * screen never clears.
+     */
+    trigger(event) {
+      if (stage !== IDLE) return false;
+      stage = HOLD;
+      timer = 0;
+      pending = event;
+      failures++;
+      if (onFail) onFail(event, failures);
+      return true;
+    },
+
+    tick(dt) {
+      if (stage === IDLE) return;
+      timer += dt;
+      if (stage === HOLD && timer >= MC.hold) {
+        stage = FADE_OUT;
+        timer = 0;
+      } else if (stage === FADE_OUT && timer >= MC.fadeOut) {
+        // RESTORE AT FULL BLACK, so the player never sees the teleport.
+        stage = FADE_IN;
+        timer = 0;
+        if (onRestore) onRestore(pending);
+        pending = null;
+      } else if (stage === FADE_IN && timer >= MC.fadeIn) {
+        stage = COOLING;
+        timer = 0;
+      } else if (stage === COOLING && timer >= MC.cooldown) {
+        stage = IDLE;
+        timer = 0;
+      }
+      if (onFade) onFade(fade());
+    },
+
+    // The stick is neutralised until the restore has settled.
+    overridesInput: () => stage !== IDLE && stage !== COOLING,
+    fade,
+    stage: () => stage,
+    isActive: () => stage !== IDLE,
+    failures: () => failures,
+
+    reset() {
+      stage = IDLE;
+      timer = 0;
+      pending = null;
+    },
+    resetAll() {
+      this.reset();
+      failures = 0;
+    },
+    stats: () => ({ failures, stage }),
+  };
+}
+
 /**
  * A policy that declines everything. Stands in for stage 7's mission policy
  * until it exists, and exists now so the `G` swap is testable: the point of
