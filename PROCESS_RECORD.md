@@ -216,3 +216,76 @@ pre-commit hook still was not running from the earlier turn's fix on a fresh
 `pnpm install`, and the `assets/` directory the user staged is 46 MB. It is
 copied into `public/models/` so the loaders work, and gitignored pending the
 fidelity call, because that commit is the one step here that cannot be undone.
+
+---
+
+## 2026-08-27 09:44 — The pipeline closed, and stages 3 to 6
+
+**Prompt:**
+
+> Good, lets finish the pipeline, and fix the holes! Then Stage 5 and 6.
+
+Preceded by *"lets add the terrain, and the aircraft carrer in stage-4 launch"*
+and, on the marking environment, *"it is not real deployed on a phone, it is
+like Chrome F12 show mobile interface, so all operate on PC."*
+
+**Result:**
+Stages 3 (terrain, grid index, probes, collision policy), 4 (carrier and
+catapult), 5 (targeting, guns, one missile) and 6 (the hostile, the threat
+monitor, damage) — 132 checks to 479.
+
+**The pipeline hole was that nothing deployed.** `public/models` was gitignored
+pending a fidelity call, so a Pages build would have served the game with no
+terrain, no carrier and a placeholder box: the asset-failure fallback working
+exactly as designed, on a site where nothing had failed. `pnpm assets` now
+builds the shipping copies, sizing each texture by what it is FOR rather than by
+one blanket factor — 2048 for baseColor, 1024 for normals, and 512 for
+`metallicRoughness`, which is a DATA map carrying no detail an eye resolves at
+200 m/s. 47.30 MB → 13.49 MB, 6.8 MB gzipped, and side by side the deck markings
+and airframe panel lines are indistinguishable. Sources stay untracked, so a
+re-encode is a rebuild rather than a second permanent copy in every clone.
+
+**Two scale decisions where the spec could not be satisfied literally.** §5 asks
+for terrain 30 km across AND a ~643 m peak, and this asset gives neither under
+one factor: shrinking Ireland's 486 km to 30 km flattens its relief by the same
+16× and leaves a 292 m peak with nothing to hide behind. Relief is not
+decoration — §13's SAM mechanic *is* line-of-sight and §10 surveys passes
+between flanks — so the horizontal scale comes from the 30 km target, the
+vertical from the 643 m one, ×2.20, both measured and the ratio logged. And §9's
+carrier: the deck plane is found by histogramming the AREA of up-facing
+triangles by height, because the bounding-box top is the mast, not the deck.
+
+**Verified:**
+`pnpm check` green throughout; the game's suite 479/0. The load-bearing checks
+were the produced measurements rather than the assertions: the terrain index
+benchmarked at **2413× faster than `THREE.Raycaster` with 59/59 agreement within
+0.5 m**, against §8's quoted ~2500×, and its 8.8 MB against §8's quoted ~8.9 MB.
+The catapult solves T = 199.68 / (8 + 144/2.25) = 2.7733 s from the closed form,
+and the suite asserts a 20 Hz frame reaches the same release point as a 60 Hz
+one to 1e-6.
+
+**Commit:** [`f09c8ef`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/f09c8ef), [`e7a66ac`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/e7a66ac), [`48dd3b0`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/48dd3b0), [`725fd59`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/725fd59), [`f371882`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/f371882)
+
+**What happened:**
+**The same bug twice in one hour, which is the part worth keeping.** `normalise()`
+recentred every asset on its bounding box. For the terrain that moved sea level
+to the middle of the box, so the coast measured 321 m up a hillside and the
+samples reported "land" three kilometres out to sea. I fixed it, and an hour
+later the carrier's flight deck measured at **y = −8** — below the sea it floats
+on — because a hull's bounding box runs keel-to-masthead and its middle is
+underwater. Recentring is now per-axis, and the comment on the option names both
+failures, because the shape of the mistake is not "I got a number wrong" but "a
+bounding box centre is not a semantic origin".
+
+Also: the raycaster agreement check reported **0/15 and "raycaster missed 45"**,
+which reads exactly like the broken index stage 3 warns about. The index was
+fine. The terrain is shifted into place after its triangles are snapshotted, and
+`THREE.Raycaster` reads `matrixWorld` — so the benchmark was comparing two
+different worlds rather than two algorithms. Stage 3 says that check is the one
+that catches a broken index; it caught a broken benchmark, which is the same
+value for a different reason.
+
+And three test failures that were all *my tests* rather than the code: a rewind
+target compared against an aircraft I never flew, a fuze given one frame to
+close 8 m at 5 m per frame, and a "dead zone holds attitude" claim that
+contradicts ASSISTED self-centring by definition.
