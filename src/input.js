@@ -58,6 +58,19 @@ export function createInput(options = {}) {
   const axes = { x: 0, y: 0, roll: 0, throttle: 0 };
   const listeners = [];
 
+  // ── the pitch convention (§7, stage 2) ───────────────────────────────────
+  // NOSE UP   W pitches up    default -- what WASD implies to a first-time
+  //                           player, who is being handed this game cold
+  // NOSE DOWN W pitches down  the control column convention, what anyone who
+  //                           has flown a sim reaches for without thinking
+  //
+  // Both are real and neither is wrong, so it is a toggle rather than a
+  // choice made for the player. It is ONE SIGN FLIP applied here, at the
+  // input boundary: nothing downstream -- not the flight model, not the HUD,
+  // not the FX -- may know the setting exists, because a convention is not a
+  // physics change and no other module should have an opinion about it.
+  let pitchSign = 1;
+
   function on(node, type, fn) {
     if (!node || typeof node.addEventListener !== "function") return;
     node.addEventListener(type, fn);
@@ -78,6 +91,10 @@ export function createInput(options = {}) {
       clear();
       return;
     }
+    if (code === "KeyI") {
+      togglePitchConvention();
+      return;
+    }
     if (LATCH_KEYS[code]) latches.add(LATCH_KEYS[code]);
     if (!AXIS_KEYS[code]) return;
     held.add(code);
@@ -96,6 +113,19 @@ export function createInput(options = {}) {
     axes.y = 0;
     axes.roll = 0;
     axes.throttle = 0;
+    // pitchSign is deliberately NOT reset here. Every other reset in this
+    // project clears everything it can reach; this is the explicit exception,
+    // because the convention is a PREFERENCE and must survive reset, respawn
+    // and mode change. A player who set it once should never have to set it
+    // again because they hit a mountain.
+  }
+
+  function togglePitchConvention() {
+    pitchSign = -pitchSign;
+    // Flip the live ramped value too, so the axis reverses on the spot
+    // rather than easing across zero over the next second. A player who
+    // presses this mid-pull expects the nose to change direction now.
+    axes.y = -axes.y;
   }
 
   // Rule 3: every one of these is a way a held key stops being held without a
@@ -131,7 +161,9 @@ export function createInput(options = {}) {
       const bind = AXIS_KEYS[code];
       if (bind && bind.axis === axis) v += bind.value;
     }
-    return clamp(v, -1, 1);
+    v = clamp(v, -1, 1);
+    // The whole of the pitch convention, applied once, here.
+    return axis === "y" ? v * pitchSign : v;
   }
 
   function update(dt) {
@@ -171,6 +203,13 @@ export function createInput(options = {}) {
     // touch or wheel listener exists at all -- rather than only the symptom
     // that a dispatched pointer event happened not to move an axis.
     listenerTypes: () => listeners.map(([, type]) => type),
+    // Announced as "PITCH · W = NOSE DOWN", never "INVERT ON": a player who
+    // just pressed the key needs to know which way W now goes, and "ON" does
+    // not tell them that.
+    pitchConvention: () => (pitchSign > 0 ? "W = NOSE UP" : "W = NOSE DOWN"),
+    pitchSign: () => pitchSign,
+    togglePitchConvention,
+
     consumeLatch(name) {
       if (!latches.has(name)) return false;
       latches.delete(name);

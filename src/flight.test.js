@@ -29,7 +29,9 @@ import {
   quatFromEulerYXZ,
   quatIdentity,
   quatMultiply,
+  quatToEulerYXZ,
   quatUp,
+  setMode,
   updateFlight,
   wrapAngle,
 } from "./flight.js";
@@ -580,6 +582,308 @@ function testLatches() {
   check("dropLatches discards a pending latch", h.input.consumeLatch("restart") === false);
 }
 
+// ── stage 2: EXPERT mode ───────────────────────────────────────────────────
+
+const expert = (over = {}) => createFlightState({ mode: "EXPERT", ...over });
+
+function testExpertHasNoBankToHeading() {
+  // THE defining assertion of the mode. Bank hard in EXPERT, hold no other
+  // input, and the heading must not move. Asserted as an ABSENCE on purpose:
+  // a later edit that "fixes turning in Expert" will reintroduce the coupling
+  // and look like a bug fix, and this is the only thing that will object.
+  // Drive BOTH modes with the identical held input and compare. Holding is
+  // what makes the comparison fair: ASSISTED self-centres, so a version of
+  // this test that released the stick would let the bank decay and would be
+  // measuring the decay rather than the coupling.
+  const e = expert();
+  fly(e, stick({ x: 1 }), 3);
+  const a = createFlightState();
+  fly(a, stick({ x: 1 }), 3);
+
+  // Prove the roll happened via the UP-VECTOR, not via the bank angle: at a
+  // constant stick EXPERT rolls 2.4 rad/s, so after 3 s it has turned 7.2 rad
+  // and the derived Euler bank has wrapped past a full revolution -- near
+  // zero again, and useless as evidence either way.
+  const eUp = quatUp(e.quat);
+  check(
+    "EXPERT: a held roll does not change heading at all",
+    Math.abs(eUp.y - 1) > 0.1 && near(e.heading, 0, 1e-9),
+    `up.y ${eUp.y} heading ${e.heading}`,
+  );
+  check(
+    "ASSISTED: the same held input turns the aircraft",
+    Math.abs(a.heading) > 0.5,
+    `heading ${a.heading}`,
+  );
+
+  // And with the stick released, EXPERT keeps the bank and STILL does not
+  // turn -- the case a reintroduced coupling would fail loudest.
+  const held = expert();
+  fly(held, stick({ x: 1 }), 0.45);
+  const bankHeld = held.bank;
+  const headingHeld = held.heading;
+  fly(held, stick(), 3);
+  check(
+    "EXPERT: a persisting bank with no input does not turn",
+    Math.abs(held.bank) > 0.5 &&
+      near(held.bank, bankHeld, 1e-6) &&
+      near(held.heading, headingHeld, 1e-9),
+    `bank ${bankHeld} -> ${held.bank}, heading ${headingHeld} -> ${held.heading}`,
+  );
+}
+
+function testExpertIsLocal() {
+  // Pitching while banked bends the trajectory: that is what
+  // post-multiplication buys, and it is how the mode actually turns.
+  const e = expert();
+  fly(e, stick({ x: 1 }), 0.4); // establish bank
+  const before = e.heading;
+  fly(e, stick({ y: 1 }), 1.2); // pull, no roll input
+  check(
+    "EXPERT: pitching while banked changes heading through the local axis",
+    Math.abs(wrapAngle(e.heading - before)) > 0.15,
+    `heading ${before} -> ${e.heading}`,
+  );
+
+  // Pulling while wings-level must NOT change heading -- otherwise the test
+  // above passes for the wrong reason.
+  const level = expert();
+  const levelBefore = level.heading;
+  fly(level, stick({ y: 1 }), 1.2);
+  check(
+    "EXPERT: pitching wings-level leaves heading alone",
+    near(level.heading, levelBefore, 1e-6),
+    `heading ${levelBefore} -> ${level.heading}`,
+  );
+}
+
+function testExpertDoesNotSelfCentre() {
+  const e = expert();
+  fly(e, stick({ x: 1 }), 0.4);
+  const banked = e.bank;
+  fly(e, stick(), 4);
+  check(
+    "EXPERT: controls do not self-centre",
+    near(e.bank, banked, 1e-6),
+    `bank ${banked} -> ${e.bank}`,
+  );
+
+  // ASSISTED must self-centre, for the same reason as above.
+  const a = createFlightState();
+  fly(a, stick({ x: 1 }), 2);
+  fly(a, stick(), 4);
+  check("ASSISTED: controls self-centre", Math.abs(a.bank) < 0.02, `bank ${a.bank}`);
+}
+
+function testExpertCanInvert() {
+  const e = expert();
+  // Roll continuously past 90 degrees and hold.
+  fly(e, stick({ x: 1 }), 1.4);
+  const up = quatUp(e.quat);
+  check(
+    "EXPERT: the aircraft can be inverted and stay there",
+    up.y < 0,
+    `up.y ${up.y}`,
+  );
+  check(
+    "EXPERT: pitch is not clamped to the ASSISTED limit",
+    true, // exercised by the loop below
+  );
+
+  // A full loop must be completable: pitch has to pass through vertical
+  // without the ASSISTED clamp catching it.
+  const looper = expert();
+  let sawSteepClimb = false;
+  let sawInverted = false;
+  for (let t = 0; t < 6; t += 1 / 60) {
+    updateFlight(looper, stick({ y: 1 }), 1 / 60);
+    const f = quatForward(looper.quat);
+    const u = quatUp(looper.quat);
+    if (f.y > 0.9) sawSteepClimb = true;
+    if (u.y < -0.5) sawInverted = true;
+  }
+  check("EXPERT: a sustained pull reaches vertical", sawSteepClimb);
+  check("EXPERT: a sustained pull goes over the top", sawInverted);
+
+  check(
+    "EXPERT: the quaternion stays normalised through a loop",
+    near(
+      Math.hypot(looper.quat.x, looper.quat.y, looper.quat.z, looper.quat.w),
+      1,
+      1e-6,
+    ),
+  );
+}
+
+function testExpertSink() {
+  // The sink law is written on the lift direction, not the bank angle, so it
+  // still means something past 90 degrees. Written on cos(bank) it would go
+  // NEGATIVE when inverted and the aircraft would climb by rolling over.
+  const inverted = expert();
+  fly(inverted, stick({ x: 1 }), 1.4);
+  check(
+    "EXPERT: inverted flight sinks rather than climbing",
+    inverted.sink > 0,
+    `sink ${inverted.sink} up.y ${quatUp(inverted.quat).y}`,
+  );
+
+  const levelExpert = expert();
+  fly(levelExpert, stick(), 2);
+  check(
+    "EXPERT: level flight has no sink",
+    near(levelExpert.sink, 0, 1e-9),
+    `sink ${levelExpert.sink}`,
+  );
+
+  // The two modes must agree at a bank both can represent, or the sink law
+  // has silently forked.
+  const a = createFlightState();
+  fly(a, stick({ x: 1 }), 6);
+  const bankedUpY = quatUp(a.quat).y;
+  check(
+    "the one sink law reproduces the ASSISTED turn cost at the bank limit",
+    near(bankedUpY, Math.cos(BANK_MAX), 1e-6) && a.sink > 17 && a.sink < 18,
+    `up.y ${bankedUpY} sink ${a.sink}`,
+  );
+}
+
+function testBothModesWriteTheQuaternion() {
+  for (const mode of ["ASSISTED", "EXPERT"]) {
+    const s = createFlightState({ mode });
+    fly(s, stick({ x: 0.5, y: 0.3 }), 1.2);
+    const q = s.quat;
+    check(
+      `${mode} writes a plain normalised quaternion`,
+      typeof q.copy === "undefined" &&
+        near(Math.hypot(q.x, q.y, q.z, q.w), 1, 1e-6),
+    );
+    // Forward and up derived from the quaternion must agree with the Euler
+    // angles the rail and the HUD read.
+    const back = quatToEulerYXZ(q);
+    check(
+      `${mode}: the Euler readout agrees with the quaternion`,
+      near(wrapAngle(back.heading - s.heading), 0, 1e-6) &&
+        near(back.pitch - s.pitch, 0, 1e-6) &&
+        near(wrapAngle(back.bank - s.bank), 0, 1e-6),
+      `${JSON.stringify(back)} vs h${s.heading} p${s.pitch} b${s.bank}`,
+    );
+  }
+
+  // quatToEulerYXZ must invert quatFromEulerYXZ over ordinary attitudes.
+  for (const [h, p, b] of [
+    [0, 0, 0],
+    [0.7, 0.3, -0.5],
+    [-2.1, -0.4, 1.1],
+    [3.0, 0.55, 0.9],
+  ]) {
+    const back = quatToEulerYXZ(quatFromEulerYXZ(h, p, b));
+    check(
+      `quatToEulerYXZ inverts quatFromEulerYXZ at ${h},${p},${b}`,
+      near(wrapAngle(back.heading - h), 0, 1e-9) &&
+        near(back.pitch - p, 0, 1e-9) &&
+        near(wrapAngle(back.bank - b), 0, 1e-9),
+      JSON.stringify(back),
+    );
+  }
+}
+
+function testModeChange() {
+  // Entering ASSISTED from an attitude it cannot represent must level onto
+  // the heading being travelled, not snap the quaternion through the clamp.
+  const e = expert();
+  fly(e, stick({ x: 1 }), 1.4); // inverted
+  const headingBefore = e.heading;
+  setMode(e, "ASSISTED");
+  check(
+    "entering ASSISTED clamps into its own envelope",
+    Math.abs(e.bank) <= BANK_MAX + 1e-9 && Math.abs(e.pitch) <= PITCH_MAX + 1e-9,
+    `bank ${e.bank} pitch ${e.pitch}`,
+  );
+  check(
+    "entering ASSISTED keeps the heading being travelled",
+    near(wrapAngle(e.heading - headingBefore), 0, 1e-9),
+  );
+  check(
+    "entering ASSISTED rebuilds the quaternion from the clamped angles",
+    near(quatUp(e.quat).y, Math.cos(e.bank) * Math.cos(e.pitch), 1e-6),
+  );
+  check("setMode on the same mode is a no-op", setMode(e, "ASSISTED").mode === "ASSISTED");
+}
+
+// ── stage 2: the pitch convention ──────────────────────────────────────────
+
+function testPitchConvention() {
+  const h = inputHarness();
+  check("the default convention is W = nose up", h.input.pitchSign() === 1);
+  check(
+    "the default is announced by direction, not as ON/OFF",
+    h.input.pitchConvention() === "W = NOSE UP",
+    h.input.pitchConvention(),
+  );
+
+  h.down("KeyW");
+  const up = h.tick(1.5).y;
+  check("W pitches up by default", up === 1, `y ${up}`);
+
+  // Toggling WHILE the key is held must flip the axis on the spot.
+  h.down("KeyI");
+  const flipped = h.input.axes.y;
+  check(
+    "toggling while a key is held flips the axis immediately",
+    flipped === -1,
+    `y ${flipped}`,
+  );
+  check(
+    "the announcement names the new direction",
+    h.input.pitchConvention() === "W = NOSE DOWN",
+    h.input.pitchConvention(),
+  );
+  check("W now pitches down", h.tick(1.5).y === -1, `y ${h.input.axes.y}`);
+
+  // It is a pure sign flip and nothing else: symmetric, neutral-preserving,
+  // and it must not touch any other axis.
+  const h2 = inputHarness();
+  h2.down("KeyI");
+  h2.down("KeyS");
+  check("the flip is symmetric", h2.tick(1.5).y === 1, `y ${h2.input.axes.y}`);
+  h2.up("KeyS");
+  check("neutral stays neutral under the flip", h2.tick(1.5).y === 0);
+
+  const h3 = inputHarness();
+  h3.down("KeyI");
+  h3.down("KeyA");
+  const banked = h3.tick(1.5);
+  check("bank is unaffected by the pitch convention", banked.x === 1, `x ${banked.x}`);
+  h3.down("KeyQ");
+  check("roll is unaffected by the pitch convention", h3.tick(1.5).roll === 1);
+
+  // A PREFERENCE, not transient state: it must survive everything that
+  // clears input, which is the one exception in the whole project.
+  const h4 = inputHarness();
+  h4.down("KeyI");
+  h4.input.clear();
+  check("the convention survives clear()", h4.input.pitchSign() === -1);
+  h4.target.dispatchEvent(new Event("blur"));
+  check("the convention survives a blur", h4.input.pitchSign() === -1);
+  h4.down("KeyC");
+  check("the convention survives the C key", h4.input.pitchSign() === -1);
+  h4.doc.visibilityState = "hidden";
+  h4.doc.dispatchEvent(new Event("visibilitychange"));
+  check("the convention survives a tab switch", h4.input.pitchSign() === -1);
+
+  check("toggling twice returns to the default", (() => {
+    const t = inputHarness();
+    t.down("KeyI");
+    t.down("KeyI");
+    return t.input.pitchSign() === 1;
+  })());
+
+  // I must not register as a held key or a flight axis.
+  const h5 = inputHarness();
+  h5.down("KeyI");
+  check("I is not a held axis key", h5.input.heldKeys().length === 0);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -594,6 +898,14 @@ const SUITES = [
   ["stuck-key clearing", testStuckKeyClearing],
   ["no pointer path", testNoPointerPath],
   ["latches", testLatches],
+  ["expert: no bank->heading", testExpertHasNoBankToHeading],
+  ["expert: local axes", testExpertIsLocal],
+  ["expert: no self-centring", testExpertDoesNotSelfCentre],
+  ["expert: inversion", testExpertCanInvert],
+  ["expert: sink law", testExpertSink],
+  ["both modes write the quaternion", testBothModesWriteTheQuaternion],
+  ["mode change", testModeChange],
+  ["pitch convention", testPitchConvention],
 ];
 
 export function run() {

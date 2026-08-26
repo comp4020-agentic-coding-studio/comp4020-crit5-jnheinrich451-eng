@@ -60,6 +60,10 @@ export const TURN_G =
 // player learns to pull while turning. That is the whole lesson of the sink
 // term, and it is why it is not a flat constant.
 const SINK_GAIN = 9;
+// The floor on the lift direction's vertical component. Without it, knife-edge
+// flight in EXPERT divides by zero and inverted flight changes sign.
+const SINK_MIN_LIFT = 0.15;
+const SINK_MAX = 60;
 
 // ── quaternion helpers (plain math, no THREE) ──────────────────────────────
 
@@ -115,6 +119,31 @@ export function quatRight(q) {
 export function quatNormalize(q) {
   const n = Math.hypot(q.x, q.y, q.z, q.w) || 1;
   return { x: q.x / n, y: q.y / n, z: q.z / n, w: q.w / n };
+}
+
+// The inverse of quatFromEulerYXZ, matching the same YXZ order. EXPERT
+// integrates the quaternion directly, so the Euler angles have to be read
+// back OUT of it for the HUD, the camera roll term and the developer rail --
+// they become a derived view of the attitude in that mode rather than its
+// source. Nothing may write them back into the quaternion in EXPERT, or the
+// pitch clamp would quietly forbid inverted flight.
+export function quatToEulerYXZ(q) {
+  const { x, y, z, w } = q;
+  const m13 = 2 * (x * z + w * y);
+  const m21 = 2 * (x * y + w * z);
+  const m22 = 1 - 2 * (x * x + z * z);
+  const m23 = 2 * (y * z - w * x);
+  const m31 = 2 * (x * z - w * y);
+  const m11 = 1 - 2 * (y * y + z * z);
+  const m33 = 1 - 2 * (x * x + y * y);
+
+  const pitch = Math.asin(clamp(-m23, -1, 1));
+  // Near the pitch singularity heading and bank are not separable; pin bank
+  // and put the whole rotation into heading rather than letting both spin.
+  if (Math.abs(m23) < 0.9999999) {
+    return { heading: Math.atan2(m13, m33), pitch, bank: Math.atan2(m21, m22) };
+  }
+  return { heading: Math.atan2(-m31, m11), pitch, bank: 0 };
 }
 
 // ── state ──────────────────────────────────────────────────────────────────
@@ -176,12 +205,31 @@ export function updateFlight(state, input, dt) {
     SPEED_MAX,
   );
 
-  stepAssisted(state, input, dt); // EXPERT arrives in stage 2
+  // Both modes write the same quaternion field, so the renderer and the
+  // camera read one attitude source regardless of mode. §6.
+  if (state.mode === "EXPERT") stepExpert(state, input, dt);
+  else stepAssisted(state, input, dt);
 
-  // Both modes write the same quaternion field. §6.
-  state.quat = quatFromEulerYXZ(state.heading, state.pitch, state.bank);
+  // ONE sink law for both modes, expressed on the lift direction rather than
+  // on the bank angle. The aircraft's up-vector is where lift points, so its
+  // vertical component is how much of that lift is holding the aircraft up:
+  //
+  //   level      up.y = 1                 -> no sink
+  //   70 deg     up.y = cos 70 = 0.342    -> 17.3 m/s, the arcade turn cost
+  //   inverted   up.y = -1, floored       -> heavy sink
+  //
+  // Written on the bank angle instead, this breaks the moment EXPERT can go
+  // past 90 degrees: cos(180 deg) is negative and the aircraft would CLIMB
+  // when inverted. The floor is what keeps that from becoming a division by
+  // zero at knife edge.
+  const up = quatUp(state.quat);
+  state.sink = clamp(
+    SINK_GAIN * (1 / Math.max(up.y, SINK_MIN_LIFT) - 1),
+    0,
+    SINK_MAX,
+  );
 
-  // Translate along the nose, then apply bank-driven sink.
+  // Translate along the nose, then apply the sink.
   const f = quatForward(state.quat);
   state.position.x += f.x * state.speed * dt;
   state.position.y += f.y * state.speed * dt;
@@ -205,12 +253,65 @@ function stepAssisted(state, input, dt) {
   state.pitch += (pitchTarget - state.pitch) * (1 - Math.exp(-PITCH_RATE * dt));
   state.pitch = clamp(state.pitch, -PITCH_MAX, PITCH_MAX);
 
-  // Bank drives heading change. This coupling IS what ASSISTED is; stage 2's
-  // EXPERT mode is defined by its absence, and a test asserts that absence.
+  // Bank drives heading change. This coupling IS what ASSISTED is; EXPERT is
+  // defined by its absence, and a test asserts that absence because a
+  // well-meaning later edit that "fixes turning" in Expert will reintroduce
+  // it and look like a bug fix.
   const omega = (TURN_G * Math.tan(state.bank)) / Math.max(state.speed, 1);
   state.heading = wrapAngle(state.heading + omega * dt);
 
-  state.sink = SINK_GAIN * (1 / Math.cos(state.bank) - 1);
+  state.quat = quatFromEulerYXZ(state.heading, state.pitch, state.bank);
+}
+
+// ── EXPERT ─────────────────────────────────────────────────────────────────
+// Quaternion integration in aircraft-local space. Input is angular VELOCITY,
+// not an angle, and controls do not self-centre.
+
+const EXPERT_PITCH_RATE = 1.15; // rad/s
+const EXPERT_ROLL_RATE = 2.4; // rad/s
+
+function stepExpert(state, input, dt) {
+  const pitchRate = clamp(input.y || 0, -1, 1) * EXPERT_PITCH_RATE;
+  const rollRate =
+    (clamp(input.x || 0, -1, 1) + clamp(input.roll || 0, -1, 1)) *
+    EXPERT_ROLL_RATE;
+
+  // THERE IS NO BANK -> HEADING TERM HERE, and its absence is the entire
+  // point of the mode. Heading changes only because pitching while banked
+  // rotates the nose through the local axis -- which is how a real aircraft
+  // turns, and why the mode rewards using bank and pitch together.
+  const hx = (pitchRate * dt) / 2;
+  const hz = (rollRate * dt) / 2;
+  const delta = quatNormalize({ x: hx, y: 0, z: hz, w: 1 });
+
+  // POST-multiply. quat * delta applies the rotation in the aircraft's own
+  // frame; delta * quat would apply it in world axes and the mode would just
+  // be a clumsier ASSISTED.
+  state.quat = quatNormalize(quatMultiply(state.quat, delta));
+
+  // Euler angles become a derived READ of the quaternion in this mode. They
+  // are deliberately not clamped: the aircraft can be inverted and stay
+  // there, and the player can lose orientation. Those are consequences to
+  // accept, not to smooth over.
+  const e = quatToEulerYXZ(state.quat);
+  state.heading = e.heading;
+  state.pitch = e.pitch;
+  state.bank = e.bank;
+}
+
+// Switching mode must not carry the old model's attitude in through a clamp.
+// ASSISTED cannot represent an inverted or steeply pitched state, so entering
+// it from EXPERT levels onto the heading being travelled rather than
+// snapping the quaternion through the pitch limit.
+export function setMode(state, mode) {
+  if (state.mode === mode) return state;
+  state.mode = mode;
+  if (mode === "ASSISTED") {
+    state.pitch = clamp(state.pitch, -PITCH_MAX, PITCH_MAX);
+    state.bank = clamp(state.bank, -BANK_MAX, BANK_MAX);
+    state.quat = quatFromEulerYXZ(state.heading, state.pitch, state.bank);
+  }
+  return state;
 }
 
 export function wrapAngle(a) {

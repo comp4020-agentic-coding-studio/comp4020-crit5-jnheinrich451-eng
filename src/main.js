@@ -4,9 +4,12 @@ import * as THREE from "three";
 import { createWorld, createPlaceholderAircraft } from "./world.js";
 import { createChaseCamera } from "./chase-camera.js";
 import { createInput } from "./input.js";
+import { loadAircraft } from "./aircraft.js";
+import { assetFailures } from "./assets.js";
 import {
   BANK_MAX,
   createFlightState,
+  setMode,
   updateFlight,
   commandedSpeed,
 } from "./flight.js";
@@ -19,11 +22,24 @@ const world = createWorld(canvas);
 const rig = createChaseCamera(world.camera);
 const input = createInput({ target: window, doc: document });
 
-const aircraft = createPlaceholderAircraft();
+// The placeholder flies immediately; the real airframe swaps in when it
+// arrives. Both are 19.4 m, so nothing tuned against one is wrong for the
+// other, and a failed load is a visual downgrade rather than a broken game.
+let aircraft = createPlaceholderAircraft();
 world.scene.add(aircraft);
+let airframe = null;
 
 let state = createFlightState();
 rig.reset(state);
+
+loadAircraft()
+  .then((loaded) => {
+    world.scene.remove(aircraft);
+    aircraft = loaded.group;
+    airframe = loaded;
+    world.scene.add(aircraft);
+  })
+  .catch((err) => console.error("aircraft load failed", err));
 
 // Developer rail, `H`. Off by default: a player must never open this page and
 // find a wall of telemetry. §7 lists the rest of the developer keys.
@@ -35,6 +51,17 @@ window.addEventListener("keydown", (event) => {
     railVisible = !railVisible;
     rail.hidden = !railVisible;
   }
+  if (event.code === "KeyM") {
+    setMode(state, state.mode === "ASSISTED" ? "EXPERT" : "ASSISTED");
+    // Clear transient input on a mode change: a held key would otherwise
+    // command the fresh model on frame one, and the ramped axes would carry
+    // the old attitude in with them. input.clear() deliberately leaves the
+    // pitch convention alone -- it is a preference, not transient state.
+    input.clear();
+    rig.reset(state);
+  }
+  // `G` swaps collision policies (stage 3) and `O` draws the carrier anchors
+  // (stage 4); both land with the systems they belong to.
 });
 
 // The frame loop. §17.3 and stage 1's rule 1: schedule the NEXT frame FIRST,
@@ -111,11 +138,16 @@ function paintRail(axes) {
     `BANK      ${deg(state.bank)}  / ${deg(BANK_MAX)}`,
     `POS       ${state.position.x.toFixed(0)}, ${state.position.z.toFixed(0)}`,
     `AXES      x ${axes.x.toFixed(2)}  y ${axes.y.toFixed(2)}  roll ${axes.roll.toFixed(2)}  thr ${axes.throttle}`,
+    `PITCH CV  ${input.pitchConvention()}`,
+    `GEAR      ${airframe ? (airframe.gearIsDown() ? "DOWN" : "UP") : "--"}`,
     // A stuck axis is invisible in every other readout; this is the line that
     // makes it obvious. §7.
     `KEYS      ${held.length ? held.join(" ") : "--"}`,
     `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
     `ERRORS    ${errorCount}`,
+    // §2: a fallback must be visible, or a build quietly flying the
+    // placeholder looks like a build with a badly modelled aircraft.
+    `ASSETS    ${assetFailures().length ? assetFailures().map((f) => f.name).join(", ") : "ok"}`,
   ].join("\n");
 }
 
@@ -141,4 +173,8 @@ if (new URLSearchParams(location.search).has("test")) {
 
 // Expose a handle for the developer rail and for driving the page from a
 // headless browser. Not used by gameplay.
-globalThis.__vector = { get state() { return state; }, world, rig, input, THREE };
+globalThis.__vector = {
+  get state() { return state; },
+  get airframe() { return airframe; },
+  world, rig, input, THREE,
+};
