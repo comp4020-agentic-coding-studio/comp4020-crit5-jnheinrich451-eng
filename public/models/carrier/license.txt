@@ -1,0 +1,11 @@
+Model Information:
+* title:	USS DWIGHT D.EISENHOWER CVN-69 AIRCRAFT CARRIER
+* source:	https://sketchfab.com/3d-models/uss-dwight-deisenhower-cvn-69-aircraft-carrier-f22c344e834f4c3781f676b372a94b2d
+* author:	Muhamad Mirza Arrafi (https://sketchfab.com/nazidefenseforceofficial)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "USS DWIGHT D.EISENHOWER CVN-69 AIRCRAFT CARRIER" (https://sketchfab.com/3d-models/uss-dwight-deisenhower-cvn-69-aircraft-carrier-f22c344e834f4c3781f676b372a94b2d) by Muhamad Mirza Arrafi (https://sketchfab.com/nazidefenseforceofficial) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

@@ -21,11 +21,9 @@ mise.local.toml
 # harness is CLAUDE.md (and any AGENTS.md), not this directory.
 .claude/
 
-# The glTF source assets, 46 MB of it, 35 MB of that seven texture files.
-# UNTRACKED PENDING A DECISION, not permanently: git history is forever, this
-# repo goes public, and it seeds six pod repos for the riff, so committing the
-# raw textures is the one step here that cannot be undone. The loaders
-# normalise from MEASURED bounds, so swapping in compressed textures needs no
-# code change -- deleting these two lines is the whole of "ship them as-is".
-# Until then the game runs on its documented asset-failure fallback (§2).
-public/models/
+# The glTF SOURCE assets: 47 MB of 4K textures. `pnpm assets` builds the
+# shipping copies in public/models/ from these, so only the derived, committed
+# output is in history. Keeping the sources out means a re-encode is a rebuild
+# rather than a second permanent copy in every clone.
+assets/models/
+assets/audio/

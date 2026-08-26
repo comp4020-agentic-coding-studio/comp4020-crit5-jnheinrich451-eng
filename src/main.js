@@ -43,6 +43,12 @@ let airframe = null;
 let state = createFlightState();
 rig.reset(state);
 
+// Until the deck is ready the aircraft is HELD, not flown. Otherwise the
+// opening second of every session is a jet cruising at 900 m over open water
+// that then teleports onto a carrier -- which is both a worse first frame and
+// a lie about where the sortie starts.
+let held = true;
+
 // ── terrain, physics, the collision policy ───────────────────────────────
 let physics = createPhysics({});
 let physicsDebug = null;
@@ -144,6 +150,21 @@ function measureClip(url) {
   });
 }
 
+/**
+ * R restarts the SORTIE, not just the flight state.
+ *
+ * An earlier version rebuilt the flight state alone, which dropped the player
+ * into mid-air at the spawn altitude with the launch already spent -- the
+ * strongest moment in the build, unreachable for the rest of the session.
+ * Every mode flies the catapult (§11), and that has to include a restart.
+ */
+function restartSortie() {
+  state = createFlightState();
+  physics.reset(state);
+  if (launchClipSeconds !== null && carrierAnchors) startLaunch(launchClipSeconds);
+  else rig.reset(state);
+}
+
 function startLaunch(clipSeconds) {
   if (!carrierAnchors) return;
   launch = createLaunch({
@@ -156,6 +177,7 @@ function startLaunch(clipSeconds) {
   });
   console.log("launch plan:", JSON.stringify(launch.plan));
   launch.start(state);
+  held = false;
   // Steering is disabled outright while the script owns the aircraft, rather
   // than asking the frame loop to remember to ignore the pointer (§7).
   input.setPointerEnabled(false);
@@ -231,15 +253,17 @@ function step(now) {
 
   const axes = input.update(dt);
 
-  if (input.consumeLatch("restart")) {
-    state = createFlightState();
-    rig.reset(state);
-  }
+  if (input.consumeLatch("restart")) restartSortie();
 
   // A policy can neutralise the stick -- the input that flew into the
   // mountain must not be reapplied on the restore frame. The policy is asked;
   // it never reaches into input.js itself.
-  const scripted = launch?.update(dt, state) ?? false;
+  if (held) {
+    // Nothing to simulate yet, but the policy must still be ticked (§17.4) --
+    // a branch that skips physics and forgets this freezes the game.
+    physics.getPolicy()?.tick(dt);
+  }
+  const scripted = held ? true : (launch?.update(dt, state) ?? false);
   if (scripted) {
     // §9: no flight physics runs during the launch, and §17.4 -- a branch that
     // skips physics.update() must tick the response policy ITSELF, or the game
@@ -310,7 +334,7 @@ function paintRail(axes) {
     `POLICY    ${physics.getPolicy()?.name ?? "--"}  (G)`,
     `HISTORY   ${physics.historyLength()} safe states`,
     `COAST     z=${terrainReport?.ok ? terrainReport.nearEdgeZ : "--"}`,
-    `LAUNCH    ${launch ? (launch.isActive() ? `t=${launch.elapsed().toFixed(1)}/${launch.plan.total.toFixed(1)}` : "handed off") : "--"}`,
+    `LAUNCH    ${held ? "waiting for the deck" : launch ? (launch.isActive() ? `t=${launch.elapsed().toFixed(1)}/${launch.plan.total.toFixed(1)}` : "handed off") : "--"}`,
     `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
     `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
     `ERRORS    ${errorCount}`,
