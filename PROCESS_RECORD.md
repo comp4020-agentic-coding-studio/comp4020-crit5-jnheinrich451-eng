@@ -125,3 +125,94 @@ wanted to know what would run when I committed. A silent `|| true` in a
 `prepare` script is exactly the shape of failure the proposed sensor is for, and
 it argues the sensor should check *live git config*, not just file presence: the
 hook file was there the whole time and proved nothing.
+
+---
+
+## 2026-08-27 06:26 — Operation Vector, stages 1 and 2
+
+**Prompt:**
+
+> Good, it is Operation Vector, you can check the Claude.md, on section 2
+> Assets, we normalize to let them reconcile in a world, and the f-15 is
+> relatively big than reality, but no worry, it is okay! And I upload stage 1-4
+> into the instructions, please work on them first!
+
+**Result:**
+Stage 1 (world, flight model, input, chase rig, frame loop, suite) and stage 2
+(the F-15E, EXPERT mode, the pitch convention). 119 checks green.
+
+**Named a conflict rather than averaging it.** `CLAUDE.md` §0 asks for no build
+step, no npm and three.js from a CDN import map; the repo's deploy job runs
+`pnpm build` and uploads `dist/`, and `spec/invariants.test.ts` walks every
+built page. Those cannot both hold. §0 marks the stack constraints
+`__Adjustable__`, so vite stays and three.js is bundled — a no-build site never
+reaches Pages at all, which fails C5 spec line 1 outright, and a CDN is a
+single point of failure in a crit room where the pod plays it cold. The game is
+`index.html` rather than `flight-lab.html` for the same reason: the Pages root
+URL should be the game, with no click in front of it.
+
+**Derived the arcade constants instead of tuning them.** §14 states its
+fairness claim in turn radii — enemy rounds turn at 904–1146 m and "a hard
+crossing manoeuvre defeats them with no countermeasure at all" — so the turn
+constant comes out of that claim rather than out of feel:
+
+    r = v^2 / (G tan b)   ->   G = v^2 / (r tan b)
+    G = 250^2 / (1000 * tan 70 deg) = 22.75 m/s^2
+
+Real gravity gives r = 2319 m there and loses the claim. The consequence is
+that radius falls with speed — 462 m at cruise, 194 m at minimum — so slowing
+down turns tighter, which is a real skill a player can find without being told.
+That matters for a no-tutorial brief.
+
+**One sink law for both flight modes, written on the lift direction.** The
+obvious form is `cos(bank)`, which works until EXPERT can pass 90 degrees:
+`cos(180 deg)` is negative, so an inverted aircraft would CLIMB by rolling
+over. Written on the aircraft's up-vector instead, level is 1, the bank limit
+is `cos 70 = 0.342` and reproduces the same 17.3 m/s turn cost, and inverted is
+floored rather than sign-flipped.
+
+**Verified:**
+`pnpm check` green (27 vitest tests) and the game's own suite 119/0. But the
+load-bearing verification was headless Chrome over CDP, driven with a
+zero-dependency script — `pnpm check` can tell you the modules parse, not that
+the page runs. It read off the live page: cruise 170 m/s, altitude held at 900,
+course running toward -Z, `quat` a plain record with `typeof quat.copy ===
+"undefined"` in the real bundle (§17.1 holding in the build, not just in the
+test), FOV 64.14 exactly matching the speed-scale, and the gear sequence
+up -> down -> cached-repeat -> up read off the live scene graph.
+
+Two faults only the browser could show. Both shaders failed to LINK while
+`pnpm check` stayed green, the page threw nothing, and the screen was blank:
+`<logdepthbuf_vertex>` calls `isPerspectiveMatrix()` from `<common>`, which I
+had not included, and `<fog_vertex>` reads a variable that must be named
+`mvPosition`, which I had called `mv`. And a screenshot showed a hard grey seam
+along the whole horizon that no assertion would ever have caught — the sky dome
+was being darkened below eye level, while the ocean plane's far edge sits about
+a degree BELOW eye level from 900 m, so fogged water met darkened sky.
+
+**Commit:** [`6bff0a8`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/6bff0a8), [`04156a1`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/04156a1)
+
+**What happened:**
+The aircraft flew knife-edge, and the way I got there is the part worth
+keeping. I read the glTF's raw POSITION accessors, saw 194.1 x 130.6 x 51.0,
+concluded Z-up with +X out of the nose, and built a rotation from it. The
+accessors are per-MESH local space, and every node in that file carries a
+`matrix` — which my probe printed as "no transforms" because it only looked at
+`rotation`, `scale` and `translation`. GLTFLoader applies those matrices, so
+the model was already Y-up and my correction was computed against axes that no
+longer existed.
+
+The tempting fix was a corrected constant. Instead the orientation is now
+MEASURED off the loaded object — the HUD node says which way is forward, the
+gear-down node says which way is down — and it is backed by a shape check that
+fails the load if the wingspan does not land on X. A real F-15E is 13.05 m
+across, so that number is known independently of anything this code did, and it
+is precisely what knife-edge gets wrong. §2 says never to hand-type a scale;
+the same argument applies to orientation, and I had to fly it sideways to see
+that.
+
+Also found by accident, and not what was asked for: the repo's secret-scanning
+pre-commit hook still was not running from the earlier turn's fix on a fresh
+`pnpm install`, and the `assets/` directory the user staged is 46 MB. It is
+copied into `public/models/` so the loaders work, and gitignored pending the
+fidelity call, because that commit is the one step here that cannot be undone.
