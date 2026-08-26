@@ -1,6 +1,9 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { defineConfig } from "vite";
+// from "vitest/config", not "vite": vite's own defineConfig has no `test` key
+// in its type, so the vitest options below would fail `pnpm typecheck`. It
+// re-exports vite's config unchanged with that key added.
+import { defineConfig } from "vitest/config";
 
 // Every .html file in the repo is a page and a build entry, so a multi-page
 // hand-written site needs no build config: add pages, link them, ship.
@@ -25,5 +28,16 @@ export default defineConfig({
     rollupOptions: {
       input: htmlEntries(),
     },
+  },
+  test: {
+    // Vitest's default glob would collect `src/flight.test.js` directly and
+    // fail it as "no test suite found": that file is the GAME's suite —
+    // plain assertions with its own pass/fail count, framework-free by
+    // design (CLAUDE.md §18) — and it has no describe/it blocks to find.
+    //
+    // It still runs under `pnpm check`, but through `spec/vector.test.ts`,
+    // which imports it and asserts the count is green. One suite, two
+    // harnesses; this glob just says which files are vitest's to drive.
+    include: ["spec/**/*.test.ts", "scripts/**/*.test.ts"],
   },
 });

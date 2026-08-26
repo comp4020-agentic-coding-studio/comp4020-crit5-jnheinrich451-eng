@@ -6,6 +6,18 @@
     // Imports name the file they mean, extension and all --- which is what
     // node itself wants when it runs a .ts file directly.
     "allowImportingTsExtensions": true,
+    // The game in src/ is plain JavaScript by design (CLAUDE.md §0), so tsc
+    // needs to be able to READ it for spec/vector.test.ts to import the
+    // suite. allowJs without checkJs means those modules are parsed for
+    // inference but not error-checked.
+    //
+    // Say plainly what that costs, because last week's harness note warned
+    // about exactly this shape of gap: `tsc --noEmit` is NOT a sensor over
+    // src/. What covers src/ is the game's own assertion suite, which runs
+    // headlessly under vitest via spec/vector.test.ts and in the browser at
+    // tests.html. If that suite ever stops running, nothing else is reading
+    // this code.
+    "allowJs": true,
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": ["vite/client", "node"],
     "strict": true,

@@ -3,36 +3,162 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>COMP4020 prototype</title>
+    <title>Operation Vector</title>
     <meta
       name="description"
-      content="Replace this with one sentence saying what this page is. A search result and a link preview both show it."
+      content="Fly an F-15E off a carrier deck, out over open water and into contested terrain. A browser flight game with no tutorial."
     />
 
     <!--
-      The link-preview card: public/card.png, 1200x630 --- replace it. The URL
-      resolves against this page, like any link. No og:title/og:description:
-      scrapers fall back to the <title> and description above.
+      The link-preview card: public/card.png, 1200x630. The URL resolves
+      against this page, like any link. No og:title/og:description: scrapers
+      fall back to the <title> and description above.
     -->
     <meta property="og:type" content="website" />
     <meta property="og:image" content="./card.png" />
     <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
 
-    <link rel="stylesheet" href="./styles.css" />
+    <style>
+      /* All CSS lives here, per CLAUDE.md §3. */
+      :root {
+        --green: #8ef0c8;
+        --amber: #ffd79a;
+        --salmon: #ff9b7a;
+        --cyan: #9fd7ff;
+        --yellow: #ffd400;
+        --ink: #04080c;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--ink);
+        color: var(--green);
+        font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
+          monospace;
+      }
+
+      #view {
+        display: block;
+        width: 100vw;
+        height: 100dvh;
+        touch-action: none;
+      }
+
+      /* ── the opening screen ────────────────────────────────────────────
+         The brief's no-tutorial rule means this screen carries no
+         instructions. It carries the aircraft's name and then gets out of
+         the way; the catapult sequence in stage 4 is what teaches the
+         throttle and the camera, by flying itself once. */
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-content: center;
+        gap: 0.6rem;
+        text-align: center;
+        background: var(--ink);
+        z-index: 20;
+        transition: opacity 0.6s ease;
+      }
+
+      #loading[hidden] {
+        display: grid;
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(1.6rem, 5vw, 3rem);
+        font-weight: 500;
+        letter-spacing: 0.42em;
+        text-indent: 0.42em;
+        color: var(--green);
+      }
+
+      #loading p {
+        margin: 0;
+        letter-spacing: 0.3em;
+        font-size: 0.7rem;
+        color: var(--cyan);
+        opacity: 0.65;
+      }
+
+      /* ── developer rail (H) ────────────────────────────────────────────
+         Off by default: a player must never open this page and find a wall
+         of telemetry. Width is BOUNDED rather than content-sized -- §16
+         makes the same point about the HUD's instrument columns, and for
+         the same reason: a panel that grows with its longest string will
+         eventually cover the thing it is describing. */
+      #rail {
+        position: fixed;
+        top: 0.75rem;
+        left: 0.75rem;
+        margin: 0;
+        padding: 0.7rem 0.9rem;
+        width: 26rem;
+        max-width: calc(100vw - 1.5rem);
+        overflow: hidden;
+        font-size: 0.72rem;
+        line-height: 1.55;
+        white-space: pre;
+        color: var(--green);
+        background: rgb(4 8 12 / 0.72);
+        border: 1px solid rgb(142 240 200 / 0.25);
+        border-radius: 3px;
+        z-index: 10;
+        pointer-events: none;
+      }
+
+      nav {
+        position: fixed;
+        right: 0.75rem;
+        bottom: 0.6rem;
+        z-index: 10;
+        font-size: 0.62rem;
+        letter-spacing: 0.2em;
+      }
+
+      nav a {
+        color: var(--cyan);
+        opacity: 0.35;
+        text-decoration: none;
+      }
+
+      nav a:hover,
+      nav a:focus-visible {
+        opacity: 0.9;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #loading {
+          transition: none;
+        }
+      }
+    </style>
   </head>
   <body>
-    <header>
-      <nav aria-label="Primary">
-        <a href="./">Home</a>
-      </nav>
-    </header>
-    <main>
-      <h1>COMP4020 prototype</h1>
-      <p>
-        Replace this with your prototype. This week's brief is on the course website;
-        <code>spec/README.md</code> explains how the checks in this repo relate to it.
-      </p>
-    </main>
-    <script type="module" src="./main.ts"></script>
+    <canvas id="view"></canvas>
+
+    <div id="loading">
+      <h1>Operation Vector</h1>
+      <p>F-15E</p>
+    </div>
+
+    <pre id="rail" hidden></pre>
+
+    <nav aria-label="Primary">
+      <a href="./tests.html">checks</a>
+    </nav>
+
+    <script type="module" src="./src/main.js"></script>
   </body>
 </html>
