@@ -267,6 +267,8 @@ treatment.
 
 ```
 F-15E airframe    glTF. Normalise to 19.4 m length.
+F-16C airframe    glTF. Normalise to 14.8 m length.
+Nomad SAM vehicle glTF. Normalise to 6.9 m length.
 Carrier (CVN)     glTF. Normalise to 332.8 m length. Must expose deck anchors.
 Terrain           glTF heightfield-style mesh. Normalise to 30 km across.
 AIM-9 missile     glTF. Normalise to 2.85 m.
@@ -452,6 +454,23 @@ snapshot pair.
 THREE.Quaternion.** This module must not import three.js. Provide quaternion
 helpers (`quatFromEulerYXZ`, `quatForward`, `quatUp`, multiply, identity) as plain
 math. Consumers copy components; they must not call `.copy()` on it.
+
+**quaternion integration in aircraft-local space:**
+
+quat = quat * delta
+
+Input is angular velocity, not an angle. Post-multiplication is what makes the axes local — that is the entire mechanism, and it is why pitching while banked bends the trajectory the way a real aircraft does.
+
+Expert changes the flight model, not the camera. This is the most common misreading of the mode, so it is worth stating plainly: the chase camera stays behind and above the aircraft in both modes, following it exactly as before. Expert does not switch to a world-fixed, external or orbital view, and there is no second camera rig anywhere in this project — alternative compositions are always blended into the one rig. What differs between the modes is how the aircraft's attitude is computed, and the camera simply reads whatever attitude results.
+
+The one camera-adjacent difference is a roll reference, not a position: in ASSISTED the rig leans on a flat world-up term, which is legible because bank is bounded and the aircraft cannot end up inverted. In EXPERT the aircraft can be inverted and stay there, so the rig leans on the aircraft's own up-vector instead. The camera is still directly behind the aircraft; it is now rolled with it, so inverted flight reads as inverted flight rather than as the horizon inexplicably flipping. Both modes damp forward direction, up vector and roll separately, with the same standoff and FOV curves.
+
+Consequences of the model to accept rather than smooth over:
+
+controls do not self-centre — release the stick and the aircraft holds its rate, it does not level itself
+the aircraft can be inverted and remain so indefinitely
+the player can lose orientation, and that is the trade the mode offers in exchange for control authority
+Both modes must write the same quaternion field, so the renderer, the camera and the FX read one value and none of them need to know which mode is active. Clear all transient input state on a mode change: a held key would otherwise command the fresh model on frame one, and the ramped axes would carry the old attitude in with them.
 
 ---
 

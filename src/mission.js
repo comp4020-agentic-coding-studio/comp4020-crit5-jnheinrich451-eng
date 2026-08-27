@@ -252,9 +252,28 @@ export function buildRoute({ carrierZ, coastZ, sampleHeight }) {
   // COAST and INTERCEPT may still overlap, and that is fine: only the CURRENT
   // leg is checked, and INTERCEPT's 26 s floor is exactly what covers a "next
   // region" the player is already standing in.
+  const COAST_RADIUS = 1250;
   const COASTLINE_RADIUS = 1250;
   const INTERCEPT_RADIUS = 1300;
   const MIN_GAP = 400;
+
+  // ── COAST STANDS OFF THE CARRIER BY ITS OWN RADIUS PLUS A MARGIN ─────────
+  //
+  // The leg-zero defect: COAST used to sit 1100 m ahead of the carrier with a
+  // 1250 m radius, so THE PARKED AIRCRAFT STARTED INSIDE ITS OWN FIRST
+  // WAYPOINT. It was consumed on frame one, legIndex became 1, and the HUD
+  // pointed at INTERCEPT while the jet was still on the catapult -- taking the
+  // post-launch climb cue with it and skewing every run's opening.
+  //
+  // DERIVED FROM THE RADIUS, not a new literal: a radius edit that does not
+  // also move the leg is exactly how this came back. The 900 m margin is the
+  // deck run plus the rotation, so the volume begins after the aircraft is
+  // genuinely flying rather than a metre off the bow.
+  //
+  // This is the GEOMETRIC half of the fix. The structural half is in update():
+  // no leg may be consumed while the launch script owns the aircraft, so a
+  // volume placed too close can never silently eat a waypoint again.
+  const COAST_STANDOFF = COAST_RADIUS + 900;
   const coastlineZ = coastZ + 700;
   const needed = INTERCEPT_RADIUS + COASTLINE_RADIUS + MIN_GAP;
   const midpoint = (carrierZ + coastlineZ) / 2;
@@ -265,7 +284,7 @@ export function buildRoute({ carrierZ, coastZ, sampleHeight }) {
     legs: [
       // The post-launch climb cue: named at 320 m, but altitude does NOT gate
       // it -- a player who stays low still progresses.
-      { name: "COAST", x: 0, z: carrierZ - 1100, radius: 1250, cueAltitude: 320, phase: EGRESS },
+      { name: "COAST", x: 0, z: carrierZ - COAST_STANDOFF, radius: COAST_RADIUS, cueAltitude: 320, phase: EGRESS },
       { name: "INTERCEPT", x: 0, z: interceptZ, radius: INTERCEPT_RADIUS, phase: INTERCEPT },
       { name: "COASTLINE", x: 0, z: coastlineZ, radius: COASTLINE_RADIUS, phase: DEFENSIVE },
       { ...legs[0], phase: TERRAIN },
@@ -407,9 +426,25 @@ export function createMission({ route, onPhase, onCheckpoint } = {}) {
       mission.phaseTime += dt;
       if (mission.running) mission.clock += dt;
 
-      // The current leg is the trigger volume AND the thing the HUD points at.
+      // ── THE LEG-CONSUMPTION GATE ──────────────────────────────────────
+      //
+      // NO LEG MAY BE CONSUMED WHILE THE LAUNCH SCRIPT OWNS THE AIRCRAFT.
+      //
+      // The structural half of the leg-zero fix. Standing COAST off the
+      // carrier corrects the one volume that was mispositioned; this makes the
+      // whole class of fault impossible, because a waypoint the player has no
+      // authority to fly to must not be credited to them. During DECK and
+      // LAUNCH the script writes the position -- the aircraft moves ~200 m
+      // down the deck under nobody's command -- so anything it drives through
+      // is scenery, not progress.
+      //
+      // Gated on the CONTROL HANDOFF rather than on the phase, because the
+      // handoff is the moment authority actually transfers; the phase change
+      // to EGRESS is a consequence of it, one frame later.
+      const playerFlies = ctx.handedOff === true;
       const leg = currentLeg();
-      const reached = leg && ctx.position ? inVolume(leg, ctx.position) : false;
+      const reached =
+        playerFlies && leg && ctx.position ? inVolume(leg, ctx.position) : false;
       let legReached = false;
       if (reached) {
         // TERRAIN advances only on the LAST of its three legs, so consuming a

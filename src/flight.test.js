@@ -3158,6 +3158,139 @@ function flyMission({ ignoreCombat = false, failAt = null } = {}) {
   return { mission, seen, position };
 }
 
+// ── Change 1 (DIAGNOSIS B4): mission leg zero is not consumed on the deck ──
+
+function testLegZeroIsNotConsumedOnTheDeck() {
+  const carrierZ = -1600;
+  const route = buildRoute({ carrierZ, coastZ: -7600, sampleHeight: syntheticTerrain });
+  const coast = route.legs[0];
+
+  // THE GEOMETRIC HALF. COAST used to sit 1100 m ahead of a carrier at
+  // z = -1600 with a 1250 m radius, so the parked aircraft started INSIDE its
+  // own first waypoint: it was consumed on frame one, legIndex became 1, and
+  // the HUD pointed at INTERCEPT while the jet was on the catapult.
+  check("leg 0 is still COAST", coast.name === "COAST", coast.name);
+  check(
+    "COAST stands off the carrier by its own radius plus a margin",
+    Math.abs(coast.z - carrierZ) >= coast.radius + 900 - 1e-9,
+    `standoff ${Math.abs(coast.z - carrierZ).toFixed(0)} vs radius ${coast.radius} + 900`,
+  );
+  check(
+    "and it is DERIVED from the radius, not authored beside it",
+    Math.abs(coast.z - carrierZ) === coast.radius + 900,
+    `${Math.abs(coast.z - carrierZ)}`,
+  );
+
+  // The anchors the launch script actually uses (world.js's fallback set, whose
+  // geometry matches the measured one: start 100 m aft of the carrier origin,
+  // 199.7 m of deck run, deck 20 m up).
+  const deckY = 20;
+  const launchStart = { x: 0, y: deckY, z: carrierZ + 100 };
+  const launchEnd = { x: 0, y: deckY, z: carrierZ - 99.7 };
+
+  check(
+    "the launch-start anchor is outside leg 0",
+    !inVolume(coast, launchStart),
+    `d ${Math.hypot(launchStart.x - coast.x, launchStart.z - coast.z).toFixed(0)} vs r ${coast.radius}`,
+  );
+  // The stronger reading, and the one that stops this recurring in ANY leg: no
+  // volume in the route may contain the point the aircraft is parked on.
+  for (const leg of route.legs) {
+    check(
+      `the launch-start anchor is outside ${leg.name}`,
+      !inVolume(leg, launchStart),
+      `d ${Math.hypot(launchStart.x - leg.x, launchStart.z - leg.z).toFixed(0)} vs r ${leg.radius}`,
+    );
+    check(
+      `the deck-edge anchor is outside ${leg.name}`,
+      !inVolume(leg, launchEnd),
+      `d ${Math.hypot(launchEnd.x - leg.x, launchEnd.z - leg.z).toFixed(0)} vs r ${leg.radius}`,
+    );
+  }
+  // RECOVERY is the one that is only outside because of its altitude band: it
+  // is 400 m the other side of the carrier with a 2400 m radius, so the deck is
+  // well inside it horizontally and the 80 m floor is what excludes it. Stated
+  // explicitly, because a band edit would otherwise re-open leg zero silently.
+  const recovery = route.legs[route.legs.length - 1];
+  check(
+    "RECOVERY contains the deck horizontally",
+    Math.hypot(launchStart.x - recovery.x, launchStart.z - recovery.z) < recovery.radius,
+  );
+  check(
+    "and it is the altitude band that keeps the deck out of it",
+    recovery.band.min > deckY,
+    `band min ${recovery.band.min} vs deck ${deckY}`,
+  );
+
+  // THE STRUCTURAL HALF. No leg may be consumed while the launch script owns
+  // the aircraft -- so a volume placed too close can never silently eat a
+  // waypoint again, whatever a later radius edit does to the geometry.
+  const parked = createMission({ route });
+  for (let t = 0; t < 12; t += 1 / 60) {
+    parked.update(1 / 60, {
+      position: { ...launchStart },
+      fired: t > 4,
+      handedOff: false,
+    });
+  }
+  check(
+    "leg 0 is still COAST after 12 s of deck time",
+    parked.mission.legIndex === 0 && parked.currentLeg().name === "COAST",
+    `legIndex ${parked.mission.legIndex}, leg ${parked.currentLeg()?.name}`,
+  );
+  check(
+    "and nav publishes COAST on the deck, not INTERCEPT",
+    parked.currentLeg().name === "COAST",
+    parked.currentLeg().name,
+  );
+
+  // The gate is on AUTHORITY, not on geometry: a director parked ON TOP of its
+  // own first waypoint still may not consume it before the handoff.
+  const cheat = createMission({ route });
+  for (let i = 0; i < 120; i++) {
+    cheat.update(1 / 60, {
+      position: { x: coast.x, y: 400, z: coast.z },
+      fired: true,
+      handedOff: false,
+    });
+  }
+  check(
+    "sitting inside leg 0 pre-handoff consumes nothing",
+    cheat.mission.legIndex === 0,
+    `legIndex ${cheat.mission.legIndex}`,
+  );
+  // ...and the same frame, once authority has transferred, does consume it.
+  cheat.update(1 / 60, {
+    position: { x: coast.x, y: 400, z: coast.z },
+    fired: true,
+    handedOff: true,
+  });
+  check(
+    "the same position DOES consume it after the handoff",
+    cheat.mission.legIndex === 1,
+    `legIndex ${cheat.mission.legIndex}`,
+  );
+
+  // The first frame after the handoff, flown honestly from the deck: nav must
+  // still read COAST. This is the frame the screenshot gate photographs.
+  const real = createMission({ route });
+  const pos = { x: 0, y: deckY, z: launchStart.z };
+  let handedOff = false;
+  for (let t = 0; t < 14; t += 1 / 60) {
+    if (t > 11) handedOff = true;
+    if (handedOff) pos.z -= 172 / 60;
+    real.update(1 / 60, { position: pos, fired: t > 11, handedOff });
+    if (handedOff) break;
+  }
+  check(
+    "nav publishes COAST on the first frame after the handoff",
+    real.currentLeg().name === "COAST",
+    real.currentLeg()?.name,
+  );
+  check("and the phase is EGRESS or LAUNCH, never INTERCEPT",
+    real.mission.phase !== INTERCEPT, real.mission.phase);
+}
+
 function testEndToEndMissions() {
   // 1. A direct run.
   const direct = flyMission();
@@ -4736,6 +4869,7 @@ const SUITES = [
   ["bandFeature uses the weaker flank", testBandFeatureUsesTheWeakerFlank],
   ["zoning spreads a clustered field", testZoningSpreadsAClusteredField],
   ["the route plan", testRoutePlan],
+  ["leg zero is not consumed on the deck", testLegZeroIsNotConsumedOnTheDeck],
   ["end-to-end missions", testEndToEndMissions],
   ["the mission clock", testMissionClock],
   ["a checkpoint is flyable", testCheckpointIsFlyable],
