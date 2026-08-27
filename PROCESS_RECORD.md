@@ -642,3 +642,82 @@ assertion beside it ("...and the catapult stroke does") failed and exposed it.
 The stage is now asserted explicitly, so the check cannot pass without the
 sequence actually running. §17.14 in miniature, in a test I wrote to satisfy
 §17.14.
+
+
+## 2026-08-28 03:36 — The phone viewport I spent an hour looking at was 500x693
+
+**Prompt:**
+
+> for mobile phone view, the 380*..., I forget, please tell me. And I think we
+> should redesign. For a game, it should be we move the phone sidewards, and
+> maybe use two hands to play, it is a simluator, so no need to consider the
+> read mobile game. Yet if we can make mobile view the same logic of the big
+> screen, the mouse hover location controls location, and LMB shooting, rest are
+> same, for we don't really run on a mobile device.
+
+**Result:**
+The viewport is **390x844** — the phone preset in Chrome DevTools' device
+toolbar; the other is 1920x1080. Both are full marking environments.
+
+**No touch controls, which turned out to be the easy half.** `input.js` already
+listens on `pointerdown` / `pointermove` / `pointerup`, and a finger raises those
+exactly as a mouse does, so steering from screen centre and firing on press
+needed no second code path at all. What was missing was one CSS rule:
+`touch-action: none`. Without it the browser claims the drag, the `pointermove`
+stream is cancelled mid-turn, and the aircraft appears to freeze under the thumb
+— and a downward drag, which is pitching down, triggers pull-to-refresh.
+
+**The HUD now scales; its positions never needed to.** They were already
+proportional (`w * 0.18`, `h * 0.075`). The FURNITURE was fixed: a 19 px readout
+and a 74 px radar are a corner of a 1080-tall desktop and a third of a 390-wide
+phone. `uiScaleFor` drives everything off the smaller dimension, so a phone is
+treated the same held either way up. Every glyph carries `data-base-size`, so the
+rescale reads the DOM rather than a hand-maintained list.
+
+**The lens was the hidden one.** three.js's `fov` is VERTICAL, so a portrait
+viewport narrows the view without changing a number in the composition: at
+390x844 a 66° lens showed ~34° across. The aircraft sat exactly where the framing
+put it and filled the frame, with the world squeezed out either side. Nothing
+looked broken — it just could not be flown. `fovForAspect` floors the horizontal
+field at 46°, and is inert on any landscape viewport.
+
+The developer rail now starts hidden below 1000 px wide or 620 px tall (`H`
+still summons it), and the `checks` link moved to bottom-left, out of the radar
+it had been sitting inside on the desktop too.
+
+**Verified:**
+At the real viewport, eventually. Screenshots at both, with the page asked what
+it thinks its own size is — `{"w":390,"h":844,"loading":false,"railShown":false}`
+— so a wrong size can never again be read as a layout bug. Tests 1477 → 1489,
+written as rules rather than eyeballs: the scale is equal in portrait and
+landscape, floored, capped, and leaves the radar inside a 390 px frame; the
+horizontal field of view clears its floor at all three viewports while a 16:9
+lens is left untouched. `pnpm check` green.
+
+**Commit:** [`0633e03`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/0633e03)
+
+**What happened:**
+**Every "390x844" screenshot I took for the first half of this turn was actually
+500x693.** Chrome on Windows clamps a headless window to a minimum size, renders
+the page at THAT size, and then crops the PNG down to whatever `--window-size`
+asked for. So the picture is the right shape and the wrong content: the layout is
+computed for a viewport 110 px wider and 150 px shorter than the one in the file
+name, and everything past the crop is simply absent.
+
+It produced a confident, wrong bug report — I said `5 LIVES REMAINING` was
+clipped at the right edge. It was not clipped. It was outside the crop. I only
+found out because I stopped believing the picture and measured the element:
+`left=329 right=482 width=153` in a viewport reporting `500x693`. The fix was to
+drive the browser through `Emulation.setDeviceMetricsOverride`, which is what the
+device toolbar itself uses, and to have the page print its own `innerWidth` next
+to every screenshot from now on.
+
+**And that script connected to the user's browser.** Their Chrome already held
+port 9222 on IPv4; my headless instance failed to bind, fell back to the IPv6
+loopback, and `http://127.0.0.1:9222` was a live tab with their crit-4 work in
+it. The script sent `Page.enable` and `setDeviceMetricsOverride` to that tab
+before hanging. Their tab was not navigated and I cleared the override, but the
+lesson is not "check the port" — it is that a tool which drives a real browser
+had no idea whose browser it was driving. It now refuses any target that is not
+`about:blank` or localhost, and takes the debugging endpoint as an argument
+rather than assuming one.
