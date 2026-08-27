@@ -9,7 +9,12 @@ import { defineConfig } from "vitest/config";
 // hand-written site needs no build config: add pages, link them, ship.
 // (Vite's default would build only the root index.html and silently drop the
 // rest from dist/ — fine locally, 404s deployed.)
-const SKIP = new Set(["node_modules", "dist", "spec", "scripts", "reflections"]);
+// `assets` and `public` hold tens of megabytes of models and audio and not one
+// .html between them; walking them on every config load is pure cost.
+const SKIP = new Set([
+  "node_modules", "dist", "spec", "scripts", "reflections", "assets", "public",
+  "instructions",
+]);
 
 function htmlEntries(dir = "."): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -29,6 +34,26 @@ export default defineConfig({
       input: htmlEntries(),
     },
   },
+  server: {
+    watch: {
+      // DO NOT WATCH assets/. It holds the untracked SOURCE models -- 47 MB
+      // and growing -- and nothing in it reaches the build: `pnpm assets`
+      // derives public/models/ from it, and only public/ is copied.
+      //
+      // Watching it is not merely wasteful, it is fragile. Dropping a new
+      // model in there killed the dev server outright:
+      //
+      //   Error: EBUSY: resource busy or locked, watch
+      //   'assets/models/nomads_sam_system/scene.bin'
+      //
+      // A 20 MB file still being written cannot be watched on Windows, and
+      // chokidar raises that as an unhandled error rather than skipping the
+      // file. So the failure mode of ADDING AN ASSET was the whole dev server
+      // exiting with a stack trace about a file the build never reads.
+      ignored: ["**/assets/**", "**/dist/**"],
+    },
+  },
+
   test: {
     // Vitest's default glob would collect `src/flight.test.js` directly and
     // fail it as "no test suite found": that file is the GAME's suite —
