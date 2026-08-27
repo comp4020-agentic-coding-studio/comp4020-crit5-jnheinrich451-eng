@@ -399,3 +399,103 @@ minutes, and a cold load on crit-room wifi spends some of it.
 **Still red, and not touched:** `pnpm check:evidence` fails because `PROCESS.md`
 is still the template boilerplate with placeholder commit hashes. That is spec
 line 6 and it is the user's to write.
+
+
+## 2026-08-28 02:34 — Two waypoints vanish, and only one of them was a bug
+
+**Prompt:**
+
+> No worry, the process.md I can fill in the end. [...] the sam it has many
+> state in the model, but we only use it to provide appearance [...] with or
+> without this sam actually is fine for the whole picture of the game [...] but
+> we have this sam, then we keep it. Yes you can commit first. And a bug I find,
+> the fourth checkpoint NAV VALLEY, when I approach it, without reaching it, and
+> I get hit by SAM. And after revival the next target jumps to last NAV
+> RECOVERY, the final stage. The intermediate NAV RIDGE, NAV SEAWARD all jumped.
+> Please diagnose it!
+
+**Result:**
+Committed the backlog in three pieces (`f335a03`, `b8bde4a`, `a59aea6`), then
+diagnosed the nav skip. It needed two things to be true at once.
+
+**GEOMETRY.** Terrain legs are SURVEYED from the height field, 1.2–10.5 km
+inland. SEAWARD is AUTHORED at a fixed `seawardBack` 2000 m inland. Nothing
+reconciles the two, so how close they land is left to the terrain. Measured on
+the shipped mesh:
+
+    TERRAIN/PASS <-> FINAL/SEAWARD   1517 m apart, SEAWARD's radius is 1600
+
+PASS's centre is inside SEAWARD's volume, with 83 m to spare. §19 already
+demands exactly this assertion for one pair — INTERCEPT and COASTLINE, "if they
+touch, entering the intercept area instantly satisfies *reached the next
+region*" — and the reasoning was never generalised. The pair that bit was a
+different one.
+
+**TELEPORT.** `respawnFromCrash` backs the aircraft 1800 m along its heading of
+travel, which from a death between PASS and VALLEY lands it inside SEAWARD.
+Nothing fires, because only the CURRENT phase's leg is ever checked. Then
+TERRAIN's 98 s fallback expires, FINAL is entered, and its one leg is satisfied
+on the entry frame by a position the player never flew to. `legDone` goes true
+and EXTRACTION follows in the same frame. RIDGE was lost to the fallback,
+SEAWARD to the overlap — both gone before the player saw either.
+
+**The fix is scoped to PLACEMENT, not to phase entry**, and that distinction is
+the whole of it. Credit is suspended for a volume the aircraft was *put* inside,
+until it has flown clear of where it was put. Being inside a leg when its phase
+begins is normal and correct: on a clean run the player is already inside PASS
+when TERRAIN starts, because they spent DEFENSIVE flying to it.
+
+`routeOverlaps()` generalises §19's check, and main.js logs contained pairs at
+load — a surveyed route's geometry is not knowable until the terrain loads, so
+it can only be reported at runtime, never asserted at build time.
+
+**Named the cost rather than hiding it:** the geometry collision is still there.
+It is now harmless, and it is now *visible* in the log, but PASS and SEAWARD
+still share airspace. Re-deriving SEAWARD from the surveyed legs was offered and
+declined for this pass, so the route keeps a fault it can survive.
+
+**Verified:**
+A repro before a fix, not after. `src/mission.js` imports nothing, so the
+director runs standalone in node: drove it to TERRAIN with PASS behind it, killed
+the player 2 km short of VALLEY, applied `respawnFromCrash`'s own retreat, and
+read the transitions back. Before:
+
+    t=111.1 FINAL      leg0 NAV=SEAWARD
+    t=111.1 EXTRACTION leg0 NAV=RECOVERY      <- same timestamp
+
+After: SEAWARD holds for 42 s and EXTRACTION arrives at t=153.2 on FINAL's own
+fallback. The control run — same route, no death — is **byte-identical before
+and after**, which is the bar the first attempt failed. Then the real browser on
+the real terrain survey, which is where the 1517 m came from: the game's own new
+warning line. Browser suite 1447 → 1464 checks, all green; `pnpm check` green.
+
+**Commit:** [`f335a03`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/f335a03), [`b8bde4a`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/b8bde4a), [`a59aea6`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/a59aea6), [`fdead5d`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/fdead5d)
+
+**What happened:**
+**I recommended a fix that would have broken the game, and the user picked it on
+my description.** The option I wrote said arm-on-exit "fixes the whole class
+regardless of route geometry". It does not: applied at phase entry it stalls the
+clean run, because the player is legitimately inside PASS the moment TERRAIN
+begins, so requiring an exit means overflying the waypoint and doubling back —
+worse than the bug being fixed. I found it while writing the code, said so, and
+narrowed the trigger to placements. The control run is what would have caught it
+regardless; the point is that the recommendation went out before that run
+existed.
+
+**My reconstruction of the route was wrong by a factor of two.** I derived PASS's
+position from the SAM sites the game had logged and got 696 m to SEAWARD. The
+real figure, once the game measured it, is 1517 m. Same conclusion — contained
+either way — but I had stated 696 m as a measurement when it was an inference,
+and the test fixture built on it is now labelled as the synthetic stand-in it
+always was.
+
+**Two of the new tests were wrong on the first run, and the failure detail added
+in `f335a03` is what named them.** `legDone` reads false again one line after a
+leg is satisfied, because entering the next phase recomputes it against that
+phase's legs — the assertion moved to the `leg` event, which records the fact
+rather than the status. And route-wide containment is the wrong bar: RECOVERY
+sits 200 m from COAST and contains it outright, which is harmless because they
+are four phases apart. Scoped to phases adjacent in `PHASE_ORDER`.
+
+**Still red, still the user's:** `pnpm check:evidence` — `PROCESS.md` is
+boilerplate. They have said they will write it at the end.
