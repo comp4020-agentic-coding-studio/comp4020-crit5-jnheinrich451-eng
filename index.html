@@ -28,6 +28,15 @@
         --cyan: #9fd7ff;
         --yellow: #ffd400;
         --ink: #04080c;
+        /* The VECTOR panel's own palette, deliberately separate from the
+           combat HUD's (H12) -- they are two displays, not one. */
+        --rail-head: #dce9f4;
+        --rail-label: rgb(178 205 226 / 0.78);
+        --rail-value: #eef5fb;
+        --rail-dim: rgb(178 205 226 / 0.5);
+        --rail-good: #8fe0a4;
+        --rail-warn: #ffd79a;
+        --rail-danger: #ff9a8f;
       }
 
       * {
@@ -92,28 +101,37 @@
         opacity: 0.65;
       }
 
-      /* ── developer rail (H) ────────────────────────────────────────────
-         Off by default: a player must never open this page and find a wall
-         of telemetry. Width is BOUNDED rather than content-sized -- §16
-         makes the same point about the HUD's instrument columns, and for
-         the same reason: a panel that grows with its longest string will
-         eventually cover the thing it is describing. */
+      /* ── the VECTOR panel ──────────────────────────────────────────────
+         The developer telemetry block, top left. PATCH-02 calls this "not
+         the HUD" and it is not: HUD.md never governed it, none of its
+         content is duplicated onto the combat HUD, and it keeps its own
+         palette and its own type.
+
+         VISIBLE BY DEFAULT and NOT toggled by `H`, per instruction. That
+         reverses PATCH-02's clarification 1, which asked for hidden-by-
+         default -- the later instruction wins and the reversal is
+         deliberate rather than drift.
+
+         Width is BOUNDED rather than content-sized: a panel that grows with
+         its longest string eventually covers the thing it is describing. */
       #rail {
         position: fixed;
-        top: 0.75rem;
-        left: 0.75rem;
+        top: 0.9rem;
+        left: 0.9rem;
         margin: 0;
-        padding: 0.7rem 0.9rem;
-        width: 26rem;
-        max-width: calc(100vw - 1.5rem);
+        padding: 0.75rem 0.95rem 0.8rem;
+        width: 25.5rem;
+        max-width: calc(100vw - 1.8rem);
         overflow: hidden;
-        font-size: 0.72rem;
-        line-height: 1.55;
+        font-size: 0.74rem;
+        line-height: 1.62;
         white-space: pre;
-        color: var(--green);
-        background: rgb(4 8 12 / 0.72);
-        border: 1px solid rgb(142 240 200 / 0.25);
-        border-radius: 3px;
+        letter-spacing: 0.02em;
+        color: var(--rail-value);
+        background: rgb(46 72 96 / 0.62);
+        border: 1px solid rgb(168 200 226 / 0.22);
+        border-radius: 5px;
+        backdrop-filter: blur(2px);
         z-index: 10;
         pointer-events: none;
       }
@@ -279,7 +297,7 @@
          other on. Under 0.15 s, low alpha. -->
     <div id="crash-flash"></div>
 
-    <pre id="rail" hidden></pre>
+    <pre id="rail"></pre>
 
     <div id="rotate" role="img" aria-label="Turn the device sideways to fly">
       <svg viewBox="0 0 24 24" fill="none" stroke="#9fd7ff" stroke-width="1.4"

@@ -659,16 +659,14 @@ loadAircraft()
   })
   .catch((err) => console.error("aircraft load failed", err));
 
-// Developer rail, `H`. Off by default: a player must never open this page and
-// find a wall of telemetry. §7 lists the rest of the developer keys.
-let railVisible = false;
+// The VECTOR panel, top left. VISIBLE BY DEFAULT and NOT bound to `H`, per
+// instruction -- this deliberately reverses PATCH-02's clarification 1, which
+// asked for hidden-by-default and for `H` to keep the toggle.
+let railVisible = true;
 let railClock = 0;
 
 window.addEventListener("keydown", (event) => {
-  if (event.code === "KeyH") {
-    railVisible = !railVisible;
-    rail.hidden = !railVisible;
-  }
+  // `H` is deliberately unbound: the panel is always on.
   if (event.code === "KeyM") {
     setMode(state, state.mode === "ASSISTED" ? "EXPERT" : "ASSISTED");
     modeChangedAt = clock;
@@ -1084,7 +1082,7 @@ function step(now) {
   world.render();
 
   railClock += dt;
-  if (railVisible && railClock > 0.1) {
+  if (railClock > 0.1) {
     railClock = 0;
     paintRail(axes);
   }
@@ -1104,49 +1102,84 @@ const EXTRACTION_SECONDS = 1.3 + 4.4 + 1.5;
 const deg = (r) => ((r * 180) / Math.PI).toFixed(1);
 const m = (v) => (Number.isFinite(v) ? v.toFixed(0) + " m" : "--");
 
+/**
+ * The VECTOR panel.
+ *
+ * Label column is a fixed width so the monospace grid aligns values without
+ * measuring anything, and a changing digit never reflows the row. Fields with
+ * no system behind them yet render an em dash rather than a plausible zero --
+ * a fabricated reading is worse than an absent one.
+ */
+const RAIL_VERSION = "04.3";
+const LABEL_W = 6;
+
+function railRow(label, value) {
+  return `${label.padEnd(LABEL_W)}${value}`;
+}
+
+const mmss = (seconds) => {
+  const s = Math.max(0, Math.floor(seconds));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+};
+const bar10 = (v) => {
+  const lit = Math.round(Math.max(0, Math.min(1, v)) * 10);
+  return "\u25ae".repeat(lit) + "\u25af".repeat(10 - lit);
+};
+
 function paintRail(axes) {
-  const held = input.heldKeys();
-  rail.textContent = [
-    `MODE      ${state.mode}`,
-    `SPEED     ${state.speed.toFixed(1)} m/s   (cmd ${commandedSpeed(state.throttle).toFixed(0)})`,
-    `THROTTLE  ${(state.throttle * 100).toFixed(0)}%${state.afterburner ? "  AB" : ""}`,
-    `ALT       ${state.position.y.toFixed(0)} m`,
-    `SINK      ${state.sink.toFixed(1)} m/s`,
-    `HDG       ${deg(state.heading)}`,
-    `PITCH     ${deg(state.pitch)}`,
-    `BANK      ${deg(state.bank)}  / ${deg(BANK_MAX)}`,
-    `POS       ${state.position.x.toFixed(0)}, ${state.position.z.toFixed(0)}`,
-    `AXES      x ${axes.x.toFixed(2)}  y ${axes.y.toFixed(2)}  roll ${axes.roll.toFixed(2)}  thr ${axes.throttle}`,
-    `PITCH CV  ${input.pitchConvention()}`,
-    `GEAR      ${airframe ? (airframe.gearIsDown() ? "DOWN" : "UP") : "--"}`,
-    // A stuck axis is invisible in every other readout; this is the line that
-    // makes it obvious. §7.
-    `KEYS      ${held.length ? held.join(" ") : "--"}`,
-    `CLEAR     ${m(physics.telemetry.clearance)}  (${physics.telemetry.closest})`,
-    `AGL       ${m(physics.telemetry.agl)}  over ${physics.telemetry.surface}`,
-    `FWD HAZ   ${m(physics.telemetry.forwardHazard)}${physics.telemetry.forwardImminent ? "  IMMINENT" : ""}`,
-    `POLICY    ${physics.getPolicy()?.name ?? "--"}  (G)`,
-    `HISTORY   ${physics.historyLength()} safe states`,
-    `COAST     z=${terrainReport?.ok ? terrainReport.nearEdgeZ : "--"}`,
-    `PHASE     ${mission ? `${mission.mission.phase} ${mission.mission.phaseTime.toFixed(1)}s` : "--"}`,
-    `NAV       ${mission?.currentLeg()?.name ?? "--"}  clock ${mission ? mission.elapsed().toFixed(1) : "--"}s`,
-    `ROUTE     ${route ? (route.surveyed ? "surveyed" : "authored") : "--"}  checkpoints ${mission?.mission.checkpoints.length ?? 0}`,
-    `LAUNCH    ${held ? "waiting for the deck" : launch ? (launch.isActive() ? `t=${launch.elapsed().toFixed(1)}/${launch.plan.total.toFixed(1)}` : "handed off") : "--"}`,
-    `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
-    `WEAPON    ${weapon}   AIM-9 ${weapons ? weapons.count : "--"}   GUN ${gun.rounds}`,
-    `HOSTILE   ${hostile.isActive() ? hostile.ai.state + " ammo " + hostile.ai.ammo : "off"}  threat ${threat || "--"}`,
-    `LIVES     ${lives === null ? "--" : lives}${lost ? "  LOST" : ""}  crashes ${crash.state.crashes}`,
-    `AUDIO     ${audio.isArmed() ? (audio.isMuted() ? "muted" : "armed") : "waiting for a gesture"}  missing ${audio.missingCues().length}`,
-    `MODE      ${mode}  sams ${sams.liveSites().length}/${sams.sites.length}  flares ${flares.remaining}`,
-    `REARM     ${rearm.active().length ? rearm.active().map((n) => `${n} ${rearm.remaining(n).toFixed(0)}s`).join("  ") : "--"}`,
-    `EVADE     ${evasion.isRolling() ? "ROLLING" : "--"}  defeated ${evasion.defeatedCount()}  hits ${damage.hitsTaken()}`,
-    `TRACK     ${targeting.state().lockState} ${(targeting.state().lockProgress * 100).toFixed(0)}%  rounds ${missiles.rounds.length}`,
-    `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
-    `ERRORS    ${errorCount}`,
-    // §2: a fallback must be visible, or a build quietly flying the
-    // placeholder looks like a build with a badly modelled aircraft.
-    `ASSETS    ${assetFailures().length ? assetFailures().map((f) => f.name).join(", ") : "ok"}`,
-  ].join("\n");
+  const deg = (r) => ((r * 180) / Math.PI).toFixed(1);
+  const dash = "\u2014";
+  const m = mission?.mission;
+  const tel = physics.telemetry;
+  const track = targeting.state();
+
+  const heading = ((state.heading * 180) / Math.PI + 360) % 360;
+  const carrierRange = carrierAnchors
+    ? Math.hypot(
+        state.position.x - carrierAnchors.deck.x,
+        state.position.z - carrierAnchors.deck.z,
+      ) / 1000
+    : null;
+  const coastRange = terrainReport?.ok
+    ? Math.abs(state.position.z - terrainReport.nearEdgeZ) / 1000
+    : null;
+
+  const emitting = sams.emitting();
+  const lines = [
+    `VECTOR \u00b7 ${RAIL_VERSION}`,
+    "",
+    railRow("MSN", m
+      ? `${m.phase} ${mmss(m.phaseTime)} \u00b7 t ${mmss(mission.elapsed())} \u00b7 cp${m.checkpoints.length}`
+      : held ? "WAITING FOR THE DECK" : dash),
+    railRow("NAV", mission?.currentLeg()
+      ? `${mission.currentLeg().name} \u00b7 ${(Math.hypot(mission.currentLeg().x - state.position.x, mission.currentLeg().z - state.position.z) / 1000).toFixed(1)} km`
+      : dash),
+    "",
+    railRow("SPD", `${state.speed.toFixed(0)} \u2192 ${commandedSpeed(state.throttle).toFixed(0)} m/s`),
+    railRow("THR", `${bar10(state.throttle)} ${(state.throttle * 100).toFixed(0)}%${state.afterburner ? "  AB" : ""}`),
+    railRow("ALT", `${state.position.y.toFixed(0)} m \u00b7 agl ${tel.surface === "ocean" ? dash : tel.agl.toFixed(0)} \u00b7 sink ${state.sink.toFixed(1)}`),
+    "",
+    railRow("AMMO", `${weapon === "AIM-9" ? "\u203a" : " "}AIM-9 ${weapons ? weapons.count : "-"} \u00b7 ${weapon === "GUN" ? "\u203a" : " "}GUN ${gun.rounds} \u00b7 FLR ${flares.remaining}`),
+    railRow("TGT", track.currentTarget
+      ? `${track.currentTarget.label} \u00b7 ${(track.range / 1000).toFixed(2)} km \u00b7 ${track.lockState} ${(track.lockProgress * 100).toFixed(0)}%`
+      : "NO TARGET"),
+    railRow("HOST", hostile.isActive() && hostile.target.alive
+      ? `${hostile.ai.state} \u00b7 ${Math.hypot(hostile.target.position.x - state.position.x, hostile.target.position.z - state.position.z).toFixed(0)} m \u00b7 ammo ${hostile.ai.ammo}`
+      : dash),
+    railRow("SAM", sams.sites.length
+      ? `${sams.liveSites().length}/${sams.sites.length} live \u00b7 ${emitting.length ? emitting.length + " emitting" : "quiet"}`
+      : dash),
+    railRow("THRT", threat || dash),
+    "",
+    railRow("P B H", `${state.pitch >= 0 ? "+" : ""}${deg(state.pitch)}\u00b0 \u00b7 ${state.bank >= 0 ? "+" : ""}${deg(state.bank)}\u00b0 \u00b7 ${heading.toFixed(0).padStart(3, "0")}\u00b0 ${state.mode === "ASSISTED" ? "STABILISED" : "DIRECT"}`),
+    railRow("MNVR", `${evasion.isRolling() ? "EVADE" : dash} \u00b7 in ${axes.x >= 0 ? "+" : ""}${axes.x.toFixed(2)}/${axes.y >= 0 ? "+" : ""}${axes.y.toFixed(2)}`),
+    railRow("CTC", tel.contact ? "CONTACT" : tel.forwardImminent ? "IMMINENT" : "CLEAR"),
+    railRow("PHYS", `60 Hz \u00b7 safe ${Number.isFinite(tel.clearance) ? tel.clearance.toFixed(0) : "-"} m \u00b7 ${physics.getPolicy()?.name === "MissionCheckpointResponse" ? "FAIL" : "REWIND"}`),
+    "",
+    railRow("FX", `live ${missiles.rounds.length} \u00b7 carr ${carrierRange === null ? dash : carrierRange.toFixed(1)} \u00b7 coast ${coastRange === null ? dash : coastRange.toFixed(1)} km`),
+    railRow("SYS", `err ${errorCount} \u00b7 keys ${input.heldKeys().length ? input.heldKeys().join(" ") : dash} \u00b7 ${assetFailures().length ? assetFailures().map((f) => f.name).join(", ") : "assets ok"}`),
+  ];
+  rail.textContent = lines.join("\n");
 }
 
 /** The four measured anchors, drawn on `O`. */

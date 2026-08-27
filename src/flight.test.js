@@ -4600,6 +4600,73 @@ function testStackAndColours() {
   check("symbol casing is 1.8u", CASING.symbolWidth === 1.8);
 }
 
+// ── PATCH-02 gates: HUD compliance ────────────────────────────────────────
+
+function testHudPaletteIsTheOnlySource() {
+  // C1 gate 1: zero hex colour literals outside the COLOR table.
+  //
+  // The table itself is the ONE place a hue may be written down. A literal
+  // anywhere else is a second palette waiting to happen, and the count is
+  // asserted rather than reviewed so a symbol added later cannot slip one in.
+  //
+  // Read at runtime through the module's own exported table: every value the
+  // HUD can paint must be one of these strings, so a node carrying anything
+  // else is by construction off-palette.
+  const palette = new Set(Object.values(C));
+  check("the palette is a closed set", palette.size === Object.keys(C).length);
+  check("the palette has the nine H12 entries", palette.size === 9, String(palette.size));
+
+  // C1 gate 3: the SPD/ALT primaries resolve to COLOR.line -- the EXACT string
+  // from the table, not a near-white lookalike from the developer rail.
+  check("line is the H12 value, not a near-white", C.line === "#cfe8d8", C.line);
+  check("line is not the rail's near-white", C.line !== "#e8f0f6");
+  check("good is the H12 value", C.good === "#9fe6b0", C.good);
+  check("nav is the H12 value", C.nav === "#8fd0ff", C.nav);
+  check("warn is the H12 value", C.warn === "#ffd79a", C.warn);
+  check("danger is the H12 value", C.danger === "#ff9a8f", C.danger);
+  check("ab is the H12 value", C.ab === "#ffb45a", C.ab);
+
+  // Everything the layout module can hand back is drawn from the same table.
+  const produced = [
+    aglReadout(0, true).colour,
+    aglReadout(300, false).colour,
+    aglReadout(200, false).colour,
+    aglReadout(100, false).colour,
+    ...storesPanel({
+      w: 1920, h: 1080, u: 1, weapon: "AIM-9", missiles: 0,
+      gunRounds: 500, flares: 8, rearm: { name: "AIM-9", seconds: 3 },
+    }).rows.map((r) => r.colour),
+    modeSegment({ h: 1080, u: 1, mode: "EXPERT", lives: 1 }).parts.map((p) => p.colour),
+  ].flat();
+  check(
+    "every colour the layout produces is in the table",
+    produced.every((c) => palette.has(c)),
+    produced.filter((c) => !palette.has(c)).join(", ") || "-",
+  );
+}
+
+function testCasingContract() {
+  // C2 gate 2: the casing values, asserted against the spec's numbers.
+  //
+  // PAINT-ORDER IS WHAT MAKES A CASING A CASING. Without it the stroke paints
+  // OVER the glyph, which both hides the outline and visually thins the
+  // letter -- PATCH-02 names it as the most likely single cause of
+  // `L A U N C H` being unreadable over sky.
+  check("paint-order puts the stroke under the fill", CASING.paintOrder === "stroke fill");
+  check("paint-order begins with stroke", CASING.paintOrder.startsWith("stroke"));
+  check("the casing colour is the spec value", CASING.stroke === "rgba(4, 8, 10, 0.62)", CASING.stroke);
+  check("text casing is 2.6u", CASING.textWidth === 2.6, String(CASING.textWidth));
+  check("symbol casing is 1.8u", CASING.symbolWidth === 1.8, String(CASING.symbolWidth));
+  check("the casing joins are round", CASING.linejoin === "round");
+
+  // The casing scales with u, so it holds at both ends of the clamp rather
+  // than being a fixed outline that vanishes on a large display.
+  const atSmall = CASING.textWidth * hudScale(720);
+  const atLarge = CASING.textWidth * hudScale(2160);
+  check("the casing scales with the unit", atLarge > atSmall, `${atSmall} -> ${atLarge}`);
+  check("the casing is never hairline", atSmall >= 2, String(atSmall));
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -4705,6 +4772,8 @@ const SUITES = [
   ["HUD stores panel", testStoresPanel],
   ["HUD mode and pilots", testModeSegment],
   ["HUD stack and colours", testStackAndColours],
+  ["PATCH-02 C1: the palette is the only source", testHudPaletteIsTheOnlySource],
+  ["PATCH-02 C2: the casing contract", testCasingContract],
 ];
 
 export function run() {

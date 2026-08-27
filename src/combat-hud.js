@@ -27,6 +27,21 @@ import {
 } from "./hud-layout.js";
 
 const NS = "http://www.w3.org/2000/svg";
+
+/**
+ * C1 (PATCH-02). THE ONLY SOURCE OF COLOUR ON THIS DISPLAY.
+ *
+ * Every HUD node takes its fill from here and no HUD node may carry a literal
+ * colour string -- a gate greps this module and hud-layout.js for hex literals
+ * outside the table declaration and requires a count of zero, so a symbol
+ * added later cannot reintroduce one.
+ *
+ * main.js may pass STATE (afterburner lit, AGL value, pilots remaining) but
+ * never a colour. The `stackTopColour` parameter it used to pass was deleted
+ * rather than defaulted: a colour that can be supplied from outside is a
+ * second palette waiting to happen.
+ */
+export const COLOR = C;
 export const COLOURS = C;
 
 const MONO = "ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace";
@@ -111,7 +126,13 @@ export function createCombatHud(host, camera) {
 
   function restyle() {
     for (const el of svg.querySelectorAll("text")) {
-      el.setAttribute("stroke-width", String(CASING.textWidth * u));
+      // C2: paint-order is what makes the casing a casing. Without it the
+      // stroke paints OVER the glyph, which both hides the outline and
+      // visually thins the letter -- the most likely single cause of
+      // `L A U N C H` being unreadable over sky.
+      el.setAttribute("paint-order", CASING.paintOrder);
+      const heavy = el.getAttribute("data-heavy-casing") === "1";
+      el.setAttribute("stroke-width", String(CASING.textWidth * u * (heavy ? 1.6 : 1)));
       const role = el.getAttribute("data-role");
       if (!role) continue;
       el.setAttribute("font-size", String(fontPx(role, u)));
@@ -133,8 +154,16 @@ export function createCombatHud(host, camera) {
   world.append(bracket, diamond.g, pipper, rangeText);
 
   // ── layer 2: attitude ────────────────────────────────────────────────────
-  const horizon = cased({ stroke: C.faint, "stroke-width": 1.2 });
-  attitude.append(horizon.g);
+  //
+  // DELIBERATELY EMPTY. The horizon bar that used to live here was removed on
+  // instruction: at boresight height it drew a hard horizontal rule straight
+  // across the airframe, which read as a bar sitting on top of the aircraft
+  // rather than as an attitude reference.
+  //
+  // HUD.md H2 never asked for one -- this layer is specified as "pitch ladder,
+  // bank pointer, velocity marker" (H6), none of which is built. The layer is
+  // kept so paint order stays fixed and those three have somewhere to land
+  // without renumbering anything.
 
   // ── layer 3: screen-fixed ────────────────────────────────────────────────
   const boresight = cased({ stroke: C.line, "stroke-width": 1.4 });
@@ -156,7 +185,12 @@ export function createCombatHud(host, camera) {
   fixed.append(spdLabel, spdValue, spdRule.g, thrValue, altLabel, altValue, altRule.g, aglValue);
 
   const threatWord = text("threat", { fill: C.danger, "text-anchor": "middle" });
+  // C2: the phase cue is the single worst case in the build -- large letter
+  // spacing, low-alpha fill, bright sky behind. It carries a heavier casing
+  // than the shared default, because a 30u glyph needs proportionally more
+  // outline to hold an edge than a 15u one does.
   const phaseCue = text("hit", { fill: C.nav, "text-anchor": "middle" });
+  phaseCue.setAttribute("data-heavy-casing", "1");
   fixed.append(threatWord, phaseCue);
 
   // H8: EXACTLY THREE SLOTS. A fourth line is a redesign of the stack, not an
@@ -296,7 +330,15 @@ export function createCombatHud(host, camera) {
       const ys = stackY(h);
       const slots = [view.stackTop ?? "", view.stackMid ?? "", view.stackLow ?? ""];
       stack.forEach((n, i) => put(n, cx, ys[i], slots[i]));
-      stack[0].setAttribute("fill", view.stackTopColour ?? C.line);
+      // C1: derived from STATE, never passed in. `tone` is a word, not a hue.
+      stack[0].setAttribute(
+        "fill",
+        view.stackTone === "danger"
+          ? COLOR.danger
+          : view.stackTone === "warn"
+            ? COLOR.warn
+            : COLOR.line,
+      );
 
       // ── stores (H7) ────────────────────────────────────────────────────
       const stores = storesPanel({
@@ -463,13 +505,6 @@ export function createCombatHud(host, camera) {
         smooth.delete("lead");
       }
 
-      const roll = -view.bank;
-      const pitchPx = (view.pitch / (Math.PI / 4)) * (h * 0.25);
-      const half = w * 0.22;
-      horizon.set(
-        `M${cx - Math.cos(roll) * half} ${by + pitchPx - Math.sin(roll) * half} ` +
-          `L${cx + Math.cos(roll) * half} ${by + pitchPx + Math.sin(roll) * half}`,
-      );
     },
   };
 }
