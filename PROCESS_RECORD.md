@@ -574,3 +574,71 @@ by their opposite: every stallable phase, held at an absurd phaseTime with its
 condition unmet, must not move. Plus the loss itself, asserted in both halves —
 a player who never flies does not reach COMPLETE, *and* the clock runs out. A
 phase machine that merely hangs satisfies the first on its own.
+
+
+## 2026-08-28 03:07 — Measured off the hull, not nudged toward the screenshot
+
+**Prompt:**
+
+> two minor fixes. First is could you remove the shaking in taking off stage,
+> not all stage, but the first warming engine part, the clip is engine-start.mp3
+> effect. And when F-15e is ejecting, then this shaking can be preserved! And
+> second the visual effect, the carrier in the night, the light is a kind of
+> mismatch. The bridge light should be a little rear to current position
+
+(with a screenshot of the carrier at pre-dawn, lights on)
+
+**Result:**
+**The deck no longer shakes.** The spool-up shimmer ramped 0.02 → 0.16 across
+the dwell, ×1.5 once the burner lit — for the full eleven seconds of the engine
+start-up, before the player has touched anything. A camera that will not hold
+still for eleven seconds reads as a fault in the game rather than as power in
+the aircraft. The catapult keeps its shake, and that is the point: a still deck
+and then the whole frame moving at once is a harder cut than a shake that merely
+gets worse. `CLAUDE.md` §9's timeline was rewritten rather than left describing a
+shimmer that no longer exists.
+
+**The island lights were on the wrong part of the ship, and the fix is a
+measurement.** The cluster ran 0.02–0.08 of the length — barely aft of midships.
+Rather than nudge it until the screenshot looked better, I read the carrier's own
+mesh: 12,878 vertices, filtered to the geometry standing above the flight deck,
+which is the only thing up there. It is a compact structure centred **0.195 L
+from midships, spanning 0.174–0.218 L** — about 15 m on a 332.8 m ship. That is
+the island, and those are now the numbers.
+
+**The sign was derived too**, because it is the half that is easy to get
+backwards and impossible to name afterwards. In model space the island sits
+toward negative long-axis, and the hull tapers toward positive — a bow narrows, a
+stern does not. So negative is aft. In game space +Z is aft as well
+(`launchStartZ` 0.16 is "the aft end of the catapult run", `launchEndZ` -0.44 is
+"short of the bow"). Island to starboard, as every carrier's is.
+
+**Verified:**
+Screenshots at the pre-dawn the report came from — the run starts at morning, so
+`DAY.startTau` was temporarily moved to 0.95 and put back afterwards. That showed
+the original defect plainly: a column of light standing forward and above the
+structure it belonged to. The final position cannot be confirmed from the deck
+camera, because it now sits beside it; the mesh measurement is the verification,
+and it is a stronger one than the screenshot was. `pnpm check` green, browser
+suite 1468 → 1477 on the built page, game page loads clean.
+
+**Commit:** [`1a66ac8`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/1a66ac8)
+
+**What happened:**
+**My first correction was half of what was needed, and I would have shipped it.**
+I moved the island from 0.05 L to 0.10 L by reasoning about where carrier islands
+sit, took a screenshot, saw it had moved in the right direction, and was ready to
+call it done. Measuring the mesh said 0.195 L. The screenshot could not tell me
+that, because from the deck camera "further aft" and "far enough aft" look the
+same — the difference only shows from the air, which is where the report came
+from and where I could not go. The lesson is not "measure more", it is that I had
+a measurable quantity available and reached for the render first.
+
+**A new check passed vacuously on its first run.** The replacement for the
+deleted shimmer assertion built a `createLaunchSequence` and never called
+`arm()`, so it measured `LaunchStage.IDLE` — where shake is zero because nothing
+is happening. "The deck does not shake" passed without a deck. Only the companion
+assertion beside it ("...and the catapult stroke does") failed and exposed it.
+The stage is now asserted explicitly, so the check cannot pass without the
+sequence actually running. §17.14 in miniature, in a test I wrote to satisfy
+§17.14.
