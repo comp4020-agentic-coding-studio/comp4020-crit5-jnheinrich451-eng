@@ -499,3 +499,78 @@ are four phases apart. Scoped to phases adjacent in `PHASE_ORDER`.
 
 **Still red, still the user's:** `pnpm check:evidence` — `PROCESS.md` is
 boilerplate. They have said they will write it at the end.
+
+
+## 2026-08-28 02:47 — The timers were not a safety net, they were the route
+
+**Prompt:**
+
+> I find, if there is a timer for each stage? [...] the SEAWARD shares same
+> location with PASS is fine, yet PASS must be accessible before SEAWARD, and
+> SEAWARD must be accessible after PASS. Currently my observation is the RIDGE
+> and SEAWARD and RECOVERY, except from RECOVERY they are automatically
+> achieved, even I am not here. If there is a timer, remove it. For we have a
+> failure case, if cannot extract within 5 min, then mission failed.
+
+**Result:**
+The observation was right and the numbers say why. Every phase carried a time
+fallback, and they were not rescuing an edge case — they were the normal path:
+
+    TERRAIN   66 s fallback, for PASS -> VALLEY -> RIDGE: ~15 km,
+              over 75 s at cruise before a single SAM is dodged
+    FINAL     42 s fallback, for an 8 km leg
+
+Both expired on every run, so the mission advanced itself past two waypoints
+while the player was still flying to the first. Removed all of them, including
+EXTRACTION's "start the cinematic anyway" timer.
+
+**Overrode §10, and said so rather than quietly ignoring it.** The spec says
+every phase needs a time fallback. The invariant it protects is that the run must
+always END — not that it must always end in a *win*. The five-minute deadline
+already guarantees that, and now it does so with teeth: a sortie never flown home
+is a loss. C5's brief asks for a game that can be lost, so removing the fallbacks
+makes the rule and the brief agree instead of conflict. `CLAUDE.md`'s phase
+table, deadline section, invariant 10 and both testing gates were rewritten to
+match, rather than left describing code that no longer exists.
+
+**Removing them exposed a soft-lock the fallbacks had been hiding**, and it is
+the user's own rule that names it. DEFENSIVE's only leg is COASTLINE, authored at
+the same coordinates as INTERCEPT's so one waterline can serve two consecutive
+encounters. INTERCEPT consumes it first, and DEFENSIVE inherits a waypoint
+several kilometres *behind* the player — not "accessible after", in the user's
+terms. `publishNav` already skipped it, so nav pointed inland at PASS while the
+trigger waited on a volume the player was flying away from. Nav and the trigger
+disagreed; only the 40 s fallback hid it. Fixed by having the trigger read the
+same `satisfied` set nav does — a point already flown through under an earlier
+phase counts, and is not flown twice. Keyed by name and position, so every leg
+with its own coordinates is still reached, in order, exactly once.
+
+**Verified:**
+The bot on both routes at three speeds: COMPLETE at 121–181 s of mission clock,
+119–179 s inside the deadline. That measurement is the point, not a formality —
+if the full route did not fit the clock the deadline would be an impossibility
+rather than a stake, and there are no fallbacks left to carry a slow player. The
+control run is byte-identical to before the change. `pnpm check` green; browser
+suite 1464 → 1468 on the built page; the real game page loads clean.
+
+**Commit:** [`af9eb59`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/af9eb59)
+
+**What happened:**
+Nothing was flagged, but two things are worth keeping.
+
+**The previous turn's fix was aimed at the smaller half of the problem.** I spent
+that turn proving how a respawn could satisfy SEAWARD by placement, and it was
+real — but the user had been watching RIDGE and SEAWARD advance on their own
+*every run*, respawn or not, and the timers were doing that. I diagnosed the
+mechanism I could reproduce rather than the one they were describing, and the
+`t=111.1` in my own repro output was the TERRAIN fallback firing in plain sight.
+I read it as the trigger for the bug instead of as the bug.
+
+**The fallback checks were deleted, not adapted.** §18 asks for that explicitly —
+delete checks when you delete the code they describe — and it matters here
+because an adapted check would have kept asserting a relationship (`sum(limit)`
+under the deadline) about a config key that no longer exists. They were replaced
+by their opposite: every stallable phase, held at an absurd phaseTime with its
+condition unmet, must not move. Plus the loss itself, asserted in both halves —
+a player who never flies does not reach COMPLETE, *and* the clock runs out. A
+phase machine that merely hangs satisfies the first on its own.
