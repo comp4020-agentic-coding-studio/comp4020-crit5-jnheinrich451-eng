@@ -86,6 +86,13 @@ export function createAudio({ createElement, cues = CUES } = {}) {
     }
   }
 
+  // The load report runs at CONSTRUCTION, not on arm(). Which files resolved is
+  // a fact about the build, not about whether the player has pressed a key yet
+  // -- and hanging the diagnostic off the gesture means a page nobody touched
+  // reports nothing at all, which is exactly when you most want to know.
+  //
+  // Skipped for an injected factory: that means a test harness, and a deferred
+  // console line firing out of a finished suite is noise attached to nothing.
   function markMissing(name) {
     const v = voices.get(name);
     if (!v || !v.available) return;
@@ -112,6 +119,8 @@ export function createAudio({ createElement, cues = CUES } = {}) {
     }, seconds * 1000);
   }
 
+  if (!createElement) auditAfter();
+
   return {
     /** NOTHING PLAYS BEFORE A USER GESTURE. The mission opens on a scripted
      *  launch with no input in it, so this is armed on the first keypress or
@@ -119,10 +128,6 @@ export function createAudio({ createElement, cues = CUES } = {}) {
     arm() {
       if (armed) return false;
       armed = true;
-      // Only when driving real elements: an injected factory means a test
-      // harness, and a deferred console report firing seconds later out of a
-      // finished suite is noise attached to nothing.
-      if (!createElement) auditAfter();
       return true;
     },
     isArmed: () => armed,

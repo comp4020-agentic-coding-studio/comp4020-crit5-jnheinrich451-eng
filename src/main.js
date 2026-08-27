@@ -1375,5 +1375,8 @@ globalThis.__vector = {
   get launch() { return launch; },
   get anchors() { return carrierAnchors; },
   get physics() { return physics; },
+  get audio() { return audio; },
+  get mission() { return mission; },
+  get crash() { return crash; },
   world, rig, input, THREE,
 };
