@@ -289,3 +289,113 @@ And three test failures that were all *my tests* rather than the code: a rewind
 target compared against an aircraft I never flew, a fuze given one frame to
 close 8 m at 5 m per frame, and a "dead zone holds attitude" claim that
 contradicts ASSISTED self-centring by definition.
+
+## 2026-08-28 01:59 — The deployed site was never the site that worked
+
+**Prompt:**
+
+> check the spec from the /comp4020:handbook, and check the repo and see if can
+> run in the local server.
+
+then, on being shown what was broken:
+
+> Yes please, and I think you can use flight-lab to replace the index.html. Oh
+> and for public and assets, the assets are the new one, I added two models
+> F-16c and Sam. Yes please fix them.
+
+**Result:**
+Three blockers, all of the same shape: **the thing that worked locally and the
+thing that ships were different objects.**
+
+*One page, not two.* `flight-lab.html` and `index.html` both loaded
+`src/main.js`, but the canvas was `#stage` in one and `#view` in the other, so
+the Pages ROOT threw `Cannot read properties of null (reading 'width')` inside
+three.js on its first frame while the page nobody linked to ran perfectly.
+`index.html` was missing 34 of the 38 element ids `main.js` now reads. Fixed by
+deleting the duplicate rather than repairing it — the divergence *is* the
+defect, and PROCESS_RECORD already recorded the decision that the game should be
+`index.html` "with no click in front of it". The link-preview head block moved
+across with it, and all eight `CLAUDE.md` references were repointed.
+
+*One file per URL.* `src/` had been repointed at `assets/<name>/scene.gltf`,
+which dev served from the untracked 84 MB source tree — and the build, which
+copies only `public/`, shipped a site where all six models 404'd to placeholder
+boxes. The root cause is worth stating precisely, because it is not "someone
+forgot to run the pipeline": a directory named `assets/` in the repo root and
+`public/assets/` are served at **the same URL**, and vite snapshots `public/` at
+boot, so `/assets/audio/gun.mp3` served the *public* copy while a probe file
+created after start-up served the *root* copy. Same URL, two different bytes,
+decided by timing. So the source tree is now `assets-src/` (ignored wholesale,
+never served) and `public/assets/` is the only thing behind that URL. The
+pipeline auto-discovers model directories instead of carrying a rename map, and
+`rm`s its output first — a stale `public/models/` had shipped for days after
+`src/` stopped asking for it, because a directory that still serves reports
+nothing.
+
+*The headless gate had rotted through three layers.* `spec/vector.test.ts`
+imports the game's suite so CI and the browser read the same numbers. It was
+failing on `location is not defined`, then `document is not defined`, then
+`getContext("2d")` returning null under jsdom, and underneath all of it
+`flight.test.js` no longer exported the `run()` the spec imports — caught by
+`tsc`, not by the tests. **Chose one place over nine.** Nine modules paint a
+sprite texture at construction; the first instinct was to guard each call site,
+and that was written and then reverted, because it puts nine branches in shipped
+code that exist only for a test environment. The environment is the harness's
+problem: `spec/headless-canvas.ts` stubs the 2D context under a jsdom
+environment. §17.13 says a double that diverges tests nothing — the divergence
+here is bounded and stated: the nine sites use exactly three methods between
+them (`createRadialGradient`, `fillRect`, a `fillStyle` assignment, plus
+`addColorStop`), every one is painting, and not one assertion in the suite reads
+a pixel.
+
+Also corrected `CREDITS.md`, which claimed the SAM and F-16C were "credited but
+not yet in the build" — they now ship, so that was a false licensing statement.
+
+**Verified:**
+Not "it builds". `pnpm check` green — typecheck, build, 3 suites, 27 tests. The
+game's own suite read **1447 checks passed** off the DOM of the *built*
+`tests.html`, served from `dist/` over HTTP, not from source. The built game
+page was loaded in headless Chrome and its console grepped for
+`placeholder|FAILED|404|Uncaught`: **no matches**, where the same grep before the
+fix returned six lines naming every model. `#loading` and `#asset-note` both
+came back `hidden`. Then the part that was the actual point: `md5sum` of four
+assets fetched from the dev server and from the built site — `scene.gltf` for
+the F-15 and the SAM, a terrain texture, and `gun.mp3` — **identical on all
+four**, which is the invariant the `assets-src/` split exists to create.
+
+**Commit:** [`f335a03`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/f335a03), [`b8bde4a`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit5-jnheinrich451-eng/commit/b8bde4a)
+
+**What happened:**
+Four things, and the first was mine.
+
+**I read a truncated listing as data loss.** `mv assets assets-src` failed with
+`Permission denied`, and `ls -la assets | head -3` printed `total 12`, `.`, `..`
+— which I reported as the directory having been emptied. It had not: `head -3`
+cut the listing at three lines and 84 MB was sitting there untouched. A pipe I
+wrote myself produced the evidence I then believed. The real cause was a Windows
+handle on one subdirectory, and moving the children individually cleared six of
+seven, then `ireland`'s contents moved file-by-file while its now-empty
+directory stayed locked for another few seconds.
+
+**Rebuilding exposed failures the stale `dist/` had been hiding.** The first
+`pnpm test` showed the invariants passing; they were reading a `dist/` built
+before the divergence. A fresh build produced 13 failures — `audio-probe.html`
+and `tests.html` with no description, card, viewport, landmark or `h1`. These
+were already red in CI and had nothing to do with this turn's edits. `tests.html`
+got the furniture it should always have had; `audio-probe.html` is a scratch
+diagnostic and was excluded from the build instead of being dressed up as a page
+it is not.
+
+**The new `h1` collided with an existing one.** Adding `<h1>Operation Vector</h1>`
+to the loading screen made two, because the developer rail's panel already had
+one. The rail's is subordinate to the page, so it became `h2`.
+
+**The site is 37 MB, and one file is 20 MB of it.** `sam/scene.bin` carries more
+geometry than the terrain and the F-15E together, and six sites are placed in the
+world. Textures compressed 57%; geometry does not compress. Recorded in
+`CREDITS.md` rather than silently accepted — the brief gives a stranger five
+minutes, and a cold load on crit-room wifi spends some of it.
+
+**Still red, and not touched:** `pnpm check:evidence` fails because `PROCESS.md`
+is still the template boilerplate with placeholder commit hashes. That is spec
+line 6 and it is the user's to write.
