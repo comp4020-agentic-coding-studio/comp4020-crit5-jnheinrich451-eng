@@ -203,6 +203,7 @@ let lives = rulesFor(MISSION).lives;
 let lost = false;
 let flybyRange = Infinity;
 let engineStarted = false;
+let modeChangedAt = -99;
 const sandbox = createSandbox();
 const flares = createFlares();
 const rearm = createRearm({
@@ -670,6 +671,7 @@ window.addEventListener("keydown", (event) => {
   }
   if (event.code === "KeyM") {
     setMode(state, state.mode === "ASSISTED" ? "EXPERT" : "ASSISTED");
+    modeChangedAt = clock;
     // Clear transient input on a mode change: a held key would otherwise
     // command the fresh model on frame one, and the ramped axes would carry
     // the old attitude in with them. input.clear() deliberately leaves the
@@ -1028,8 +1030,30 @@ function step(now) {
       afterburner: state.afterburner,
       bank: state.bank,
       pitch: state.pitch,
+      throttle: state.throttle,
+      overWater: physics.telemetry.surface === "ocean",
       missiles: weapons ? weapons.count : 0,
+      missileCapacity: weapons ? weapons.capacity : 4,
       flares: flares.remaining,
+      // H10: MISSION only -- the segment is absent entirely in FREE and PEACE.
+      lives: rulesFor(mode).lives === null ? null : lives,
+      modeChangedAgo: clock - modeChangedAt,
+      // H7: the rearm line exists ONLY while a timer runs, and names which
+      // magazine, because the two timers are independent.
+      rearm: (() => {
+        const active = rearm.active();
+        if (!active.length) return null;
+        return { name: active[0], seconds: rearm.remaining(active[0]) };
+      })(),
+      // H8: the stack has exactly three slots.
+      stackTop: message,
+      stackMid: track.currentTarget
+        ? `${track.currentTarget.label} ${(track.range / 1000).toFixed(1)}k`
+        : "",
+      stackLow: missiles.rounds.length ? `${missiles.rounds.length} live` : "",
+      // The developer rail can only RAISE the left floor, never push the
+      // column back across it (H5.1).
+      safeLeft: railVisible ? rail.getBoundingClientRect().right + 18 : 0,
       gunRounds: gun.rounds,
       weapon,
       mode: state.mode,
@@ -1348,6 +1372,8 @@ function driveAudio(dt, threatState, scripted) {
 
 function onResize() {
   world.resize();
+  // H3: `u` is recomputed on RESIZE ONLY, never per frame.
+  hud.resize(window.innerWidth, window.innerHeight);
 }
 window.addEventListener("pointerdown", () => audio.arm());
 window.addEventListener("resize", onResize);

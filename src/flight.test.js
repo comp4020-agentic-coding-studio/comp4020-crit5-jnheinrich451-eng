@@ -80,6 +80,12 @@ import {
   createAudio, groundWarning, isFlyby,
 } from "./audio.js";
 import {
+  AGL_DANGER, AGL_WARN, C, CASING, FLANK_FRACTION, RADAR_MARGIN,
+  RADAR_RADIUS, RAMP, STACK_SLOTS,
+  aglReadout, flankColumns, flankOffset, fontPx, hudScale, modeSegment,
+  stackY, storesPanel,
+} from "./hud-layout.js";
+import {
   EASE,
   HANDOFF_SPEED,
   HANDOFF_THROTTLE,
@@ -4361,6 +4367,239 @@ function testGroundWarningsAndFlyby() {
   check("still outside is not", isFlyby(900, 800, 300) === false);
 }
 
+// ── HUD.md H13 gates ──────────────────────────────────────────────────────
+
+function testHudScale() {
+  // H13.1
+  check("hudScale(720) clamps to the lower bound", hudScale(720) === 0.85, String(hudScale(720)));
+  check("hudScale(1080) is exactly 1", hudScale(1080) === 1, String(hudScale(1080)));
+  check("hudScale(1440) is 1.333", Math.abs(hudScale(1440) - 4 / 3) < 1e-9);
+  check("hudScale(2160) clamps to the upper bound", hudScale(2160) === 2.0, String(hudScale(2160)));
+  check("a degenerate height falls back to the floor", hudScale(0) === 0.85);
+
+  // The smallest ramp entry must never render below 11 CSS px. The ramp's
+  // smallest is 10 and the lower clamp is 0.85, so 8.5 -- the scale alone
+  // cannot satisfy this and the absolute floor is what does.
+  const smallest = Math.min(...Object.values(RAMP).map((r) => r.size));
+  check("the smallest ramp entry is the 10-referenced label", smallest === 10, String(smallest));
+  for (const height of [720, 900, 1080, 1440, 2160]) {
+    const px = fontPx("radarLabel", hudScale(height));
+    check(`the smallest text at ${height}p is at least 11 px`, px >= 11, String(px));
+  }
+  check(
+    "the floor does not shrink type that is already large enough",
+    fontPx("primary", hudScale(1080)) === 26,
+  );
+
+  // THE DPR TRAP (H3): the SVG viewBox is already in CSS pixels, so the browser
+  // has handled devicePixelRatio before any of this runs. Multiplying by it
+  // double-counts and produces the enormous-HUD bug.
+  //
+  // Asserted as BEHAVIOUR rather than by grepping the source: move the global
+  // devicePixelRatio and the scale must not budge. A source scan proves only
+  // that one spelling is absent; this proves the value cannot depend on it,
+  // however it were reached.
+  const savedDpr = globalThis.devicePixelRatio;
+  const atDpr = (dpr) => {
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      value: dpr, configurable: true, writable: true,
+    });
+    return hudScale(1080);
+  };
+  const one = atDpr(1);
+  const three = atDpr(3);
+  const fractional = atDpr(2.625);
+  if (savedDpr === undefined) delete globalThis.devicePixelRatio;
+  else {
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      value: savedDpr, configurable: true, writable: true,
+    });
+  }
+  check(
+    "the scale unit does not depend on devicePixelRatio",
+    one === 1 && three === 1 && fractional === 1,
+    `dpr1 ${one}, dpr3 ${three}, dpr2.625 ${fractional}`,
+  );
+}
+
+function testFlankLayout() {
+  // H13.2
+  const u = hudScale(1080);
+  const widths = [1280, 1920, 2560, 3840];
+  const flanks = widths.map((w) => flankOffset(w, u));
+  check(
+    "flank is monotonic in width",
+    flanks.every((f, i) => i === 0 || f >= flanks[i - 1]),
+    flanks.map((f) => f.toFixed(1)).join(", "),
+  );
+  check("flank is never below 92u", flanks.every((f) => f >= 92 * u));
+  check("flank is never above 300u", flanks.every((f) => f <= 300 * u));
+
+  // 0.14 x w replaces 0.18: at 2500 px the columns sat 300 px off centre while
+  // the boresight cross was 13 px wide, so nothing occupied the middle third.
+  check(
+    "the flank fraction is 0.14, not 0.18",
+    FLANK_FRACTION === 0.14,
+    String(FLANK_FRACTION),
+  );
+  check(
+    "at 2560 the columns are pulled in from the old 0.18 placement",
+    flankOffset(2560, u) < 0.18 * 2560,
+    `${flankOffset(2560, u).toFixed(0)} vs ${(0.18 * 2560).toFixed(0)}`,
+  );
+
+  // A 320 px developer rail must never be crossed.
+  for (const w of widths) {
+    const col = flankColumns(w, u, 320);
+    check(`spdX clears a 320 px rail at w=${w}`, col.spdX > 320 - 1e-9, String(col.spdX));
+  }
+  // safeLeft only ever RAISES the floor -- it can never pull a column inward.
+  const free = flankColumns(1920, u, 0);
+  const railed = flankColumns(1920, u, 900);
+  check("safeLeft raises the floor", railed.spdX === 900, String(railed.spdX));
+  check("safeLeft never moves the right column", railed.altX === free.altX);
+  check("with no rail the column sits at cx - flank", free.spdX === 960 - free.flank);
+}
+
+function testAglReadout() {
+  // H13.5. AGL OVER WATER READS AN EM DASH, NOT ZERO: a dash means "not a
+  // factor", a zero means "you are about to die", and the sea must not cry
+  // wolf for the four minutes of the sortie flown over it.
+  const water = aglReadout(0, true);
+  check("AGL over water is an em dash", water.text === "—", water.text);
+  check("and it is dim, not a warning colour", water.colour === C.dim);
+  check("a non-finite AGL is also a dash", aglReadout(Infinity, false).text === "—");
+
+  check("AGL 300 is neutral", aglReadout(300, false).colour === C.line);
+  check("AGL 200 is amber", aglReadout(200, false).colour === C.warn);
+  check("AGL 100 is salmon", aglReadout(100, false).colour === C.danger);
+  check("AGL 300 prints the number", aglReadout(300, false).text === "300");
+  check("the thresholds are 220 and 110", AGL_WARN === 220 && AGL_DANGER === 110);
+}
+
+function testStoresPanel() {
+  // H13.6
+  const u = hudScale(1080);
+  const base = {
+    w: 1920, h: 1080, u, weapon: "AIM-9", missiles: 4, missileCapacity: 4,
+    gunRounds: 500, flares: 8,
+  };
+  const panel = storesPanel(base);
+  check("the panel is right-anchored", panel.anchor === "end");
+  check("it has three rows", panel.rows.length === 3);
+
+  // THE SELECTED WEAPON IS MARKED BY POSITION AND GLYPH, NOT BY COLOUR ALONE:
+  // colour-only selection fails for a colour-blind player and fails again on a
+  // bright deck.
+  const selected = panel.rows.find((r) => r.selected);
+  check("the selected row carries a marker glyph", selected.marker === "›", selected.marker);
+  check("unselected rows carry no marker", panel.rows.filter((r) => !r.selected).every((r) => r.marker.trim() === ""));
+  check("the selected row is full brightness", selected.colour === C.line);
+  check("unselected rows are dim", panel.rows.find((r) => r.key === "GUN").colour === C.dim);
+  const gunSelected = storesPanel({ ...base, weapon: "GUN" });
+  check("selection follows the weapon", gunSelected.rows.find((r) => r.key === "GUN").marker === "›");
+
+  // PIPS, NOT JUST DIGITS. Two AIM-9 is a quantity a player must FEEL.
+  check("four of four is four full pips", panel.rows[0].glyph === "▮▮▮▮", panel.rows[0].glyph);
+  const two = storesPanel({ ...base, missiles: 2 });
+  check("two of four is two full and two hollow", two.rows[0].glyph === "▮▮▭▭", two.rows[0].glyph);
+
+  // EMPTY IS AMBER, NEVER HIDDEN. A row that disappears when empty teaches
+  // nothing.
+  const dry = storesPanel({ ...base, missiles: 0 });
+  check("an empty magazine is still present", dry.rows.length === 3);
+  check("an empty magazine is amber", dry.rows[0].colour === C.warn, dry.rows[0].colour);
+  check("an empty magazine has hollow pips", dry.rows[0].glyph === "▭▭▭▭", dry.rows[0].glyph);
+  check("the empty row still prints its count", dry.rows[0].count === 0);
+
+  // The gun is a FRACTION, not a count, so it gets an eight-cell bar.
+  check("a full gun is eight lit cells", panel.rows[1].glyph === "▬".repeat(8), panel.rows[1].glyph);
+  const half = storesPanel({ ...base, gunRounds: 250 });
+  check("a half gun is four lit cells", half.rows[1].glyph === "▬▬▬▬▭▭▭▭", half.rows[1].glyph);
+
+  // THE REARM LINE ONLY EXISTS WHILE A TIMER RUNS, and names WHICH magazine.
+  check("no rearm line when no timer runs", panel.rearm === null);
+  const rearming = storesPanel({ ...base, rearm: { name: "AIM-9", seconds: 11.2 } });
+  check("a running timer produces a line", rearming.rearm !== null);
+  check("and it names the magazine", rearming.rearm.text.includes("AIM-9"), rearming.rearm.text);
+  check("and it is amber", rearming.rearm.colour === C.warn);
+  check("and it rounds up the seconds", rearming.rearm.text.includes("12s"), rearming.rearm.text);
+
+  // H13.7: the panel must clear the radar ring at BOTH ends of the u clamp --
+  // the two places a collision would first appear.
+  //
+  // Measured against the ring's TRUE top (2r + margin above the bottom), not
+  // against `r + margin` as H13.7 words it -- that is the ring's CENTRE line,
+  // and a panel can clear it while still overlapping the upper half of the
+  // ring. The weaker reading passed here while the live nodes overlapped by
+  // 58 px at 2560x1440.
+  for (const [w, h] of [[1280, 720], [1920, 1080], [2560, 1440], [3840, 2160]]) {
+    const uu = hudScale(h);
+    const p = storesPanel({ ...base, w, h, u: uu });
+    const trueRadarTop = h - (2 * RADAR_RADIUS + RADAR_MARGIN) * uu;
+    check(
+      `stores clears the radar RING at ${w}x${h}`,
+      p.bottom <= trueRadarTop && p.top < trueRadarTop,
+      `bottom ${p.bottom.toFixed(0)}, ring top ${trueRadarTop.toFixed(0)}`,
+    );
+    check(
+      `stores also clears H13.7's stated line at ${w}x${h}`,
+      p.top < h - (RADAR_RADIUS + RADAR_MARGIN) * uu,
+    );
+  }
+}
+
+function testModeSegment() {
+  // H13.9
+  const u = hudScale(1080);
+  const mission = modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5 });
+  check("MISSION shows the pilot count", mission.text.includes("5 PILOTS"), mission.text);
+  check("it is bottom-left anchored", mission.anchor === "start");
+
+  // PILOTS is MISSION ONLY: counting deaths in a sandbox turns practice into a
+  // test, so the segment is ABSENT ENTIRELY in FREE and PEACE.
+  const free = modeSegment({ h: 1080, u, mode: "ASSISTED", lives: null });
+  check("FREE has no PILOTS segment", !free.text.includes("PILOT"), free.text);
+  check("and no pilots part at all", free.parts.length === 1);
+  const peace = modeSegment({ h: 1080, u, mode: "EXPERT", lives: undefined });
+  check("PEACE has no PILOTS segment", !peace.text.includes("PILOT"), peace.text);
+
+  // EXPERT renders in the good tint, so the modes are distinguishable at a
+  // glance without reading the word.
+  check("EXPERT is the good tint", modeSegment({ h: 1080, u, mode: "EXPERT", lives: 5 }).parts[0].colour === C.good);
+  check("ASSISTED is not", mission.parts[0].colour !== C.good);
+
+  // Pilots shift amber at 2, salmon at 1.
+  check("5 pilots is dim", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5 }).parts[1].colour === C.dim);
+  check("2 pilots is amber", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 2 }).parts[1].colour === C.warn);
+  check("1 pilot is salmon", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 1 }).parts[1].colour === C.danger);
+  check("1 pilot is singular", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 1 }).text.includes("1 PILOT"), "plural");
+
+  // The mode brightens for 1.2 s after M, then settles back.
+  check("a fresh mode change is bright", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5, modeChangedAgo: 0.4 }).parts[0].colour === C.line);
+  check("and settles back after 1.2 s", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5, modeChangedAgo: 2 }).parts[0].colour === C.dim);
+}
+
+function testStackAndColours() {
+  // H13.8: the stack has EXACTLY THREE slots. A fourth line of combat text is
+  // a redesign of the stack, not an addition to it.
+  check("the stack has exactly three slots", STACK_SLOTS.length === 3, String(STACK_SLOTS.length));
+  check("the slots descend", STACK_SLOTS[0] < STACK_SLOTS[1] && STACK_SLOTS[1] < STACK_SLOTS[2]);
+  check("stackY maps them onto a viewport", stackY(1000).join(",") === "630,665,695");
+
+  // H12: six hues and no gradients.
+  for (const key of ["line", "dim", "faint", "good", "nav", "warn", "danger", "ab", "radar"]) {
+    check(`the palette defines ${key}`, typeof C[key] === "string" && C[key].length > 0);
+  }
+  check("no colour is a gradient", Object.values(C).every((v) => !v.includes("gradient")));
+
+  // H4: the casing contract the shared text() helper applies.
+  check("the casing paints stroke under fill", CASING.paintOrder === "stroke fill");
+  check("the casing is a dark translucent stroke", CASING.stroke.startsWith("rgba(4, 8, 10"));
+  check("text casing is 2.6u", CASING.textWidth === 2.6);
+  check("symbol casing is 1.8u", CASING.symbolWidth === 1.8);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -4460,6 +4699,12 @@ const SUITES = [
   ["audio intervals and takes", testAudioIntervalsAndTakes],
   ["audio gestures and missing files", testAudioGesturesAndMissingFiles],
   ["ground warnings and the fly-by", testGroundWarningsAndFlyby],
+  ["HUD scale unit", testHudScale],
+  ["HUD flank layout", testFlankLayout],
+  ["HUD AGL readout", testAglReadout],
+  ["HUD stores panel", testStoresPanel],
+  ["HUD mode and pilots", testModeSegment],
+  ["HUD stack and colours", testStackAndColours],
 ];
 
 export function run() {
