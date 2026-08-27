@@ -15,7 +15,7 @@ import { LockState, LockFail, TARGETING, targetGeometry, qualifies, advanceLock,
 import { MISSILE, MissileState, steer, segmentDistance, advanceSpeed, leadPoint, overshooting, createMissileSystem } from "./missile.js";
 import { ENEMY, createTargetDrone, updateTargetDrone, integrateDrone, resetTargetDrone, markTargetHit, damageTarget, normalizeHostileModel, installHostileVisual, HOSTILE_MODEL } from "./enemy.js";
 import { HOSTILE, HOSTILE_MISSILE, HostileState, wrapPi, aimAngles, forwardFrom, offNoseDeg, steerAngle, predictPoint, inAttackCone, altitudeGuard, hostileTransition, phaseSpeed, createHostileAI } from "./hostile.js";
-import { THREAT, ThreatLevel, ThreatTier, threatLevelOf, warningTier, threatBearing, dodgeWindow, inDodgePeak, evasionAuthority, evadeEarned, createThreatMonitor } from "./threat.js";
+import { THREAT, ThreatLevel, ThreatTier, threatLevelOf, warningTier, threatBearing, dodgeWindow, inDodgePeak, evasionAuthority, evadeEarned, mergeHostiles, createThreatMonitor } from "./threat.js";
 import { DamageSource, createPlayerDamageEvent, createDevelopmentHitResponse } from "./damage.js";
 import { HUD, apparentSize, damp, dampAngle, derivePitchDeg, deriveBankDeg, deriveHeadingDeg, uiScaleFor } from "./combat-hud.js";
 import { ENGINE_FX, engineIntensity, ringOpacity, flickerAt } from "./engine-fx.js";
@@ -3209,20 +3209,50 @@ const makeTerrain = (f, half = 100) => {
   for (let i = 0; i < 60 * 2; i++) box.update({ hostileAlive: false }, 1 / 60);
   check("sandbox: then it arrives", spawns === 1, spawns);
 
-  // One at a time, always. A living hostile freezes the respawn clock entirely.
-  for (let i = 0; i < 60 * 60; i++) box.update({ hostileAlive: true }, 1 / 60);
-  check("sandbox: a live hostile is never joined by a second", spawns === 1, spawns);
-  for (let i = 0; i < 60 * (SANDBOX.hostileRespawn - 1); i++) box.update({ hostileAlive: false }, 1 / 60);
-  check("sandbox: a kill buys a real pause", spawns === 1, spawns);
-  for (let i = 0; i < 60 * 2; i++) box.update({ hostileAlive: false }, 1 / 60);
-  check("sandbox: and then the next one", spawns === 2, spawns);
+  /**
+   * FREE FLY FILLS A WING, and then stops.
+   *
+   * This used to be one-at-a-time, and the check here asserted that a live
+   * hostile was never joined by a second. `SANDBOX.wing` replaced that rule, so
+   * the check is rewritten rather than adapted (§18) -- an adapted version would
+   * still be describing a design that no longer exists.
+   *
+   * `hostilesAlive` is a COUNT now, because a boolean cannot express "one of two
+   * is flying", which is the state the mode is in for most of a fight.
+   */
+  check("sandbox: FREE fly flies a wing of more than one", SANDBOX.wing > 1, SANDBOX.wing);
+  for (let i = 0; i < 60 * (SANDBOX.hostileRespawn + 1); i++) box.update({ hostilesAlive: 1 }, 1 / 60);
+  check("sandbox: one of two alive still calls for a wingman", spawns === 2, spawns);
+  // ...and a full wing freezes the clock entirely, however long you fly.
+  for (let i = 0; i < 60 * 120; i++) box.update({ hostilesAlive: SANDBOX.wing }, 1 / 60);
+  check("sandbox: a FULL wing is never joined by another", spawns === 2, spawns);
 
-  // SAM sites deliberately do not come back: clearing the valley is the reward.
-  check("sandbox: SAM sites never respawn", SANDBOX.samRespawn === null);
+  /**
+   * Drain to a KNOWN timer first. The previous segments leave the respawn clock
+   * part-spent, and a check written against a whole `hostileRespawn` from there
+   * fails on arithmetic rather than on behaviour -- which is exactly what the
+   * first draft of this did.
+   */
+  const mark = spawns;
+  for (let i = 0; i < 60 * (SANDBOX.hostileRespawn + 2) && spawns === mark; i++) box.update({ hostilesAlive: 0 }, 1 / 60);
+  check("sandbox: an empty sky is refilled", spawns === mark + 1, spawns);
+  // The timer is now exactly hostileRespawn, so the next two checks mean what
+  // they say.
+  for (let i = 0; i < 60 * (SANDBOX.hostileRespawn - 1); i++) box.update({ hostilesAlive: 0 }, 1 / 60);
+  check("sandbox: a kill buys a real pause", spawns === mark + 1, spawns);
+  for (let i = 0; i < 60 * 2; i++) box.update({ hostilesAlive: 0 }, 1 / 60);
+  // ONE replacement, not a wing's worth: the timer runs between spawns, so
+  // losing both does not put two aircraft in the air on the same frame.
+  check("sandbox: and then the next one, one at a time", spawns === mark + 2, spawns);
 
+  // SAM sites do not come back in MISSION: clearing the valley is the reward.
+  // FREE fly seeds its own batches instead, which is a different rule entirely.
+  check("sandbox: MISSION's SAM sites never respawn", SANDBOX.samRespawn === null);
+
+  const atReset = spawns;
   box.reset();
-  for (let i = 0; i < 60 * 60; i++) box.update({ hostileAlive: false }, 1 / 60);
-  check("sandbox: reset stops it dead", spawns === 2 && !box.state.live, spawns);
+  for (let i = 0; i < 60 * 60; i++) box.update({ hostilesAlive: 0 }, 1 / 60);
+  check("sandbox: reset stops it dead", spawns === atReset && !box.state.live, spawns);
 }
 
 /* ---- the director parks in a sandbox mode ---- */
@@ -5521,6 +5551,40 @@ const holdStep = (d, pos, dt) =>
   check("free/sam: PEACE seeds nothing", peaceSeeded === 0, peaceSeeded);
   check("free/sam: ...because PEACE has no SAMs to seed", modeRules(GameMode.PEACE).sams === false);
   check("free/sam: and MISSION still owns its authored corridor", modeRules(GameMode.MISSION).sams === true && SANDBOX.samRespawn === null);
+}
+
+/**
+ * A WING OF TWO, AND THE THREAT MONITOR STILL ASKS ONE QUESTION.
+ *
+ * `threat.update` reads `{tracking, locked, lockProgress}` — one hostile's
+ * worth. FREE fly flies two (SANDBOX.wing), so they are merged, and the merge
+ * is the WORST case: what is being done to the player does not get less urgent
+ * because a second aircraft is the one doing it.
+ *
+ * §17.14 — assert the merge, not "the HUD shows something". A merge that took
+ * the FIRST hostile, or averaged them, would still light the display.
+ */
+{
+  const none = { tracking: false, locked: false, lockProgress: 0 };
+  const tracking = { tracking: true, locked: false, lockProgress: 0.4 };
+  const locked = { tracking: true, locked: true, lockProgress: 1 };
+
+  check("wing: an empty sky threatens nothing", JSON.stringify(mergeHostiles([])) === JSON.stringify(none));
+  check("wing: a null wing is handled rather than thrown at", JSON.stringify(mergeHostiles(null)) === JSON.stringify(none));
+  check("wing: one hostile passes straight through — MISSION is unchanged", mergeHostiles([locked]).locked === true && mergeHostiles([tracking]).locked === false);
+
+  // The load-bearing case: the SECOND aircraft is the dangerous one.
+  const mixed = mergeHostiles([tracking, locked]);
+  check("wing: a lock anywhere in the wing is a LOCK", mixed.locked === true, mixed);
+  check("wing: ...even when the first aircraft is only tracking", mergeHostiles([tracking, locked]).locked === true);
+  check("wing: ...and in either order", mergeHostiles([locked, tracking]).locked === true);
+  check("wing: the pip follows whichever is closest to firing", mixed.lockProgress === 1, mixed.lockProgress);
+  check("wing: tracking is a union too", mergeHostiles([none, tracking]).tracking === true);
+  check("wing: two quiet hostiles are still quiet", mergeHostiles([none, none]).locked === false && mergeHostiles([none, none]).tracking === false);
+  // A slot that has never been deployed is a hole in the array, not a threat.
+  check("wing: an undeployed slot does not invent a threat", mergeHostiles([locked, null]).locked === true && mergeHostiles([null, null]).locked === false);
+
+  check("wing: FREE fly flies more than one, MISSION exactly one (§12)", SANDBOX.wing === 2 && MISSION.encounter.defensive.ammo === 2, SANDBOX.wing);
 }
 
 console.log(failures === 0 ? `flight.test.js — all ${total} checks passed` : `flight.test.js — ${failures} failure(s) of ${total}`);

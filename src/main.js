@@ -36,7 +36,7 @@ import { MISSILE, createMissileSystem } from "./missile.js";
 import { GUN, createGunSystem } from "./gun.js";
 import { ENEMY, createTargetDrone, updateTargetDrone, resetTargetDrone, markTargetHit, damageTarget, loadHostileFighter, installHostileVisual } from "./enemy.js";
 import { HOSTILE, HOSTILE_MISSILE, HostileState, createHostileAI } from "./hostile.js";
-import { THREAT, ThreatLevel, createThreatMonitor, inDodgePeak, evadeEarned } from "./threat.js";
+import { THREAT, ThreatLevel, createThreatMonitor, inDodgePeak, evadeEarned, mergeHostiles } from "./threat.js";
 import { DamageSource, createPlayerDamageEvent, createDevelopmentHitResponse } from "./damage.js";
 import { createCombatHud, projectToScreen } from "./combat-hud.js";
 import { ENGINE_FX, createEngineFx } from "./engine-fx.js";
@@ -152,8 +152,25 @@ const combatRoot = new THREE.Object3D();
 combatRoot.name = "CombatRoot";
 scene.add(combatRoot);
 
-const drone = createTargetDrone();
-combatRoot.add(drone.root);
+/**
+ * THE WING. Element 0 IS the old single hostile, under the old names, so every
+ * MISSION path below is byte-identical to what it was: §12's "one instance
+ * serves all three encounters" is a mission rule and it still holds -- the
+ * encounter table deploys `wing[0]` and nothing else.
+ *
+ * The extra aircraft exist only for FREE fly (`SANDBOX.wing`). They are built up
+ * front rather than on demand because a hostile is a drone, an AI, a cloned
+ * mesh and a launch subscription, and creating that mid-fight is four chances
+ * to leak something. Inactive ones are switched off, which §5 already requires:
+ * an inactive hostile is not simulated, not drawn and not offered to targeting.
+ */
+const wing = [];
+for (let i = 0; i < SANDBOX.wing; i++) {
+  const d = createTargetDrone();
+  combatRoot.add(d.root);
+  wing.push({ drone: d, ai: null });
+}
+const drone = wing[0].drone;
 
 /**
  * Stage 03.3 — the player as a target entity.
@@ -167,7 +184,13 @@ const playerEntity = { position: aircraftRoot.position, velocity: new THREE.Vect
 
 // The hostile's brain. It owns the drone's heading/pitch/speed and nothing else
 // — a launch is an event this file interprets, not something the AI performs.
-const hostileAi = createHostileAI({ drone });
+for (const w of wing) w.ai = createHostileAI({ drone: w.drone });
+const hostileAi = wing[0].ai;
+
+/** The pairs currently worth simulating, targeting or drawing. */
+function liveHostiles() {
+  return wing.filter((w) => w.ai.state.active && w.drone.alive);
+}
 const threat = createThreatMonitor();
 // Guidance context for the evasion hook: rebuilt each frame, read per missile.
 const _evasion = { position: aircraftRoot.position, velocityDir: null, inPeak: false };
@@ -239,9 +262,17 @@ function retireFreeSites() {
 }
 
 const sandbox = createSandbox({
-  spawnHostile: () => deployHostile(MISSION.encounter.defensive),
+  /**
+   * Fill the first empty slot rather than redeploying wing[0] on top of a
+   * hostile that is already flying -- which is what a bare deployHostile() would
+   * do, and it would look like the aircraft teleporting.
+   */
+  spawnHostile: () => {
+    const slot = wing.find((w) => !(w.ai.state.active && w.drone.alive));
+    if (slot) deployHostile(MISSION.encounter.defensive, slot);
+  },
   setHostile: (on) => {
-    if (!on) hostileAi.setActive(false);
+    if (!on) for (const w of wing) w.ai.setActive(false);
   },
   setSams: (on) => {
     /**
@@ -342,7 +373,7 @@ function applyMode(next) {
   retireFreeSites();
   samNet.setSites(missionSites);
   samNet.setActive(false);
-  hostileAi.setActive(false);
+  for (const w of wing) w.ai.setActive(false);
   hideFailed();
   paintLives();
   return rules;
@@ -716,18 +747,44 @@ function clearEncounterFx() {
  * of the player and given the ammunition the encounter calls for; INTERCEPT's
  * zero rounds is what makes that phase one-way pressure without a new state.
  */
-function deployHostile(enc) {
+/**
+ * @param w which aircraft to deploy. Defaults to wing[0], which is the ONLY one
+ *   MISSION ever uses -- §12's single instance, unchanged.
+ */
+let waveSide = 1;
+function deployHostile(enc, w = wing[0]) {
   const e = MISSION.encounter;
   quatForward(flightState.quat, _fwd);
-  const side = hostileAi.state.encounters % 2 === 0 ? 1 : -1;
+  /**
+   * Slot 0 keeps §12's alternation EXACTLY -- its own encounter count, which is
+   * what MISSION has always used. Every other slot is placed relative to it:
+   * opposite side, and further out.
+   *
+   * §17.9 in miniature: THE SIDE IS LATCHED WHEN THE LEAD DEPLOYS, and the
+   * wingman reads the latch rather than recomputing.
+   *
+   * Two attempts got this wrong, both by recomputing. Adding the wing index to
+   * each aircraft's OWN encounter count cancels -- two slots whose counters
+   * differ by one, at indices differing by one, land on the same parity.
+   * Reading slot 0's counter live fails for a subtler reason: slot 0's deploy
+   * INCREMENTS it, so by the time the wingman deploys the value has flipped and
+   * negating it returns the lead's side. Measured both times: x = 900 and 1440,
+   * the same side, 540 m apart.
+   */
+  const idx = wing.indexOf(w);
+  if (idx === 0) waveSide = w.ai.state.encounters % 2 === 0 ? 1 : -1;
+  const side = idx === 0 ? waveSide : -waveSide;
+  const lateral = e.lateral * (1 + idx * 0.6);
   const at = {
-    x: aircraftRoot.position.x + _fwd.x * e.ahead - _fwd.z * side * e.lateral,
-    y: Math.max(HOSTILE.minAltitude + 60, aircraftRoot.position.y + e.above),
-    z: aircraftRoot.position.z + _fwd.z * e.ahead + _fwd.x * side * e.lateral,
+    x: aircraftRoot.position.x + _fwd.x * e.ahead - _fwd.z * side * lateral,
+    // Stagger the altitude too, so a wingman is not hidden directly behind its
+    // leader from the player's eye.
+    y: Math.max(HOSTILE.minAltitude + 60, aircraftRoot.position.y + e.above + idx * 90),
+    z: aircraftRoot.position.z + _fwd.z * e.ahead + _fwd.x * side * lateral,
   };
   // Facing back down the player's course: a head-on pass is how an intercept
   // announces itself, and it puts the hostile on screen without a hunt.
-  hostileAi.deploy({ at, heading: Math.atan2(-_fwd.x, -_fwd.z) + Math.PI, ammo: enc.ammo, engageDelay: enc.engageDelay });
+  w.ai.deploy({ at, heading: Math.atan2(-_fwd.x, -_fwd.z) + Math.PI, ammo: enc.ammo, engageDelay: enc.engageDelay });
 }
 
 director.on("phase", ({ phase }) => {
@@ -742,7 +799,7 @@ director.on("phase", ({ phase }) => {
     deployHostile(enc);
   } else {
     // §5 — do not simulate what the player cannot interact with.
-    hostileAi.setActive(false);
+    for (const w of wing) w.ai.setActive(false);
     targeting.clear();
   }
   if (phase === MissionPhase.COMPLETE) showComplete();
@@ -1039,20 +1096,24 @@ function navCtx() {
 }
 
 // §16: the round leaves a wing hardpoint, never the aircraft's centre.
-hostileAi.on("launch", () => {
-  if (!missiles) return;
-  // The drone moved this frame; its hardpoint's world transform has to be
-  // current or the round leaves from where the enemy was, not where it is.
-  drone.root.updateMatrixWorld(true);
-  missiles.fire({
-    mount: drone.hardpoint,
-    target: playerEntity,
-    ownerSpeed: drone.speed,
-    owner: "hostile",
-    side: 1,
-    cfg: HOSTILE_MISSILE,
+// Per aircraft, so a round leaves the rail of the one that fired it. Subscribing
+// once with `drone` closed over would have every launch come off wing[0].
+for (const w of wing) {
+  w.ai.on("launch", () => {
+    if (!missiles) return;
+    // The drone moved this frame; its hardpoint's world transform has to be
+    // current or the round leaves from where the enemy was, not where it is.
+    w.drone.root.updateMatrixWorld(true);
+    missiles.fire({
+      mount: w.drone.hardpoint,
+      target: playerEntity,
+      ownerSpeed: w.drone.speed,
+      owner: "hostile",
+      side: 1,
+      cfg: HOSTILE_MISSILE,
+    });
   });
-});
+}
 
 /* ---- Stage 04.1/04.5: rearm and audio ---- */
 // §13 — built after `rounds` exists, so it is created in the load block. The
@@ -1122,7 +1183,7 @@ const _contacts = [];
  */
 function radarContacts() {
   _contacts.length = 0;
-  if (hostileAi.state.active && drone.alive) _contacts.push({ x: drone.position.x, z: drone.position.z, kind: "AIR" });
+  for (const w of liveHostiles()) _contacts.push({ x: w.drone.position.x, z: w.drone.position.z, kind: "AIR" });
   for (const s of samNet.sites) {
     if (!s.alive) continue;
     if (s.phase !== SamState.TRACK && s.phase !== SamState.LOCK && s.phase !== SamState.LAUNCH) continue;
@@ -1257,11 +1318,11 @@ function resetCombat() {
   // Ammo resets; the *selected* weapon does not. R restores the battle, not the
   // player's choice of how to fight it.
   gun.reset();
-  resetTargetDrone(drone);
+  for (const w of wing) resetTargetDrone(w.drone);
   // §38: the enemy, its AI, its ammunition and every threat display go back with
   // everything else. No stale hostile missile survives a reset — missiles.reset()
   // above clears both owners' rounds.
-  hostileAi.reset();
+  for (const w of wing) w.ai.reset();
   threat.reset();
   hitResponse.reset();
   if (rearm) rearm.reset();
@@ -2051,8 +2112,8 @@ function step() {
       position: aircraftRoot.position,
       strokeStarted: launch.state.stage !== LaunchStage.DECK && launch.state.stage !== LaunchStage.IDLE,
       launchDone: launch.state.done,
-      hostileAlive: drone.alive,
-      hostileSpent: hostileAi.spent && (!missiles || missiles.ownedBy("hostile").length === 0),
+      hostileAlive: wing.some((w) => w.drone.alive),
+      hostileSpent: wing.every((w) => w.ai.spent) && (!missiles || missiles.ownedBy("hostile").length === 0),
     },
     dt
   );
@@ -2154,15 +2215,16 @@ function step() {
   // §15 — including whether the player has a completed lock on it. Published
   // state, exactly like position and velocity: the AI reads the same fact the
   // player's HUD is showing, not the HUD itself.
-  playerEntity.locked = targeting.state.lockState === LockState.LOCKED && targeting.state.currentTarget === drone;
-  hostileAi.update(playerEntity, dt);
+  playerEntity.locked =
+    targeting.state.lockState === LockState.LOCKED && wing.some((w) => targeting.state.currentTarget === w.drone);
+  for (const w of wing) w.ai.update(playerEntity, dt);
   // Ground threats. Static, so there is no integration step — only acquisition,
   // line of sight and a launch.
   samNet.update(playerEntity, dt);
   if (isSandbox(mode)) {
     sandbox.update(
       {
-        hostileAlive: hostileAi.state.active && drone.alive,
+        hostilesAlive: liveHostiles().length,
         position: aircraftRoot.position,
         heading: flightState.heading,
         // Only FREE fly seeds batches. PEACE has no SAMs at all, and passing a
@@ -2175,9 +2237,10 @@ function step() {
 
   // §5 — an inactive hostile is not a target, either. Handing targeting an empty
   // list is what stops the player locking a drone that is not in the mission yet.
-  const engaged = hostileAi.state.active && drone.alive;
+  const flying = liveHostiles();
+  const engaged = flying.length > 0;
   _candidates.length = 0;
-  if (engaged) _candidates.push(drone);
+  for (const w of flying) _candidates.push(w.drone);
   for (const s of samNet.targets) _candidates.push(s);
   targeting.update(observer, _candidates, screenOffsetOf, dt);
   handleFireInput();
@@ -2191,7 +2254,10 @@ function step() {
   // the range the fuze is working with.
   threat.update(
     {
-      hostile: hostileAi.state,
+      // The worst case across the wing: one locked and one merely tracking is a
+      // LOCK, and it does not get less urgent because a second aircraft is the
+      // one doing it. See threat.js's mergeHostiles.
+      hostile: mergeHostiles(wing.map((w) => w.ai.state)),
       // Both owners' rounds, so a SAM shot escalates the display the same way a
       // fighter's does and the nearest one wins.
       incoming: missiles ? missiles.live.filter((m) => m.owner === "hostile" || m.owner === "sam") : [],
@@ -2226,7 +2292,7 @@ function step() {
       // Whatever the targeting system has settled on — which may be a SAM site.
       // The gun works on ground targets with no special case because the lead
       // solution only needs a position and a velocity, and a SAM's is zero.
-      target: targeting.state.currentTarget || (engaged ? drone : null),
+      target: targeting.state.currentTarget || (flying[0] ? flying[0].drone : null),
     },
     dt
   );
@@ -2391,7 +2457,7 @@ function step() {
       // be a SAM site. This was hardcoded to the drone, so a locked ground target
       // drew no bracket, no lock diamond and no range: the lock worked and the
       // player had no way to know, which reads exactly like "I cannot lock SAM".
-      target: targeting.state.currentTarget || (engaged ? drone : null),
+      target: targeting.state.currentTarget || (flying[0] ? flying[0].drone : null),
       advisory: atmosphere.state.advisory,
       // Cloud dims the target bracket rather than hiding it: harder to read,
       // never impossible (§36).
@@ -2644,7 +2710,9 @@ Promise.all([
   if (f15 && f15.placeholder) failures.push("F-15: placeholder airframe in use");
   // The hostile is ONE instance reused by every encounter (§43), so its visual
   // is swapped once here rather than per deploy.
-  if (hostileModel) installHostileVisual(drone, hostileModel.prototype);
+  // One clone per aircraft: clone(true) shares geometry and materials, so a wing
+  // costs one transform hierarchy each rather than N copies of the mesh.
+  if (hostileModel) for (const w of wing) installHostileVisual(w.drone, hostileModel.prototype.clone(true));
   else failures.push("F-16C: placeholder UCAV in use");
   if (failures.length) {
     noteEl.innerHTML = failures.map((f) => `asset error &mdash; ${f}`).join("<br />");
@@ -2663,7 +2731,7 @@ Promise.all([
 
   console.log("[atmos] cloud field", atmosphere.report);
 
-  window.__flightLab = { scene, camera, aircraftRoot, flightState, world, WORLD, FLIGHT, SPEED, THROTTLE, EXPERT, CHASE, PHYSICS, RECOVERY, physics, recovery, physicsDebug, carrier, terrain, WEAPONS, TARGETING, MISSILE, ENEMY, GUN, HOSTILE, HOSTILE_MISSILE, THREAT, mountSet, rounds, missiles, targeting, drone, hostileAi, threat, hitResponse, playerEntity, combatHud, tryFire, gun, WeaponMode, get weapon() { return weapon; }, input, ENGINE_FX, VAPOR, ATMOS, engineFx, vaporFx, atmosphere, MISSION, MissionPhase, LAUNCH, MISSION_FAILURE, director, launch, missionFailure, navRoot, restartMission, REARM, AUDIO, Cue, Priority, audio, SAM, SAM_MISSILE, SamState, samNet, FLARE, flares, CRASH, CrashCause, crashFx, step, GameMode, MODES, SANDBOX, sandbox, applyMode, lineOfSight, get mode() { return mode; }, get rearm() { return rearm; }, get route() { return director.route; }, get policy() { return physicsPolicy.name; } , worldClock, DAY, environmentFor, oceanVisual, OCEAN, LIGHTS, get settlementLights() { return settlementLights; }, get carrierLights() { return carrierLights; }, sun, moon, skyFill, sky, atmosphere };
+  window.__flightLab = { scene, camera, aircraftRoot, flightState, world, WORLD, FLIGHT, SPEED, THROTTLE, EXPERT, CHASE, PHYSICS, RECOVERY, physics, recovery, physicsDebug, carrier, terrain, WEAPONS, TARGETING, MISSILE, ENEMY, GUN, HOSTILE, HOSTILE_MISSILE, THREAT, mountSet, rounds, missiles, targeting, drone, hostileAi, wing, liveHostiles, threat, hitResponse, playerEntity, combatHud, tryFire, gun, WeaponMode, get weapon() { return weapon; }, input, ENGINE_FX, VAPOR, ATMOS, engineFx, vaporFx, atmosphere, MISSION, MissionPhase, LAUNCH, MISSION_FAILURE, director, launch, missionFailure, navRoot, restartMission, REARM, AUDIO, Cue, Priority, audio, SAM, SAM_MISSILE, SamState, samNet, FLARE, flares, CRASH, CrashCause, crashFx, step, GameMode, MODES, SANDBOX, sandbox, applyMode, lineOfSight, get mode() { return mode; }, get rearm() { return rearm; }, get route() { return director.route; }, get policy() { return physicsPolicy.name; } , worldClock, DAY, environmentFor, oceanVisual, OCEAN, LIGHTS, get settlementLights() { return settlementLights; }, get carrierLights() { return carrierLights; }, sun, moon, skyFill, sky, atmosphere };
 
   loadingEl.hidden = true;
   combatHud.reveal();

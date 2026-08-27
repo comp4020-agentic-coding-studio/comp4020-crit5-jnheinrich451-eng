@@ -105,6 +105,21 @@ export const SANDBOX = {
   samRespawn: null,
   /** First hostile appears a beat after the player has the aircraft. */
   firstHostile: 8,
+  /**
+   * How many hostiles FREE fly keeps in the air at once.
+   *
+   * MISSION is unaffected and stays at exactly one: §12's "one instance serves
+   * all three encounters" is a mission rule, and the encounter table hands out
+   * one aircraft with a specific magazine. This is the sandbox saying how full
+   * its sky is.
+   *
+   * Two, not three. A second aircraft changes the fight from a duel into
+   * something you have to keep track of -- which is the point -- while three
+   * turns it into a scramble where the player is mostly reacting to whichever
+   * one they did not see. The difficulty this mode wants comes from the
+   * missiles, not from the count.
+   */
+  wing: 2,
 
   /**
    * FREE FLY SEEDS ITS OWN SAM BATCHES, and MISSION does not.
@@ -280,7 +295,7 @@ export function createSandbox({ spawnHostile = null, setHostile = null, setSams 
    * @param heading       ...and where they are pointed
    * @param samsSpent     has the current batch been dealt with? (samBatchSpent)
    */
-  function update({ hostileAlive, position = null, heading = 0, samsSpent = false }, dt) {
+  function update({ hostileAlive = false, hostilesAlive = null, position = null, heading = 0, samsSpent = false }, dt) {
     if (!state.live) return state;
     state.elapsed += dt;
 
@@ -302,7 +317,17 @@ export function createSandbox({ spawnHostile = null, setHostile = null, setSams 
     }
 
     if (!Number.isFinite(state.respawn)) return state;
-    if (hostileAlive) return state; // one at a time, always
+    /**
+     * Spawn until the wing is full, not until one exists. `hostilesAlive` is a
+     * COUNT rather than the old boolean, because "is one flying" cannot express
+     * "one of two is flying" -- and that is the state the mode spends most of
+     * its time in once a wing is being whittled down.
+     *
+     * The timer still runs between spawns, so losing both does not put two
+     * replacements in the air on the same frame.
+     */
+    const alive = typeof hostilesAlive === "number" ? hostilesAlive : hostileAlive ? 1 : 0;
+    if (alive >= cfg.wing) return state;
     state.respawn -= dt;
     if (state.respawn > 0) return state;
     state.respawn = cfg.hostileRespawn;

@@ -65,6 +65,35 @@ export const THREAT = {
   assistedWarnLead: 0.35,
 };
 
+/**
+ * Collapse a wing of hostiles into the single `{tracking, locked, lockProgress}`
+ * the threat monitor reads.
+ *
+ * The monitor asks one question -- "what is being done to the player" -- and the
+ * answer does not get less urgent because a second aircraft is doing it. So the
+ * merge is the WORST case across the wing, not an average and not the nearest:
+ * one locked fighter and one merely tracking is a LOCK, and showing TRACK
+ * because the other one has not got there yet would be a lie the player pays
+ * for.
+ *
+ * `lockProgress` takes the maximum for the same reason -- it drives the lock
+ * pip, and the pip should follow whichever aircraft is closest to firing.
+ *
+ * Pure, so the rule is asserted without a scene (§4). MISSION passes a wing of
+ * one and gets exactly what it always got.
+ */
+export function mergeHostiles(states) {
+  const out = { tracking: false, locked: false, lockProgress: 0 };
+  if (!states) return out;
+  for (const h of states) {
+    if (!h) continue;
+    if (h.tracking) out.tracking = true;
+    if (h.locked) out.locked = true;
+    if (typeof h.lockProgress === "number" && h.lockProgress > out.lockProgress) out.lockProgress = h.lockProgress;
+  }
+  return out;
+}
+
 /** §11 — one level from the hostile's state and the sky. Incoming wins. */
 export function threatLevelOf({ incoming = false, locked = false, tracking = false }) {
   if (incoming) return ThreatLevel.MISSILE;

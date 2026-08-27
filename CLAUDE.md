@@ -960,8 +960,30 @@ timing and publishes no navigation. Assert that a parked director never complete
 a mission by accident.
 
 Sandbox driver, deliberately tiny — no waves, no difficulty curve, no hidden
-score: one hostile at a time, respawning 12 s after a kill, first arrival 8 s after
-handoff.
+score. First arrival 8 s after handoff, and a replacement 12 s after a kill.
+
+**FREE fly flies a wing of two; MISSION flies exactly one.** §12's "one instance
+serves all three encounters" is a MISSION rule and it still holds — the
+encounter table deploys `wing[0]` and nothing else, with the magazine the phase
+calls for. The sandbox says how full its own sky is, and two is the number: a
+second aircraft turns a duel into something you have to keep track of, which is
+the point, while three is a scramble where the player is mostly reacting to the
+one they did not see. The difficulty this mode wants comes from the missiles.
+
+Three things a wing needs that a single hostile did not:
+
+- **The threat monitor is fed the WORST case across the wing**
+  (`mergeHostiles`), not the first and not the nearest. One locked and one
+  merely tracking is a `LOCK` — what is being done to the player does not get
+  less urgent because a second aircraft is doing it.
+- **Each aircraft fires its own rounds.** Subscribe to `launch` per instance; one
+  subscription closing over a single drone sends every wingman's missile off the
+  leader's rail.
+- **The wingman's side is LATCHED when the lead deploys** (§17.9). Recomputing
+  it is wrong twice over: adding the wing index to each aircraft's own encounter
+  count cancels when the counters differ by one, and reading the lead's counter
+  live fails because the lead's own deploy increments it. Both were measured
+  putting two aircraft on the same side, 540 m apart.
 
 **SAM sites must not respawn in MISSION.** Six is a finite thing to clear, and a
 player who spent four minutes clearing the valley has earned an empty valley. A
