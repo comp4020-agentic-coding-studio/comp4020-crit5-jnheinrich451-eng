@@ -1,9 +1,29 @@
-// Build the shipping textures from the source models. CLAUDE.md §2.
+// Build the shipping assets from the sources. CLAUDE.md §2.
 //
-// The source assets are 46 MB, 35 MB of that in seven texture files. That is
-// not a repository problem so much as a CRIT ROOM problem: the pod opens the
-// deployed URL cold on shared wifi, and a player staring at a loading screen
-// has already lost part of the five minutes the brief gives them.
+// The sources are 84 MB, most of it in texture files. That is not a repository
+// problem so much as a CRIT ROOM problem: the pod opens the deployed URL cold
+// on shared wifi, and a player staring at a loading screen has already lost
+// part of the five minutes the brief gives them.
+//
+// WHY THE SOURCE TREE IS `assets-src/` AND NOT `assets/`
+// -----------------------------------------------------
+// It used to be `assets/`, next to a derived copy under `public/assets/`. Both
+// are served at the SAME URL -- vite mounts `public/` at the site root, and the
+// root `assets/` directory is already there -- so `/assets/audio/gun.mp3` had
+// two files behind it and no rule saying which won. Measured, it was neither,
+// consistently: vite snapshots `public/` at boot, so a file that existed at
+// start-up served the PUBLIC copy while one created later served the ROOT copy.
+// The same URL, two different bytes, decided by timing.
+//
+// That is what hid the bug this script now prevents. src/ was repointed at
+// `assets/<name>/scene.gltf`, dev served it from the root source tree and
+// looked perfect, and the build -- which copies only `public/` -- shipped a
+// site where all six models 404'd and every airframe fell back to a placeholder
+// box. Dev was green on files the deploy never had.
+//
+// So: `assets-src/` is SOURCE, untracked, never served. `public/assets/` is
+// OUTPUT, committed, and the only thing behind that URL in dev and in the
+// build alike. One URL, one file, dev and prod byte-identical.
 //
 // Nothing here is a judgement about how the game should look. Each texture is
 // resized by what it is FOR:
@@ -13,26 +33,27 @@
 //   metallicRoughness  a DATA map: roughness in G, metalness in B. It carries
 //                      no detail an eye can resolve, and at 19.4 m across at
 //                      200 m/s nobody is reading its gradients -> 512
-//   terrain baseColor  seen from 900 m and fogged past 12 km -> 2048
 //
-// Run with `pnpm assets`. The originals stay untracked in assets/models/, so
-// this is re-runnable and reversible; only its output is committed.
+// Run with `pnpm assets`. The originals stay untracked in assets-src/, so this
+// is re-runnable and reversible; only its output is committed.
 
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative } from "node:path";
 import sharp from "sharp";
 
-const SOURCE = "assets/models";
-const OUT = "public/models";
+const SOURCE = "assets-src";
+const OUT = "public/assets";
 
-// Source directory -> shipped directory. Renamed on the way so the URLs in
-// src/ stay short and stable if a model is ever replaced.
-const MODELS: Record<string, string> = {
-  "f-15e_strike_eagle_-_fighter_jet_-_free": "f-15e",
-  "uss_dwight_d.eisenhower_cvn-69_aircraft_carrier": "carrier",
-  ireland_terrain: "terrain",
-  "aim-9_missile": "aim-9",
-};
+// Audio ships byte-for-byte. CLAUDE.md §16 pins these paths -- "the paths ARE
+// the whole interface" -- and re-encoding a cue would change what the mix was
+// balanced against, so this directory is copied, never processed.
+const VERBATIM = new Set(["audio"]);
+
+// No source -> shipped rename map any more. The source directories are already
+// the short, stable names the URLs in src/ use (f15, f16c, carrier, ireland,
+// aim9, sam), so a model is added by dropping it in and re-running -- there is
+// no second place to remember to edit. The old map existed because the sources
+// were named things like `f-15e_strike_eagle_-_fighter_jet_-_free`.
 
 type Rule = { match: RegExp; size: number; quality: number };
 
@@ -63,19 +84,37 @@ async function walk(dir: string): Promise<string[]> {
 
 const mb = (n: number) => (n / 1e6).toFixed(2).padStart(7);
 
+async function copy(from: string, to: string) {
+  await mkdir(dirname(to), { recursive: true });
+  await writeFile(to, await readFile(from));
+}
+
 async function main() {
   let sourceTotal = 0;
   let shippedTotal = 0;
   const rows: string[] = [];
 
-  for (const [from, to] of Object.entries(MODELS)) {
-    const src = join(SOURCE, from);
-    try {
-      await stat(src);
-    } catch {
-      console.warn(`skip ${from}: not present`);
-      continue;
-    }
+  let dirs: string[];
+  try {
+    dirs = (await readdir(SOURCE, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    console.error(
+      `${SOURCE}/ is not present. It holds the untracked source assets; ` +
+        `nothing to build. public/assets/ keeps whatever is already committed.`,
+    );
+    return;
+  }
+
+  // Rebuild from empty. A stale directory here is invisible -- it ships, it
+  // serves, and nothing reports it -- which is how public/models/ survived
+  // long after src/ stopped asking for it.
+  await rm(OUT, { recursive: true, force: true });
+
+  for (const name of dirs) {
+    const src = join(SOURCE, name);
 
     for (const file of await walk(src)) {
       const rel = relative(src, file);
@@ -87,26 +126,17 @@ async function main() {
       // travel with them. A stray "<name> scene.bin.txt" in one source
       // package is a duplicate of the binary, not a licence -- skip it.
       if (ext === ".txt" && /scene\.bin/i.test(rel)) continue;
-      if (ext === ".txt") {
-        const dest = join(OUT, to, rel);
-        await mkdir(dirname(dest), { recursive: true });
-        await writeFile(dest, await readFile(file));
-        shippedTotal += bytes;
-        continue;
-      }
 
-      if (!IMAGE.has(ext)) {
-        // .gltf and .bin pass through untouched -- the geometry is 234k
-        // triangles across all four models and costs almost nothing.
-        const dest = join(OUT, to, rel);
-        await mkdir(dirname(dest), { recursive: true });
-        await writeFile(dest, await readFile(file));
+      if (VERBATIM.has(name) || ext === ".txt" || !IMAGE.has(ext)) {
+        // .gltf and .bin pass through untouched -- the geometry costs almost
+        // nothing next to the textures.
+        await copy(file, join(OUT, name, rel));
         shippedTotal += bytes;
         continue;
       }
 
       const rule = ruleFor(rel);
-      const dest = join(OUT, to, rel.replace(/\.(png|jpe?g)$/i, ".webp"));
+      const dest = join(OUT, name, rel.replace(/\.(png|jpe?g)$/i, ".webp"));
       await mkdir(dirname(dest), { recursive: true });
 
       const image = sharp(file);
@@ -124,21 +154,26 @@ async function main() {
       shippedTotal += out.length;
 
       rows.push(
-        `  ${to}/${rel.padEnd(44)} ${meta.width}x${meta.height} -> ` +
+        `  ${name}/${rel.padEnd(46)} ${meta.width}x${meta.height} -> ` +
           `${rule.size}px  ${mb(bytes)} -> ${mb(out.length)} MB`,
       );
     }
 
+    if (VERBATIM.has(name)) {
+      rows.push(`  ${name}/: copied verbatim`);
+      continue;
+    }
+
     // Every texture is now .webp, so the glTF's image URIs have to follow.
     // Rewriting the manifest is what makes the swap invisible to the loader.
-    const manifest = join(OUT, to, "scene.gltf");
+    const manifest = join(OUT, name, "scene.gltf");
     try {
       const json = JSON.parse(await readFile(manifest, "utf8"));
       for (const image of json.images ?? []) {
         if (image.uri) image.uri = image.uri.replace(/\.(png|jpe?g)$/i, ".webp");
       }
       await writeFile(manifest, JSON.stringify(json));
-      rows.push(`  ${to}/scene.gltf: image URIs repointed at .webp`);
+      rows.push(`  ${name}/scene.gltf: image URIs repointed at .webp`);
     } catch (err) {
       console.error(`could not rewrite ${manifest}:`, err);
       process.exitCode = 1;

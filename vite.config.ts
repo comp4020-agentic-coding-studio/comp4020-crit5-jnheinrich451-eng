@@ -9,18 +9,26 @@ import { defineConfig } from "vitest/config";
 // hand-written site needs no build config: add pages, link them, ship.
 // (Vite's default would build only the root index.html and silently drop the
 // rest from dist/ — fine locally, 404s deployed.)
-// `assets` and `public` hold tens of megabytes of models and audio and not one
+// `assets-src` and `public` hold tens of megabytes of models and audio and not one
 // .html between them; walking them on every config load is pure cost.
 const SKIP = new Set([
-  "node_modules", "dist", "spec", "scripts", "reflections", "assets", "public",
-  "instructions",
+  "node_modules", "dist", "spec", "scripts", "reflections", "assets-src",
+  "public", "instructions", "build",
 ]);
+
+// Local diagnostics that are not part of the site. They are real pages and
+// they work, but a deployed audio probe is a page a pod can land on that is
+// not the game -- and every shipped page has to carry a description, a card
+// and a landmark, which a scratch harness has no reason to. Keeping them out
+// of the build is cheaper than dressing them up as pages they are not.
+const DEV_ONLY = new Set(["audio-probe.html"]);
 
 function htmlEntries(dir = "."): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     if (entry.name.startsWith(".") || SKIP.has(entry.name)) return [];
     const path = join(dir, entry.name);
     if (entry.isDirectory()) return htmlEntries(path);
+    if (DEV_ONLY.has(entry.name)) return [];
     return entry.name.endsWith(".html") ? [path] : [];
   });
 }
@@ -36,15 +44,17 @@ export default defineConfig({
   },
   server: {
     watch: {
-      // DO NOT WATCH assets/. It holds the untracked SOURCE models -- 47 MB
-      // and growing -- and nothing in it reaches the build: `pnpm assets`
-      // derives public/models/ from it, and only public/ is copied.
+      // DO NOT WATCH assets-src/. It holds the untracked SOURCE models --
+      // 84 MB and growing -- and nothing in it reaches the build directly:
+      // `pnpm assets` derives public/assets/ from it, and only public/ is
+      // copied. (It was `assets/` until that name was found to collide with
+      // the URL public/assets/ serves; see scripts/compress-assets.ts.)
       //
       // Watching it is not merely wasteful, it is fragile. Dropping a new
       // model in there killed the dev server outright:
       //
       //   Error: EBUSY: resource busy or locked, watch
-      //   'assets/models/nomads_sam_system/scene.bin'
+      //   'assets-src/sam/scene.bin'
       //
       // A 20 MB file still being written cannot be watched on Windows, and
       // chokidar raises that as an unhandled error rather than skipping the
@@ -53,11 +63,11 @@ export default defineConfig({
       // Widened after this recurred on `instructions/` -- a spec document being
       // written killed the server the same way a model did. Ignoring one
       // directory at a time treats instances; the CLASS is "anything the
-      // browser never fetches". Nothing below reaches a page: assets/ holds
-      // untracked sources that `pnpm assets` derives public/ from, and the
-      // rest is prose.
+      // browser never fetches". Nothing below reaches a page: assets-src/
+      // holds untracked sources that `pnpm assets` derives public/ from, and
+      // the rest is prose.
       ignored: [
-        "**/assets/**",
+        "**/assets-src/**",
         "**/dist/**",
         "**/instructions/**",
         "**/reflections/**",
@@ -77,5 +87,13 @@ export default defineConfig({
     // which imports it and asserts the count is green. One suite, two
     // harnesses; this glob just says which files are vitest's to drive.
     include: ["spec/**/*.test.ts", "scripts/**/*.test.ts"],
+
+    // jsdom, because the game's suite is imported here and it reads document,
+    // window.innerWidth and location -- the pointer-steering checks need a
+    // viewport to measure deflection from. spec/headless-canvas.ts adds the
+    // one thing jsdom lacks, a 2D context; its header says why that is a
+    // legitimate double and not a hole in the gate.
+    environment: "jsdom",
+    setupFiles: ["spec/headless-canvas.ts"],
   },
 });

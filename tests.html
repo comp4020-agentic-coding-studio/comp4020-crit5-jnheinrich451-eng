@@ -1,125 +1,73 @@
-<!doctype html>
-<html lang="en-AU">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Operation Vector checks</title>
-    <meta
-      name="description"
-      content="The assertion suite for Operation Vector: flight envelope, turn coupling, throttle, input robustness and the no-pointer rule."
-    />
-    <meta property="og:type" content="website" />
-    <meta property="og:image" content="./card.png" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-
-    <style>
-      :root {
-        --green: #8ef0c8;
-        --salmon: #ff9b7a;
-        --cyan: #9fd7ff;
-        --ink: #04080c;
-      }
-
-      body {
-        margin: 0;
-        padding: 2rem 1.25rem 4rem;
-        background: var(--ink);
-        color: var(--green);
-        font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
-          monospace;
-        font-size: 0.82rem;
-        line-height: 1.6;
-      }
-
-      main {
-        max-width: 60rem;
-        margin: 0 auto;
-      }
-
-      h1 {
-        margin: 0 0 0.3rem;
-        font-size: 1rem;
-        font-weight: 500;
-        letter-spacing: 0.3em;
-      }
-
-      nav {
-        margin-bottom: 2rem;
-        font-size: 0.68rem;
-        letter-spacing: 0.2em;
-      }
-
-      nav a {
-        color: var(--cyan);
-        text-decoration: none;
-        opacity: 0.7;
-      }
-
-      nav a:hover,
-      nav a:focus-visible {
-        opacity: 1;
-      }
-
-      #count {
-        font-size: 1.35rem;
-        letter-spacing: 0.1em;
-        margin: 0 0 1.4rem;
-      }
-
-      .red {
-        color: var(--salmon);
-      }
-
-      #failures {
-        margin: 0;
-        padding: 0;
-        list-style: none;
-      }
-
-      #failures li {
-        padding: 0.35rem 0 0.35rem 0.9rem;
-        border-left: 2px solid var(--salmon);
-        margin-bottom: 0.4rem;
-        color: var(--salmon);
-      }
-
-      #failures em {
-        display: block;
-        font-style: normal;
-        opacity: 0.7;
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>Operation Vector checks</h1>
-      <nav aria-label="Primary"><a href="./">&larr; back to the game</a></nav>
-      <p id="count">running&hellip;</p>
-      <ul id="failures"></ul>
-    </main>
-
-    <script type="module">
-      // The same suite the repository gate runs, so the count on this page
-      // and the result in CI can never disagree about what passed.
-      import { run } from "./src/flight.test.js";
-
-      const result = run();
-      const count = document.getElementById("count");
-      count.textContent = `${result.passed} passed · ${result.failed} failed`;
-      if (result.failed > 0) count.classList.add("red");
-
-      const list = document.getElementById("failures");
-      for (const failure of result.failures) {
-        const li = document.createElement("li");
-        li.textContent = failure.name;
-        if (failure.detail) {
-          const em = document.createElement("em");
-          em.textContent = failure.detail;
-          li.append(em);
-        }
-        list.append(li);
-      }
-    </script>
-  </body>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Operation Vector — checks</title>
+<meta
+  name="description"
+  content="The assertion suite for Operation Vector: every flight, mission and weapon rule, with a pass/fail count."
+/>
+<meta property="og:type" content="website" />
+<meta property="og:image" content="./card.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.184.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.184.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1116; color: #e8f0f6;
+    font: 13px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #out { padding: 22px; white-space: pre-wrap; }
+  .fail { color: #ff9b7a; }
+  .sum { margin-top: 14px; letter-spacing: 0.2em; text-transform: uppercase; }
+  .ok { color: #9fe6b0; }
+  h1 { margin: 0 0 4px; font: inherit; font-size: 14px; letter-spacing: 0.28em;
+    text-transform: uppercase; color: #9fd7ff; }
+  nav { font-size: 0.8em; letter-spacing: 0.2em; }
+  nav a { color: #9fd7ff; opacity: 0.5; text-decoration: none; }
+  nav a:hover, nav a:focus-visible { opacity: 0.9; }
+</style>
+</head>
+<body>
+<header style="padding: 22px 22px 0">
+  <h1>Operation Vector &middot; checks</h1>
+  <nav aria-label="Primary"><a href="./">&larr; back to the game</a></nav>
+</header>
+<div id="out">running&hellip;</div>
+<script type="module">
+  // Headless-ish runner for src/flight.test.js: the suite logs to the console,
+  // so the console is mirrored onto the page. Same module, no test framework.
+  const out = document.getElementById("out");
+  out.textContent = "";
+  let fails = 0;
+  const write = (cls, text) => {
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = text;
+    out.appendChild(line);
+  };
+  const wrap = (kind) => {
+    const original = console[kind].bind(console);
+    console[kind] = (...args) => {
+      original(...args);
+      const text = args
+        .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+        .join(" ");
+      if (!text.startsWith("PASS")) write(kind === "error" ? "fail" : "", text);
+      if (text.startsWith("FAIL")) fails++;
+    };
+  };
+  wrap("log");
+  wrap("error");
+  wrap("warn");
+  await import("./src/flight.test.js");
+  write(fails ? "sum fail" : "sum ok", fails ? `${fails} failure(s)` : "all checks passed");
+</script>
+</body>
 </html>

@@ -1,9 +1,8 @@
 # Credits
 
-Operation Vector ships four third-party 3D models and fourteen audio files, and
-carries two more models that are credited but **not yet in the build**. Every
-shipped model's licence text travels with it in
-`public/models/<name>/license.txt` and is deployed alongside the game.
+Operation Vector ships six third-party 3D models and fourteen audio files.
+Every shipped model's licence text travels with it in
+`public/assets/<name>/license.txt` and is deployed alongside the game.
 
 ## Licence summary — read this first
 
@@ -15,8 +14,8 @@ shipped model's licence text travels with it in
 | Ireland Terrain | CC-BY-NC-4.0 | **no** | no | yes |
 | USS Dwight D. Eisenhower | CC-BY-4.0 | yes | no | yes |
 | AIM-9 missile | CC-BY-4.0 | yes | no | yes |
-| NOMADS SAM system | CC-BY-4.0 | yes | no | not yet |
-| F16-C Falcon | CC-BY-4.0 | yes | no | not yet |
+| NOMADS SAM system | CC-BY-4.0 | yes | no | yes |
+| F16-C Falcon | CC-BY-4.0 | yes | no | yes |
 
 The two newest are both plain CC-BY, so neither tightens the constraints below
 — those come entirely from the F-15E and the terrain.
@@ -55,12 +54,12 @@ time:
 > by RickSlash (https://sketchfab.com/RickSlash) licensed under CC-BY-4.0
 > (http://creativecommons.org/licenses/by/4.0/)
 
-### Credited but not yet in the build
+### The two newest
 
-These two are present in the untracked `assets/models/` and are **not** in
-`public/models/`, so they are not deployed and not part of the current site.
-Credited here anyway, so the record is complete before they are wired in rather
-than after.
+Both are now wired in and deployed: the F-16C is the hostile fighter and the
+Nomad vehicle is the SAM launcher, each replacing the primitive that stood in
+for it. They ship from `public/assets/f16c/` and `public/assets/sam/`, built by
+`pnpm assets` from the untracked sources in `assets-src/`.
 
 > This work is based on "NOMADS SAM system"
 > (https://sketchfab.com/3d-models/nomads-sam-system-2f54eb14a7d649b68e196c1835f6a820)
@@ -73,11 +72,17 @@ than after.
 > CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
 
 `CLAUDE.md` §2 gives them their normalisation targets: the F-16C to **14.8 m**
-length and the Nomad SAM vehicle to **6.9 m**. Both would replace primitives —
-the hostile is a cone and each SAM site is a cylinder and a box — and neither
-needs a logic change to land, only the same treatment every other asset got:
-measured normalisation, orientation read from the LOADED object rather than
-from raw accessors, and a pass through `pnpm assets`.
+length and the Nomad SAM vehicle to **6.9 m**. Neither needed a logic change to
+land, only the same treatment every other asset got: measured normalisation,
+orientation read from the LOADED object rather than from raw accessors, and a
+pass through `pnpm assets`.
+
+The SAM is by far the most expensive thing on the site: its `scene.bin` is
+20.3 MB of geometry, more than the terrain and the F-15E together, and six
+sites are placed in the world. Textures compress; geometry does not, so `pnpm
+assets` takes the whole build only to 37 MB. That is the number to watch if the
+crit room's wifi is the constraint — decimating this one mesh is where the
+saving is, not in another texture pass.
 
 **Measured before committing to either, and the two are not comparable:**
 

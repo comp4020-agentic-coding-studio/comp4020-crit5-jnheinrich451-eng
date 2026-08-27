@@ -1,320 +1,418 @@
-<!doctype html>
-<html lang="en-AU">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Operation Vector</title>
-    <meta
-      name="description"
-      content="Fly an F-15E off a carrier deck, out over open water and into contested terrain. A browser flight game with no tutorial."
-    />
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Operation Vector</title>
+<meta
+  name="description"
+  content="Fly an F-15E off a carrier deck, out over open water and into contested terrain. A browser flight game with no tutorial."
+/>
 
-    <!--
-      The link-preview card: public/card.png, 1200x630. The URL resolves
-      against this page, like any link. No og:title/og:description: scrapers
-      fall back to the <title> and description above.
-    -->
-    <meta property="og:type" content="website" />
-    <meta property="og:image" content="./card.png" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+<!--
+  The link-preview card: public/card.png, 1200x630. The URL resolves against
+  this page, like any link. No og:title/og:description: scrapers fall back to
+  the <title> and description above.
+-->
+<meta property="og:type" content="website" />
+<meta property="og:image" content="./card.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.184.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.184.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1116; }
+  #stage { display: block; width: 100vw; height: 100vh; }
+  /* Both overlays live in one fixed column pinned top and bottom, so they
+     cannot meet however short the viewport gets. Two rules matter here:
 
-    <style>
-      /* All CSS lives here, per CLAUDE.md §3. */
-      :root {
-        --green: #8ef0c8;
-        --amber: #ffd79a;
-        --salmon: #ff9b7a;
-        --cyan: #9fd7ff;
-        --yellow: #ffd400;
-        --ink: #04080c;
-        /* The VECTOR panel's own palette, deliberately separate from the
-           combat HUD's (H12) -- they are two displays, not one. */
-        --rail-head: #dce9f4;
-        --rail-label: rgb(178 205 226 / 0.78);
-        --rail-value: #eef5fb;
-        --rail-dim: rgb(178 205 226 / 0.5);
-        --rail-good: #8fe0a4;
-        --rail-warn: #ffd79a;
-        --rail-danger: #ff9a8f;
-      }
+     - #keys is flex: 0 0 auto. It must NEVER shrink: it is the only place the
+       controls are written down, and Stage 03.15 found it silently truncating
+       the fire/HUD line, which made the primary weapon undiscoverable.
+     - #hud scrolls rather than clipping. Stage 03.15 also found five rows
+       (ENG, ATM, CARR, TERR, IN) cut off with no scrollbar and no visual cue,
+       so the diagnostics for the systems that stage added were invisible. A
+       scrollbar is an ugly answer but a silent crop is a wrong one — the rows
+       themselves were folded down to 18 so it should not appear at 1080. */
+  #rail {
+    position: fixed;
+    top: 20px;
+    bottom: 20px;
+    left: 22px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 10px;
+    pointer-events: none;
+  }
+  .panel {
+    position: fixed;
+    font: 12px/1.34 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: 0.06em;
+    color: #e8f0f6;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+    pointer-events: none;
+    user-select: none;
+  }
+  /* BOUNDED WIDTH is the fix, not a clamp on the combat HUD's side.
 
-      * {
-        box-sizing: border-box;
-      }
+     The value column used to be `auto`, so #hud was sized by its longest row and
+     grew without limit as mission text lengthened — 504 px at one point, half the
+     viewport, straight through the airspeed readout. Clamping the HUD away from
+     it treated the symptom three times over: the rail simply must not be allowed
+     to eat the frame. minmax(0, 1fr) inside a max-width lets a long row wrap
+     instead of pushing the panel wider. */
+  #rail #hud { position: static; box-sizing: border-box; min-height: 0; max-width: 340px; overflow-y: auto; overflow-x: hidden; flex: 0 1 auto; scrollbar-width: thin; }
+  #rail #keys { position: static; overflow: visible; flex: 0 0 auto; }
+  #hud {
+    padding: 8px 14px 9px;
+    border-radius: 3px;
+    /* The label column is deliberately low-contrast, which puts it at risk
+       over the bright horizon band. A scrim keeps all rows legible without
+       turning the overlay into a solid panel. */
+    background: linear-gradient(160deg, rgba(9, 14, 20, 0.42), rgba(9, 14, 20, 0.16));
+    backdrop-filter: blur(2px);
+  }
+  #hud h2 {
+    margin: 0 0 6px;
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.28em;
+    color: rgba(232, 240, 246, 0.6);
+    text-transform: uppercase;
+  }
+  #hud dl { display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 0 10px; margin: 0; }
+  #hud dd#v-fov { color: rgba(232, 240, 246, 0.8); }
+  #hud dt { color: rgba(232, 240, 246, 0.5); }
+  #hud dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: break-word; }
+  #hud .rule { height: 1px; background: rgba(232, 240, 246, 0.18); margin: 5px 0; }
+  /* Throttle bar: equal-height cells, so the unfilled run matches the filled
+     one exactly. Colour is inherited, which keeps the AB tint working. */
+  #hud .bar { display: inline-flex; gap: 2px; vertical-align: -1px; }
+  #hud .bar .cell {
+    width: 6px;
+    height: 9px;
+    background: currentColor;
+    opacity: 0.22;
+  }
+  #hud .bar .cell.on { opacity: 1; }
+  #keys { color: rgba(232, 240, 246, 0.62); }
+  #keys div { display: flex; gap: 10px; flex-wrap: wrap; }
+  #keys b { font-weight: 400; color: #e8f0f6; }
+  #asset-note {
+    bottom: 20px;
+    right: 22px;
+    max-width: 340px;
+    text-align: right;
+    color: rgba(255, 226, 178, 0.85);
+  }
+  /* Development loading state only — not a title screen. The simulation does
+     not start until the carrier and terrain have resolved, so nothing pops in
+     around an already-flying aircraft. */
+  #loading {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background: #0d1116;
+    font: 12px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: 0.34em;
+    color: rgba(232, 240, 246, 0.55);
+    text-transform: uppercase;
+  }
+  /* The page's one h1, and the only place the game is named. A NAME is not an
+     instruction -- the brief explicitly allows naming the game -- and it lives
+     on the loading screen so it is gone by the first frame of play. Screen
+     readers get a heading; a player gets a title card that costs them nothing. */
+  #loading h1 {
+    margin: 0;
+    font: inherit;
+    font-size: 15px;
+    font-weight: 500;
+    letter-spacing: 0.42em;
+    color: #9fd7ff;
+  }
+  /* The checks link. Deliberately near-invisible and bottom-right: it is a
+     landmark for a crawler and a way into tests.html, not a menu -- a game with
+     visible navigation has already started explaining itself. */
+  nav {
+    position: fixed;
+    right: 0.75rem;
+    bottom: 0.6rem;
+    z-index: 10;
+    font: 12px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.62rem;
+    letter-spacing: 0.2em;
+  }
+  nav a {
+    color: #9fd7ff;
+    opacity: 0.35;
+    text-decoration: none;
+  }
+  nav a:hover,
+  nav a:focus-visible {
+    opacity: 0.9;
+  }
+  /* display: flex above outranks the UA's [hidden] rule, so hiding has to be
+     explicit — otherwise the overlay covers the world forever. */
+  #loading[hidden] {
+    display: none;
+  }
 
-      html,
-      body {
-        margin: 0;
-        height: 100%;
-        overflow: hidden;
-        background: var(--ink);
-        color: var(--green);
-        font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
-          monospace;
-      }
+  /* Stage 04.0 — one fade layer, driven from the mission code. It serves the
+     opening deck fade-in, the failure/checkpoint cut and the closing recovery
+     cinematic; three separate overlays would only be three chances for one of
+     them to be left on screen. Above the combat HUD (z 5) so it dims the
+     instruments along with the world — a cinematic fade that leaves the
+     instruments burning through it is not a fade. The rail is deliberately NOT
+     raised above this: doing so put it above the HUD svg as well, and at narrow
+     viewports the rail's box covers the HUD's left flank, which silently ate the
+     airspeed readout. */
+  #fade {
+    position: fixed;
+    inset: 0;
+    background: #05080b;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 6;
+  }
 
-      #view {
-        display: block;
-        width: 100vw;
-        height: 100dvh;
-        touch-action: none;
-      }
+  /* Stage 04.7 §30 — impact flash. Above the fade so a crash still reads as the
+     screen darkens, and a separate layer so neither can strand the other on. */
+  #crash-flash {
+    position: fixed;
+    inset: 0;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 7;
+    transition: opacity 60ms linear;
+  }
 
-      /* ── the opening screen ────────────────────────────────────────────
-         The brief's no-tutorial rule means this screen carries no
-         instructions. It carries the aircraft's name and then gets out of
-         the way; the catapult sequence in stage 4 is what teaches the
-         throttle and the camera, by flying itself once. */
-      #loading {
-        position: fixed;
-        inset: 0;
-        display: grid;
-        place-content: center;
-        gap: 0.6rem;
-        text-align: center;
-        background: var(--ink);
-        z-index: 20;
-        transition: opacity 0.6s ease;
-      }
+  /* §35 — the complete screen. Compact run information, not a scoreboard. */
+  #complete {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background: rgba(5, 8, 11, 0.92);
+    font: 13px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: #e8f0f6;
+    pointer-events: none;
+    user-select: none;
+  }
+  #complete[hidden], #failed[hidden] { display: none; }
 
-      #loading[hidden] {
-        display: grid;
-        opacity: 0;
-        pointer-events: none;
-      }
+  /* Stage 05.0 — the loss screen. Same furniture as the win, in salmon, so the
+     two read as the same kind of ending rather than as different screens. */
+  #failed {
+    position: fixed;
+    inset: 0;
+    z-index: 9;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background: rgba(10, 5, 6, 0.93);
+    font: 13px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: #e8f0f6;
+    pointer-events: none;
+    user-select: none;
+  }
+  #failed h2 {
+    margin: 0;
+    font: inherit;
+    font-size: 22px;
+    letter-spacing: 0.42em;
+    text-transform: uppercase;
+    color: #ff9b7a;
+  }
+  #failed .rule { width: 320px; height: 1px; background: rgba(255, 155, 122, 0.28); }
+  #failed p { margin: 0; color: rgba(232, 240, 246, 0.72); letter-spacing: 0.06em; }
+  #failed dl {
+    display: grid;
+    grid-template-columns: 130px 120px;
+    gap: 6px 24px;
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  #failed dt { color: rgba(232, 240, 246, 0.5); letter-spacing: 0.18em; }
+  #failed dd { margin: 0; text-align: right; font-size: 16px; }
+  #failed .hint { color: rgba(232, 240, 246, 0.45); letter-spacing: 0.24em; font-size: 11px; }
 
-      h1 {
-        margin: 0;
-        font-size: clamp(1.6rem, 5vw, 3rem);
-        font-weight: 500;
-        letter-spacing: 0.42em;
-        text-indent: 0.42em;
-        color: var(--green);
-      }
+  /* Lives. Top right, quiet until it matters. */
+  #lives {
+    position: fixed;
+    top: 16px;
+    right: 18px;
+    z-index: 5;
+    font: 11px/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: 0.26em;
+    color: rgba(232, 240, 246, 0.5);
+    pointer-events: none;
+    user-select: none;
+  }
+  #lives b { font-weight: 600; font-size: 16px; color: #8ef0c8; letter-spacing: 0.1em; }
+  #lives.low b { color: #ffd79a; }
+  #lives.critical b { color: #ff9b7a; }
+  #lives[hidden] { display: none; }
+  #complete h2 {
+    margin: 0;
+    font: inherit;
+    font-size: 22px;
+    letter-spacing: 0.42em;
+    text-transform: uppercase;
+    color: #8ef0c8;
+  }
+  #complete .rule { width: 320px; height: 1px; background: rgba(232, 240, 246, 0.18); }
+  #complete dl {
+    display: grid;
+    grid-template-columns: 130px 120px;
+    gap: 6px 24px;
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  #complete dt { color: rgba(232, 240, 246, 0.5); letter-spacing: 0.18em; }
+  #complete dd { margin: 0; text-align: right; font-size: 16px; }
+  #complete .hint { color: rgba(232, 240, 246, 0.45); letter-spacing: 0.24em; font-size: 11px; }
 
-      #loading p {
-        margin: 0;
-        letter-spacing: 0.3em;
-        font-size: 0.7rem;
-        color: var(--cyan);
-        opacity: 0.65;
-      }
+  /* Stage 05.5 — the pause screen.
+     Deliberately the smallest possible interface: a title, a rule and one line
+     telling you how to get back in. No quit (the tab is the quit), no options,
+     no settings, no volume slider — every one of those would be a menu, and this
+     game does not have menus. Same furniture as the win and loss screens so it
+     reads as part of the same family. */
+  #pause {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 18px;
+    background: rgba(6, 11, 18, 0.72);
+    backdrop-filter: blur(3px);
+    font: 500 13px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.22em;
+    color: #e8f0f6;
+    text-transform: uppercase;
+    user-select: none;
+  }
+  #pause[hidden] { display: none; }
+  #pause h2 {
+    margin: 0;
+    font: inherit;
+    font-size: 22px;
+    letter-spacing: 0.42em;
+    color: #9fd7ff;
+  }
+  #pause .rule { width: 260px; height: 1px; background: rgba(159, 215, 255, 0.24); }
+  #pause .hint { color: rgba(232, 240, 246, 0.5); letter-spacing: 0.24em; font-size: 11px; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="loading">
+  <h1>Operation Vector</h1>
+  <p>loading world&hellip;</p>
+</div>
+<div id="fade"></div>
+<div id="crash-flash"></div>
 
-      /* ── the VECTOR panel ──────────────────────────────────────────────
-         The developer telemetry block, top left. PATCH-02 calls this "not
-         the HUD" and it is not: HUD.md never governed it, none of its
-         content is duplicated onto the combat HUD, and it keeps its own
-         palette and its own type.
+<!-- Stage 05.0 — lives. Diegetic, not instruction: it is the squadron's state. -->
+<div id="lives"><b id="lives-count">5</b> LIVES REMAINING</div>
 
-         VISIBLE BY DEFAULT and NOT toggled by `H`, per instruction. That
-         reverses PATCH-02's clarification 1, which asked for hidden-by-
-         default -- the later instruction wins and the reversal is
-         deliberate rather than drift.
+<section id="failed" hidden>
+  <h2>Mission Failed</h2>
+  <div class="rule"></div>
+  <p id="failed-line">No pilots remain on station.</p>
+  <dl id="failed-stats"></dl>
+  <div class="rule"></div>
+  <div class="hint">R or Enter to fly again</div>
+</section>
 
-         Width is BOUNDED rather than content-sized: a panel that grows with
-         its longest string eventually covers the thing it is describing. */
-      #rail {
-        position: fixed;
-        top: 0.9rem;
-        left: 0.9rem;
-        margin: 0;
-        padding: 0.75rem 0.95rem 0.8rem;
-        width: 25.5rem;
-        max-width: calc(100vw - 1.8rem);
-        overflow: hidden;
-        font-size: 0.74rem;
-        line-height: 1.62;
-        white-space: pre;
-        letter-spacing: 0.02em;
-        color: var(--rail-value);
-        background: rgb(46 72 96 / 0.62);
-        border: 1px solid rgb(168 200 226 / 0.22);
-        border-radius: 5px;
-        backdrop-filter: blur(2px);
-        z-index: 10;
-        pointer-events: none;
-      }
+<section id="complete" hidden>
+  <h2 id="complete-title">Vector Complete</h2>
+  <div class="rule"></div>
+  <dl id="complete-stats"></dl>
+  <div class="rule"></div>
+  <div class="hint">R or Enter to fly again</div>
+</section>
 
-      /* ── rotate affordance ─────────────────────────────────────────────
-         Shown only in portrait, and deliberately NOT a blocking overlay:
-         the game stays playable behind it, so a marker who never rotates
-         still gets a working prototype rather than a wall. It carries no
-         words for the same reason the rest of the page doesn't -- a
-         rotating-phone glyph is a device affordance, not a tutorial. */
-      #rotate {
-        position: fixed;
-        left: 50%;
-        bottom: 2.2rem;
-        translate: -50% 0;
-        z-index: 15;
-        display: none;
-        opacity: 0.55;
-        animation: nudge 2.6s ease-in-out infinite;
-        pointer-events: none;
-      }
+<section id="pause" hidden>
+  <h2>Paused</h2>
+  <div class="rule"></div>
+  <div class="hint">Esc to resume</div>
+</section>
 
-      #rotate svg {
-        display: block;
-        width: 3rem;
-        height: 3rem;
-      }
+<div id="rail">
+<section class="panel" id="hud">
+  <h2>Vector &middot; 04.3</h2>
+  <dl>
+    <dt>MSN</dt><dd id="v-msn">DECK &middot; 00:00</dd>
+    <dt>NAV</dt><dd id="v-nav" style="color: rgba(232, 240, 246, 0.45)">&mdash;</dd>
+    <div class="rule" style="grid-column: 1 / -1"></div>
+    <dt>SPD</dt><dd id="v-spd">170 &rarr; 170 m/s</dd>
+    <dt>THR</dt><dd id="v-thr"><span class="bar"><i class="cell on"></i><i class="cell on"></i><i class="cell on"></i><i class="cell on"></i><i class="cell on"></i><i class="cell"></i><i class="cell"></i><i class="cell"></i><i class="cell"></i><i class="cell"></i></span> 46%</dd>
+    <dt>ALT</dt><dd id="v-alt">150 m &middot; sink 0.0</dd>
+    <div class="rule" style="grid-column: 1 / -1"></div>
+    <dt>AMMO</dt><dd id="v-ammo">&rsaquo;AIM-9 2 &middot; GUN 500 &middot; FLR 8</dd>
+    <dt>TGT</dt><dd id="v-tgt" style="color: rgba(232, 240, 246, 0.45)">NO TARGET</dd>
+    <dt>HOST</dt><dd id="v-host" style="color: rgba(232, 240, 246, 0.5)">PATROL</dd>
+    <dt>SAM</dt><dd id="v-sam" style="color: rgba(232, 240, 246, 0.45)">&mdash;</dd>
+    <dt>THRT</dt><dd id="v-thrt" style="color: rgba(232, 240, 246, 0.45)">&mdash;</dd>
+    <div class="rule" style="grid-column: 1 / -1"></div>
+    <dt>P B H</dt><dd id="v-pbh">+0.0&deg; &middot; +0.0&deg; &middot; 000&deg;</dd>
+    <dt>MNVR</dt><dd id="v-mnvr" style="color: rgba(232, 240, 246, 0.45)">&mdash;</dd>
+    <dt>CTC</dt><dd id="v-ctc" style="color: #9fe6b0">CLEAR</dd>
+    <dt>PHYS</dt><dd id="v-phys">60 Hz &middot; safe 60 m</dd>
+    <div class="rule" style="grid-column: 1 / -1"></div>
+    <dt>FX</dt><dd id="v-atm" style="color: rgba(232, 240, 246, 0.45)">&mdash;</dd>
+  </dl>
+</section>
 
-      @keyframes nudge {
-        0%,
-        62%,
-        100% {
-          rotate: 0deg;
-        }
-        80%,
-        92% {
-          rotate: -90deg;
-        }
-      }
+<!-- Stage 05.0 — the control legend is GONE, not hidden by a flag.
 
-      @media (orientation: portrait) {
-        #rotate {
-          display: block;
-        }
-      }
+     The spec requires the game to teach itself, with no instructions on screen or
+     off. A key list is the most literal possible violation, and leaving it behind
+     a toggle would only mean the violation is one keypress away.
 
-      @media (prefers-reduced-motion: reduce) {
-        #rotate {
-          animation: none;
-          rotate: -90deg;
-        }
-      }
+     What teaches instead: the catapult launch runs itself and demonstrates the
+     throttle rising and the burner lighting; the aircraft sits at the centre of
+     the screen and follows the cursor, which is discoverable in about a second;
+     the nav diamond says where to go without words. The HUD is not instruction —
+     it is instrumentation, and reading an instrument is part of flying.
 
-      #fade {
-        position: fixed;
-        inset: 0;
-        background: #000;
-        opacity: 0;
-        z-index: 18;
-        pointer-events: none;
-      }
+     Every key still works. Nothing is disabled; it is simply undocumented
+     in-game, which is what "play teaches whatever comes next" asks for. -->
+<section class="panel" id="keys" hidden>
+  <div><span style="opacity:.55">developer reference — not shown in play</span></div>
+  <div><b>H</b> rail &nbsp; <b>J</b> HUD &nbsp; <b>K</b> audio &nbsp; <b>P</b> probes &nbsp; <b>O</b> anchors &nbsp; <b>N</b> nav &nbsp; <b>G</b> policy &nbsp; <b>T</b> mode</div>
+</section>
+</div>
 
-      #crash-flash {
-        position: fixed;
-        inset: 0;
-        background: #ffd2b0;
-        opacity: 0;
-        z-index: 19;
-        pointer-events: none;
-      }
+<section class="panel" id="asset-note" hidden>
+  placeholder airframe &mdash; drop scene.gltf, scene.bin and textures/ into assets-src/f15/ and run `pnpm assets` for the real F-15E
+</section>
 
-      #complete {
-        position: fixed;
-        inset: 0;
-        display: grid;
-        place-content: center;
-        gap: 1.1rem;
-        text-align: center;
-        background: rgb(4 8 12 / 0.86);
-        z-index: 19;
-      }
+<nav aria-label="Primary">
+  <a href="./tests.html">checks</a>
+</nav>
 
-      #complete[hidden] {
-        display: none;
-      }
-
-      #complete-title {
-        margin: 0;
-        font-size: clamp(1.1rem, 3.2vw, 1.8rem);
-        letter-spacing: 0.36em;
-        text-indent: 0.36em;
-        color: var(--green);
-      }
-
-      #complete-rows {
-        margin: 0;
-        display: grid;
-        grid-template-columns: auto auto;
-        gap: 0.35rem 1.6rem;
-        font-size: 0.78rem;
-        letter-spacing: 0.14em;
-        color: var(--cyan);
-      }
-
-      #complete-rows dt {
-        text-align: right;
-        opacity: 0.65;
-      }
-
-      #complete-rows dd {
-        margin: 0;
-        text-align: left;
-        color: var(--green);
-      }
-
-      nav {
-        position: fixed;
-        right: 0.75rem;
-        bottom: 0.6rem;
-        z-index: 10;
-        font-size: 0.62rem;
-        letter-spacing: 0.2em;
-      }
-
-      nav a {
-        color: var(--cyan);
-        opacity: 0.35;
-        text-decoration: none;
-      }
-
-      nav a:hover,
-      nav a:focus-visible {
-        opacity: 0.9;
-      }
-
-      @media (prefers-reduced-motion: reduce) {
-        #loading {
-          transition: none;
-        }
-      }
-    </style>
-  </head>
-  <body>
-    <canvas id="view"></canvas>
-
-    <div id="loading">
-      <h1>Operation Vector</h1>
-      <p>F-15E</p>
-    </div>
-
-    <!-- The failure fade. The checkpoint restore happens at FULL BLACK, so
-         the player never sees the teleport. -->
-    <div id="fade"></div>
-
-    <!-- The completion screen. `R` or Enter restarts -- Enter ONLY from here,
-         because it is a fire key in flight. -->
-    <div id="complete" hidden>
-      <p id="complete-title">SORTIE COMPLETE</p>
-      <dl id="complete-rows"></dl>
-    </div>
-
-    <!-- ABOVE the fade, and a SEPARATE element, so neither can strand the
-         other on. Under 0.15 s, low alpha. -->
-    <div id="crash-flash"></div>
-
-    <pre id="rail"></pre>
-
-    <div id="rotate" role="img" aria-label="Turn the device sideways to fly">
-      <svg viewBox="0 0 24 24" fill="none" stroke="#9fd7ff" stroke-width="1.4"
-           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="8" y="2" width="8" height="20" rx="1.6" />
-        <line x1="10.6" y1="4.4" x2="13.4" y2="4.4" />
-        <path d="M4.2 15.4a8 8 0 0 1 0-6.8" />
-        <path d="M19.8 8.6a8 8 0 0 1 0 6.8" />
-        <polyline points="2.6,12.4 4.2,15.6 5.9,12.6" />
-        <polyline points="21.4,11.6 19.8,8.4 18.1,11.4" />
-      </svg>
-    </div>
-
-    <nav aria-label="Primary">
-      <a href="./tests.html">checks</a>
-    </nav>
-
-    <script type="module" src="./src/main.js"></script>
-  </body>
+<script type="module" src="src/main.js"></script>
+</body>
 </html>

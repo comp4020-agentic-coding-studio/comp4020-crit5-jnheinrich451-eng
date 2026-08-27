@@ -45,13 +45,14 @@ Build the game described below.
 - No build step, no bundler, no npm, no `node_modules`
 - three.js from a CDN import map in the HTML head
 - No backend, no API, no database, no storage writes
-- Static files only; `flight-lab.html` is the entry point and runs as-is
+- Static files only; `index.html` is the entry point and runs as-is
 
 **Deliverables:**
 
 ```
-flight-lab.html      canvas, overlay layers, developer rail, all CSS
+index.html           canvas, overlay layers, developer rail, all CSS
 tests.html           loads src/flight.test.js and prints a pass/fail count
+audio-probe.html      playability probe for audio assets — see §16
 src/*.js             the modules listed in §3
 src/flight.test.js   plain assertions, no test framework
 ```
@@ -93,7 +94,7 @@ are only visible in motion.
 ### Stage 1 — A shape flying over water
 
 ```
-flight-lab.html   canvas, import map, resize, #loading
+index.html        canvas, import map, resize, #loading
 src/world.js      scene, ocean plane, sky, fog, lighting
 src/flight.js     ASSISTED mode only
 src/input.js      keyboard axes, throttle lever
@@ -181,7 +182,7 @@ src/mission.js    phases, transition table, route survey, triggers, checkpoints,
                   autopilot
 src/collision.js  add MissionCheckpointResponse (G swaps the two)
 src/combat-hud.js add nav marker, phase cue
-flight-lab.html   add #fade and the #complete screen
+index.html        add #fade and the #complete screen
 ```
 
 **Runnable:** the full nine-phase mission completes.
@@ -211,7 +212,7 @@ empty; the modes table; a parked director never completing a mission.
 ```
 src/crash-fx.js  the procedural crash presentation
 src/audio.js     the 11-cue director
-flight-lab.html  add #crash-flash
+index.html       add #crash-flash
 ```
 
 The crash reuses `MissionCheckpointResponse`'s `hold` stage — do not add a state
@@ -227,6 +228,23 @@ ducking, round-robin takes, and the availability rule from §16.
 Walk §19 as a checklist. Then measure three human runs and record the times — a
 bot flying straight lines gives you a lower bound on the route, not a playtest,
 and no amount of green tests substitutes for it.
+
+### Stages 11–13 — after the feature freeze
+
+The game is complete and playable at stage 10, and the freeze holds: these three
+add **no new systems**. They are model substitutions and presentation, each
+runnable and gated like every stage above.
+
+```
+Stage 11  real airframes for the enemies — F-16C hostile, SAM launcher (§2)
+Stage 12  the living world — day/night clock, dynamic ocean, night lights (§16)
+Stage 13  comfort and honesty — warning thresholds, the audio watchdog, pause
+```
+
+Do stage 13 last and do not skip it. It contains no features at all, and it is
+where the build stops lying about its own state: a warning that fires when the
+player cannot act, a loop that reports healthy and plays nothing, and a game with
+no way to stop are all things a green test suite will never mention.
 
 ### Where the schedule risk actually is
 
@@ -248,9 +266,13 @@ are, in descending order:
 ## 1. What to build
 
 A third-person arcade F-15E combat game in the browser. A four-minute authored
-sortie: catapult off a carrier, fly 6 km of open water, fight a hostile fighter,
+sortie: catapult off a carrier, fly 6 km of open water, fight a hostile F-16C,
 run a low-level corridor through SAM-defended terrain, turn back out to sea for
 recovery. Plus two sandbox modes that reuse every system.
+
+The world is alive but not simulated: an 8-minute day/night cycle, a GPU wave
+ocean, and lights that come up on the island after dark. **No weather system** —
+that is a different game, and this one is four minutes long.
 
 Arcade flight model, cinematic presentation, real terrain mesh.
 
@@ -267,11 +289,11 @@ treatment.
 
 ```
 F-15E airframe    glTF. Normalise to 19.4 m length.
-F-16C airframe    glTF. Normalise to 14.8 m length.
-Nomad SAM vehicle glTF. Normalise to 6.9 m length.
+F-16C airframe    glTF. Normalise to 14.8 m length.  The hostile fighter.
 Carrier (CVN)     glTF. Normalise to 332.8 m length. Must expose deck anchors.
 Terrain           glTF heightfield-style mesh. Normalise to 30 km across.
 AIM-9 missile     glTF. Normalise to 2.85 m.
+SAM launcher      glTF. Normalise to 6.9 m length.   Stands on the ground.
 Audio             14 files in assets/audio/ — the manifest is in §16.
                   The game must run silent if absent.
 ```
@@ -279,6 +301,40 @@ Audio             14 files in assets/audio/ — the manifest is in §16.
 Every asset is **normalised at load from measured bounds**, never scaled by a
 hand-typed factor. Load code measures the source bounding box, computes the scale
 that produces the target length, and logs the result.
+
+The hostile is **shorter than the player's aircraft** (14.8 m against 19.4 m), and
+that is worth having: a head-on pass reads as a smaller, lighter aeroplane, and it
+comes free from using true figures. A useful confirmation that a source is to
+scale rather than stretched: at 14.8 m length the F-16C's span should measure
+~9.4 m, which is its real figure.
+
+### Four rules for normalising a downloaded model
+
+Each of these is a defect that shipped once.
+
+1. **Aircraft recentre on the bounding-box centre; vehicles put the bottom of the
+   box at y = 0.** An aeroplane rotates about its middle, a launcher stands on its
+   tracks — and a site's root sits at the sampled ground height, so a
+   centre-recentred vehicle is buried to its axles.
+2. **Measure the yaw correction; do not eyeball it.** Sources arrive at whatever
+   yaw the artist modelled at. Check a *node position* — the canopy and pilot must
+   end up forward of the rudder and engine on the −Z axis. A tail-first aircraft
+   from a chase camera reads as a strange-looking aeroplane, not as an obviously
+   reversed one, so the eye is not a good enough test.
+3. **A merged source may have nothing to articulate.** A launcher exported as one
+   merged OBJ is a flat list of unnamed sibling meshes with no turret, radar or
+   rail node. Do not guess which of thirty-five meshes rotates: slew the WHOLE
+   vehicle on its Y axis, which is honest to the asset and correct for a
+   trailer-mounted launcher — the rails come round to bear.
+4. **A model swap must remove everything it replaces.** The procedural blockout's
+   parts are not all children of one group; anything parented to the turret
+   survives a swap of the group, then drops to ground level and ends up buried
+   under the new model — present, invisible, and impossible to attribute. Name
+   the blockout's parts so the swap can find them, and assert their absence
+   afterwards.
+
+The scale, the yaw and the recentring are **three separate nodes**, so no
+correction can quietly absorb another.
 
 The carrier must yield four local reference points, derived from its measured
 bounds rather than authored: `DeckReference`, `LaunchStart`, `LaunchEnd`,
@@ -294,12 +350,15 @@ offsets and record the fallback in a failure list shown on the developer rail.
 ## 3. Modules to create
 
 ```
-flight-lab.html      canvas, #loading, #fade, #crash-flash, #complete,
+index.html           canvas, #loading, #fade, #crash-flash, #complete,
                      developer rail markup, all CSS
 src/main.js          THE ORCHESTRATOR — wiring, frame loop, HUD text
 
   ── world & physics ───────────────────────────────────────────────
-src/world.js         scene graph, ocean, sky, fog, asset normalisation
+src/world.js         scene graph, sky, fog, asset normalisation
+src/world-time.js    the day/night clock, keyframed palette, sun & moon
+src/ocean.js         the GPU wave surface (one ShaderMaterial)
+src/night-lights.js  settlement and carrier lights, faded by the night factor
 src/aircraft.js      F-15 load, hierarchy, gear visual swap
 src/physics.js       60 Hz probe queries, terrain grid index, safe-state history
 src/physics-debug.js probe and anchor visualisation
@@ -455,23 +514,6 @@ THREE.Quaternion.** This module must not import three.js. Provide quaternion
 helpers (`quatFromEulerYXZ`, `quatForward`, `quatUp`, multiply, identity) as plain
 math. Consumers copy components; they must not call `.copy()` on it.
 
-**quaternion integration in aircraft-local space:**
-
-quat = quat * delta
-
-Input is angular velocity, not an angle. Post-multiplication is what makes the axes local — that is the entire mechanism, and it is why pitching while banked bends the trajectory the way a real aircraft does.
-
-Expert changes the flight model, not the camera. This is the most common misreading of the mode, so it is worth stating plainly: the chase camera stays behind and above the aircraft in both modes, following it exactly as before. Expert does not switch to a world-fixed, external or orbital view, and there is no second camera rig anywhere in this project — alternative compositions are always blended into the one rig. What differs between the modes is how the aircraft's attitude is computed, and the camera simply reads whatever attitude results.
-
-The one camera-adjacent difference is a roll reference, not a position: in ASSISTED the rig leans on a flat world-up term, which is legible because bank is bounded and the aircraft cannot end up inverted. In EXPERT the aircraft can be inverted and stay there, so the rig leans on the aircraft's own up-vector instead. The camera is still directly behind the aircraft; it is now rolled with it, so inverted flight reads as inverted flight rather than as the horizon inexplicably flipping. Both modes damp forward direction, up vector and roll separately, with the same standoff and FOV curves.
-
-Consequences of the model to accept rather than smooth over:
-
-controls do not self-centre — release the stick and the aircraft holds its rate, it does not level itself
-the aircraft can be inverted and remain so indefinitely
-the player can lose orientation, and that is the trade the mode offers in exchange for control authority
-Both modes must write the same quaternion field, so the renderer, the camera and the FX read one value and none of them need to know which mode is active. Clear all transient input state on a mode change: a held key would otherwise command the fresh model on frame one, and the ramped axes would carry the old attitude in with them.
-
 ---
 
 ## 7. Input (`input.js`)
@@ -485,8 +527,13 @@ Q E        roll rate              I                  pitch convention toggle
 LMB / F    fire (hold for gun)    X / RMB            weapon select
 Z / MMB    flares                 M                  Assisted / Expert
 R          restart                C                  clear stuck keys
-wheel      throttle
+wheel      throttle               Esc                pause / resume
 ```
+
+`Esc` both pauses and resumes — one key, both directions. It is handled **before
+every other binding and returns immediately**, so while paused the only key that
+does anything is the one that unpauses; a stray `H` or `T` must not toggle an
+overlay or restart the mission behind the pause screen. See §16.
 
 The mouse carries four things: **move** steers, **left** fires, **right** switches
 weapon, **middle** dispenses flares, **wheel** moves the throttle. All four
@@ -507,7 +554,7 @@ in the frame loop rather than in a key handler, so both behave identically.
 
 Developer keys: `H` rail · `J` HUD · `K` audio mute · `P` probes · `O` carrier
 anchors · `N` nav route · `G` collision policy · `T` game mode · `1 2 3` camera
-roll influence.
+roll influence · `[` `]` jump the clock to sunrise / sunset.
 
 ### Pointer steering — the aircraft is the centre
 
@@ -675,13 +722,31 @@ DECK → LAUNCH → EGRESS → INTERCEPT → DEFENSIVE → TERRAIN → FINAL →
 |---|---|---|---|
 | DECK | catapult fires | — | — |
 | LAUNCH | control handoff | — | — |
-| EGRESS | intercept waypoint reached | — | 44 s |
-| INTERCEPT | kill, or next region reached | 26 s (6 s after a kill) | 52 s |
-| DEFENSIVE | kill, magazine spent, or next region | 30 s (6 s after a kill) | 58 s |
-| TERRAIN | last of three inland legs | — | 98 s |
-| FINAL | seaward waypoint reached | — | 62 s |
-| EXTRACTION | recovery cinematic ends | — | 78 s to start |
+| EGRESS | intercept waypoint reached | — | 30 s |
+| INTERCEPT | kill, or next region reached | 26 s (6 s after a kill) | 34 s |
+| DEFENSIVE | kill, magazine spent, or next region | 30 s (6 s after a kill) | 40 s |
+| TERRAIN | last of three inland legs | — | 66 s |
+| FINAL | seaward waypoint reached | — | 42 s |
+| EXTRACTION | recovery cinematic ends | — | 52 s to start |
 | COMPLETE | terminal | — | — |
+
+### The five-minute deadline
+
+**The sortie is capped at 300 s of mission clock.** Past it the recovery window
+has closed and the run is lost — diegetically, enemy reinforcements arrive. The
+loss screen is the same furniture as the out-of-pilots one, with its own line.
+
+The deadline sits **above the worst-case fallback path** and must stay there:
+`sum(limit)` is 264 s and the closing cinematic brings the worst case to ~277 s.
+So you cannot be failed by the clock for ignoring combat or missing every
+waypoint — only for genuinely spending the time, by circling, fighting too long,
+or dying repeatedly. §10's no-soft-lock guarantee is unaffected, and the
+relationship is asserted rather than assumed.
+
+It is a **policy in the orchestrator reading one pure rule** (`missionExpired`),
+not a tenth phase: the transition table promotes phases and nothing else, and
+"the run is over" is a decision about the run (§4). MISSION only — a deadline in a
+sandbox mode would turn practice into a test (§11).
 
 **Every phase needs a time fallback.** No combination of missed shots or ignored
 enemies may soft-lock a sortie. Write two tests that fly the whole mission with a
@@ -704,6 +769,30 @@ broad: a player must never miss progression by 50 m.
 
 Check only the *current* leg, so flying through a later volume early cannot skip
 the route.
+
+### Navigation falls forward; triggers do not
+
+Two separate questions, and they must not share one answer: **which volume
+advances the mission** (the current phase's current leg, and nothing else) versus
+**where is the player going next** (the next unreached point on the whole route).
+
+Publishing the trigger leg as guidance produced two defects at the coastline:
+
+1. INTERCEPT owns exactly one leg. Reaching it exhausted the phase's list, so the
+   marker **vanished outright** — no diamond, no offscreen chevron — for as long as
+   the phase's 26 s floor. A new player has nothing at all to fly toward.
+2. DEFENSIVE then re-selected *its own copy* of COASTLINE, at the same
+   coordinates, so the marker pointed **backwards** and asked the player to turn
+   around.
+
+So guidance skips any leg already reached and walks the route in flight order for
+the next real destination. Track reached legs **by name and position, not by
+identity** — COASTLINE is deliberately authored twice, and keying by identity
+treats the second copy as somewhere new. Clear that record on restart, before
+publishing nav, or a fresh sortie falls forward past the whole old route and opens
+with no marker.
+
+The trigger check is untouched by this, which is why it changes no phase timing.
 
 Approximate layout (all derived from the measured coast, not authored):
 
@@ -769,8 +858,10 @@ sink and camera rig the player was just using, and control is handed *away* over
 620 m / 190 m/s, hold 4.4 s, fade 1.5 s. **No touchdown is shown** — the player has
 already demonstrated skill; landing must not become another test.
 
-Completion screen: time, air kills, SAM sites, AIM-9 fired/loadout, gun rounds.
-`R` or Enter restarts. Enter only from that screen — it is a fire key in flight.
+Completion screen: time, air kills, SAM sites, AIM-9 fired, gun rounds. The
+AIM-9 row is a **plain count**, not `fired/loadout`: the magazine refills
+mid-sortie, so by the end the denominator is not a fact about anything. `R` or
+Enter restarts. Enter only from that screen — it is a fire key in flight.
 
 The mission clock starts at catapult release and stops at COMPLETE. State that in
 exactly one place so no caller can start it elsewhere.
@@ -930,6 +1021,21 @@ it, the player has genuinely broken the lock.
 
 A spent site must never acquire again: still a target, still worth a kill, but no
 longer a threat. Otherwise it sits in LOCK forever with nothing to fire.
+
+**Enforce that on the way OUT as well as the way in.** Guarding only the
+`SEARCH → TRACK` promotion leaves `LAUNCH` with no exit except firing — and the
+firing branch is itself gated on having a round, so a site that reaches LAUNCH
+empty never sets its `launched` flag, and the table returns LAUNCH again on every
+frame, permanently. The symptom is hard to attribute because the site looks
+blameless: it holds the player in LOCK, the threat monitor keeps reporting a lock,
+the warning keeps sounding, the HUD keeps the diamond up, and no missile ever
+arrives because there is none to arrive. It reads as "the SAM locks me and warns
+me but never shoots", and it shows up halfway through a sortie, which is when a
+site is most likely to be spent.
+
+So `LAUNCH` returns `RELOAD` on an empty magazine, and `LOCK` falls back to
+`SEARCH` on one. Assert that **every** magazine state leaves LAUNCH within one
+step: no state in any of these three tables may loop on itself.
 
 **Destroyable with no special cases.** A site publishes the same
 `{position, velocity, alive, health, radius, label}` contract the drone does, so
@@ -1189,8 +1295,18 @@ Nav is **yellow, not orange**, deliberately: orange sits between `warn` and
 
 Nav marker: a yellow diamond with name and range, radius 12, stroke 2. Offscreen
 it becomes a yellow chevron at ~24%/22% of the viewport pointing the way round.
-Hide it inside 260 m, and **suppress it entirely while a missile is inbound** — at
-that moment the player needs one piece of information and it is not the waypoint.
+Hide it inside 260 m — you have arrived and the next leg is about to become
+current, so it is furniture rather than guidance.
+
+**A threat never suppresses it.** The marker used to vanish while a missile was
+inbound, on the reasoning that the player then needs one piece of information and
+it is not the waypoint. That is wrong in play: the guidance disappears at the
+exact moment the player is manoeuvring hardest, so defeating a round costs them
+the course as well — a second penalty for being shot at. Nothing about the missile
+cue needs the space either; it lives in the upper-centre stack, nowhere near the
+projected diamond. Priority stays expressed in **paint order** — nav is drawn
+first in the world layer, so a hostile bracket and a lock diamond cover it
+without either of them having to switch it off.
 
 The phase name appears once, large, for 2.7 s after a transition, eased in and out.
 That is the only mission text. **No tutorial text anywhere.**
@@ -1277,8 +1393,8 @@ telling the player what has locked them; a score would sit on top of all three a
 make the warnings less audible.
 
 ```
-ENGINE_START   deck spool          AMBIENT    one-shot, stoppable, rate ×2
-ENGINE_LOOP    throttle > 2%       AMBIENT    loop, gain + pitch from the lever
+ENGINE_START   deck spool          AMBIENT    one-shot, stoppable, rate ×2, noDuck
+ENGINE_LOOP    throttle > 2%       AMBIENT    loop, gain + pitch from the lever, noDuck
 GUN            trigger held        WEAPON     loop
 LOCK           threat = LOCK       WARNING    3 takes, 3.2 s floor, ducks to 0.45
 MISSILE        threat = MISSILE    CRITICAL   2 takes, 2.4 s floor, ducks to 0.30
@@ -1286,8 +1402,8 @@ MISSILE_LAUNCH player fires        WEAPON     0.4 s floor
 MISSILE_HIT    any kill / taking one WEAPON   0.3 s floor
 FLYBY          hostile inside 340 m AMBIENT   4 s floor
 FLARES         on dispense         ADVISORY   forced past its own floor
-ALTITUDE       AGL < 220 m         WARNING    3.5 s floor
-PULL_UP        forward hazard      CRITICAL   1.8 s floor
+ALTITUDE       low AND descending  WARNING    3.5 s floor
+PULL_UP        < 9 s to impact     CRITICAL   1.8 s floor
 ```
 
 ### File manifest
@@ -1299,7 +1415,7 @@ named file into `assets/audio/` makes that cue work with no code change.
 | cue | file(s) | volume | content |
 |---|---|---|---|
 | `ENGINE_START` | `assets/audio/engine-start.mp3` | 0.55 | jet engine spinning up |
-| `ENGINE_LOOP` | `assets/audio/engine-loop.mp3` | 0.34 | seamless running-engine loop |
+| `ENGINE_LOOP` | `assets/audio/engine-loop.mp3` | 0.56 | seamless running-engine loop |
 | `GUN` | `assets/audio/gun.mp3` | 0.50 | seamless cannon-fire loop |
 | `LOCK` | `assets/audio/lock-1.mp3`<br>`assets/audio/lock-2.mp3`<br>`assets/audio/lock-3.mp3` | 0.85 | voice: "lock on" ×3 |
 | `MISSILE` | `assets/audio/missile-1.mp3`<br>`assets/audio/missile-2.mp3` | 1.00 | voice: "missile warning" ×2 |
@@ -1321,6 +1437,11 @@ Because almost every sound is information, the mix is a priority problem:
 
 - **`AMBIENT < WEAPON < WARNING < CRITICAL`.** A warning ducks AMBIENT and WEAPON
   for 1.1 s. A warning never ducks another warning.
+- **The engine is exempt from ducking** (`noDuck`). It is the aircraft's own voice
+  and the bed the whole mix sits on, so attenuating it for a spoken advisory is
+  backwards — and with a cue that can repeat every few seconds it is not a duck at
+  all, it is a permanent attenuation that makes the aeroplane sound switched off.
+  The gun still ducks: a cannon burst genuinely does mask speech.
 - **Every one-shot has a minimum interval.** A cue that repeats is a cue nobody
   hears.
 - **Multi-take cues rotate round-robin**, so with three takes it is provably never
@@ -1334,9 +1455,40 @@ Because almost every sound is information, the mix is a priority problem:
   scripted launch with no input in it, so arm on first keypress or click and never
   surface a blocked start as an error.
 
-Ground proximity is two levels, both **AGL, not altitude above sea level**:
-`PULL UP` on an imminent forward hazard or low-and-descending, `ALTITUDE` below
-220 m AGL. So 200 m over the ocean is quiet and 200 m into a 600 m ridge is not.
+Ground proximity is two levels, both from **AGL, not altitude above sea level**.
+Neither is a bare height threshold, and both took several passes to get right:
+
+- **`PULL UP` is a TIME, not a height** — fewer than 9 s to impact on the current
+  trajectory, from sink rate and from the ground sampled 6 s ahead. A height
+  threshold cannot work at both 110 and 250 m/s, and it fires far too late over
+  rising ground: by the time a low number is reached the aircraft is committed.
+  Nine seconds is ~2.2 km of warning. It also works over water, where there is no
+  terrain ahead to probe.
+- **`ALTITUDE` is low AND descending** — below 250 m AGL with a sink rate over
+  1.5 m/s. Low and level is legitimate flying: the terrain leg is flown that way
+  on purpose. A height-only rule fires every `minInterval` for the whole sortie,
+  which is a cue the player learns to ignore, and — because every firing ducked
+  the ambient channels — it also held the engine down permanently and made the
+  aircraft sound switched off.
+- **Neither may fire in the first 5 s of player control.** The aircraft leaves the
+  deck ~20 m over the water and sinks briefly off the bow before the wing takes
+  over, which is a guaranteed trajectory warning at the one moment the player has
+  nothing to do with it — and the launch is the loudest scripted beat in the build
+  and must not be talked over. The grace timer resets whenever control is taken
+  away, so it covers every respawn and the recovery autopilot too.
+
+- **A hard floor of 90 m applies over WATER ONLY** — below it the sea is a
+  `PULL UP` regardless of trajectory. The time-to-impact rule needs a descent to
+  have something to divide by, so level flight 20 m over the waterline was silent:
+  correct arithmetic, useless advice. Over land that is acceptable, because the
+  corridor is flown deliberately low and the ground *ahead* supplies the warning;
+  over open sea there is nothing ahead to sample and no visual scale, so height is
+  the only cue there is. Do **not** extend this floor to terrain — it would fire
+  continuously for the whole TERRAIN leg, which is the nagging-cue failure that
+  `ALTITUDE` was given a descent test to fix.
+
+So 200 m over the ocean in level flight is quiet, 60 m over the ocean is not, and
+200 m descending into a 600 m ridge is not.
 
 The engine loop must **not** run during the deck phase — the start-up plays alone
 while the aircraft shakes in place, at double playback rate so the whole recording
@@ -1355,6 +1507,170 @@ loading, and which will mark every working file as missing. Availability starts
 optimistic and is corrected by a deadline that the audio module itself owns and
 announces; do not put the deadline in one module and the report in another, or the
 two will drift.
+
+### One owner per media element
+
+**A looping cue must be commanded from exactly one expression.** The engine loop
+once had four owners — the crash branch, the deck branch and the mission-complete
+branch each switched it off for a good reason, and the drive line, running later in
+the *same frame*, switched it back on because its condition only knew about the
+deck. Every frame the element was paused and restarted, `currentTime` reset to
+zero, and the loop never got past a single frame of audio. What the player heard
+was the restart: a click or a burst, not an engine.
+
+Every condition that silences a loop belongs in that one expression. This is the
+same rule as §17's single-owner rules for the aircraft transform and the mission
+clock, and it fails the same way — silently, with everything reporting healthy.
+
+### The loop watchdog
+
+**A media element cannot tell you it is producing no sound.** "No engine" was
+reported repeatedly while every observable said the audio was fine: `paused` false,
+`readyState` 4, a correct `duration`, a fully populated `buffered` range, no
+`error`, a resolved `play()` promise and a sane `volume`. `decodeAudioData` decodes
+the same bytes perfectly.
+
+The one honest signal is whether `currentTime` moves. So the director watches it,
+and distinguishes **two faults that look identical from outside**:
+
+```
+never moved     a START failure. The browser is refusing playback until the
+                document has had a real user gesture. Nothing is misconfigured;
+                keep asking, and say so on the rail ("CLICK PAGE").
+moved, stopped  a genuine STALL. Reset playbackRate to 1 and LOCK it (some
+                engines mute a looping element at a shifted rate), re-issue
+                play(), and count it.
+```
+
+Conflating the two is a real defect and not a hypothetical one: a watchdog that
+blames the playback rate for an autoplay block permanently strips the engine's
+throttle-pitch effect for a fault that has nothing to do with it. Gate the repair
+on whether the clock has *ever* moved.
+
+Rate-limit the retry (~4/s). A refused `play()` re-issued every frame is sixty
+promises a second for the browser to reject, and it makes a genuine autoplay block
+look like a stall. Cap the console output per channel: a stall that cannot be
+repaired would otherwise print twice a second forever and bury everything else.
+
+Publish both counts. The developer rail must name which of four states the engine
+is in — `CLICK PAGE`, `MUTE`, `OFF`, or a climbing clock — because "no engine
+sound" has had a different cause every time it has been reported, and one
+ambiguous number cannot tell them apart. If the rail shows a climbing clock and
+nothing is audible, the fault is downstream of the game entirely.
+
+Ship `audio-probe.html`: a standalone page that plays each file and reports whether
+its clock advanced. Run every new audio asset through it before wiring it into the
+cue table. **Mind the order it probes in** — the autoplay policy makes the first few
+clips a page touches look broken regardless of which clips they are, and that
+artefact is easy to mistake for a property of the files. It cost a wrong diagnosis
+once (three clips re-encoded to WAV to fix a fault that was never in them);
+reversing the probe order is what exposed it.
+
+### Day and night (`world-time.js`, `night-lights.js`)
+
+A clock, not a weather system. One normalised phase `tau` in 0..1 owns everything;
+nothing else may write it, and every consumer reads one interpolated palette so
+the sky, the fog, the water, the sun, the moon and the lights cannot disagree.
+
+```
+cycle            8 real minutes = 24 visual hours
+start            tau 0.18 (mid-morning)
+sunrise/sunset   tau 0.045 / 0.55
+sun peak         2.3        moon 0.55 (brighter than reality, on purpose)
+```
+
+- **Interpolate keyframes; never select one.** A palette that snaps between
+  discrete states is the most artificial thing a cycle can do. The same goes for
+  the lights: fade them by the night factor rather than switching them on.
+- **The daytime plateau must not be flat.** `dayFactor` saturates well before
+  midday, so with a bare `day²` term the sun holds one constant value across two
+  thirds of the cycle — two minutes of flying then shows *nothing changing* and
+  the cycle looks broken when it is working exactly as specified. Add a gentle
+  elevation ramp (midday 100%, mid-morning ~87%) and pull the morning and
+  afternoon keyframes apart in colour: morning paler and cooler, afternoon warmer.
+  **Colour shift is what the eye notices while the sun is at full strength.**
+- **A player must reach a visibly different sky within about two minutes**, and
+  sunset within about three. That requirement is what sets the cycle length; it
+  was 12 minutes and nothing read as moving.
+- **Name the phase on the developer rail** (`MIDDAY 0.216`). Otherwise "is the
+  clock even running?" is unanswerable except by staring at the sky.
+- Settlement lights are **deterministic** from a fixed seed — the same island
+  every run — and placed only where the terrain is habitable (low, flat, inland).
+
+No weather, no clouds driven by the clock, no time-of-day control in the game.
+`[` and `]` jump to sunrise and sunset for inspection; they are developer keys.
+
+### Ocean (`ocean.js`)
+
+One mesh, one `ShaderMaterial`, three sine components on the GPU. No FFT, no fluid
+solve, no reflection camera, no second render pass — this is the cheapest thing
+that reads correctly at 200 m/s, per §1.
+
+```
+patch          90 km, follows the player in X/Z only
+grid           96×96, RADIALLY WARPED (power 2): ~20 m cells at the centre,
+               ~1.9 km at the rim — 9409 vertices either way
+waves          3 components, amplitudes 0.70 / 0.38 / 0.17 m
+wave fade      flat beyond 7 km of the camera
+Fresnel        base 0.012, power 6.5, CAPPED at 0.55
+```
+
+Five rules, each one a defect that shipped:
+
+1. **The patch must be several times the fog's visibility, not just "far".** A
+   14 km patch was chosen on the assumption fog would hide its edge; at 3.9 km
+   altitude the fog factor 7 km out is 0.058, so the sea ended in a hard dark
+   quadrilateral with sky beyond it. At 90 km the rim sits at 0.92. Visibility is
+   roughly `1/fogDensity` — compute it rather than guessing.
+2. **Warp the grid rather than subdividing it.** 96² over 90 km is a 937 m cell,
+   coarser than the 74 m chop, which aliases into triangular garbage. Warping
+   radially puts the resolution where the waves are legible and spends nothing on
+   water 40 km away.
+3. **Fade wave amplitude with distance.** Rim cells are kilometres across;
+   displacing them as hard as the fine centre cells turns the horizon into slow
+   enormous ripples.
+4. **Cap the Fresnel blend.** Uncapped, the far half of the sea becomes flat sky
+   colour and the whole surface reads as milky soup. Water *tinted* by the sky
+   still reads as water; water *replaced* by it does not.
+5. **A raw `ShaderMaterial` does not get the renderer's output colour conversion**
+   that built-in materials receive. Include three's `<colorspace_fragment>` chunk
+   or linear values reach an sRGB framebuffer unconverted and a mid navy renders
+   near-black.
+
+The wave phase is computed from **world** position, so the pattern is stable in
+the world as the patch follows the player; snap the mesh to a coarse step so the
+tessellation does not crawl. Patch height stays at y = 0, which is also the
+collision plane, so the visual and physical sea never disagree.
+
+**The water is held more saturated than the sky and the horizon at every daylight
+hour.** Over open sea at low altitude the only cue for height is the colour
+boundary between air and surface, and a grey-blue sea against a pale sky has
+almost none — there is no waterline to find. At night the boundary is carried by
+luminance instead: the haze band stays brighter than the water.
+
+### Pause
+
+`Esc`. The smallest possible interface: a title, a rule, and one line saying how
+to get back in. **No quit** — the tab is the quit. No options, no settings, no
+volume slider; every one of those is a menu, and this game does not have menus.
+Same furniture as the win and loss screens so it reads as part of the family.
+
+- **Pause is a property of the frame LOOP, not of the mission, the mode or the
+  flight model.** One early return; none of those systems learns about it. That is
+  why pausing cannot corrupt a launch, a crash sequence or a checkpoint the way a
+  per-system pause flag could.
+- **Place the return after the frame's timestamp is updated**, so the frame the
+  player resumes on has a normal `dt` rather than the whole paused duration. The
+  `dt` clamp would swallow it anyway; relying on a clamp to hide a bug is not a
+  design.
+- **Keep rendering.** The paused world sits there and looks like the world, not
+  like a black screen.
+- **Silence the audio and restore what the player had.** A continuous engine
+  running behind a pause screen is the most obvious way to make a pause feel
+  broken. Remember the player's own mute (`K`) so pausing never turns their audio
+  back on.
+- Disable pointer steering while paused: a paused game must not be flown by a
+  moving cursor.
 
 ---
 
@@ -1388,6 +1704,36 @@ Each of these describes a real failure. Violating one reproduces it.
 13. **A test double must match the real thing.** One that diverges tests nothing.
 14. **Assert the mechanism, not the symptom.** "The round was defeated" passes
     while a counter-measure is completely broken.
+15. **One owner per media element.** Every condition that silences a loop lives in
+    one expression. Four owners across four frame-loop branches pause and restart
+    the element every frame; it reports perfectly healthy and plays nothing.
+16. **Distinguish a start failure from a stall.** "Never played" is the autoplay
+    policy waiting for a user gesture and needs no repair; "played, then froze"
+    does. Gate any repair on whether the clock has *ever* moved, or a watchdog will
+    strip a working feature to fix a fault that is not there.
+17. **A vehicle stands on the ground; an aircraft rotates about its middle.** Two
+    different normalisations. Using the aircraft rule on a launcher buries it.
+18. **A model swap removes everything it replaces.** Anything parented to a node
+    the swap keeps survives, drops, and ends up buried and invisible.
+19. **Measure a model's forward axis from a node position.** Tail-first reads as
+    an odd-looking aeroplane, not as an obvious reversal, so the eye is not a test.
+20. **A patch that follows the player must exceed the fog's visibility several
+    times over.** "Far away" is not a number; `1/fogDensity` is.
+21. **A raw `ShaderMaterial` needs the output colour-space conversion** that
+    built-in materials get for free. Without it everything renders too dark.
+22. **A saturating factor makes a flat plateau.** Anything driven by one needs a
+    second, non-saturating term, or two thirds of a cycle shows no change and the
+    system looks dead while working exactly as specified.
+23. **A threshold that must hold at two speeds should be a TIME, not a distance.**
+    `PULL UP` at 110 and at 250 m/s is the case that proves it.
+24. **A warning that fires while the player has no control teaches nothing.** Give
+    every advisory a grace window after control is handed over, and reset it
+    whenever control is taken away.
+25. **Guard a resource rule at every edge of the state machine, not just the
+    entry.** "A spent site never acquires" enforced only at `SEARCH` left `LAUNCH`
+    with no exit but firing, and firing needed the resource it no longer had — a
+    permanent lock with no missile. Assert that every state leaves itself within
+    one step, for every value of the resource.
 
 ---
 
@@ -1395,9 +1741,9 @@ Each of these describes a real failure. Violating one reproduces it.
 
 `src/flight.test.js` is plain assertions with a `check(name, pass, detail)` helper
 and a pass/fail count. No runner, no framework, no async. `tests.html` loads it;
-`flight-lab.html?test=1` runs it alongside the game.
+`index.html?test=1` runs it alongside the game.
 
-Target ~1200+ checks. What must be covered:
+Target ~1400+ checks. What must be covered:
 
 - **Flight math** both modes: envelope limits, bank/heading coupling in Assisted
   and its *absence* in Expert, sink, throttle as a lever, snapshot round-trip.
@@ -1418,6 +1764,19 @@ Target ~1200+ checks. What must be covered:
 - **Counter-measures with correct geometry**: a *moving* aircraft for the flare
   stern chase (a static one never leaves its flares behind, and the mechanic looks
   broken), plus head-on and committed-round cases.
+- **Asset normalisation without a loader**: synthetic sources with an arbitrary
+  origin, asserting the aircraft rule (pivot on the bounding-box centre) and the
+  vehicle rule (bottom of the box at y = 0) separately, plus that a model swap
+  removes the blockout's parts and that the turret slew still works through it.
+- **The day/night cycle as arithmetic**: midday measurably brighter than
+  mid-morning *and* mid-afternoon, the daytime palette actually changing, and two
+  minutes of flight from the start moving the sky — the assertions that pin the
+  flat-plateau regression.
+- **The loop watchdog with a stub that reports perfect health and never
+  advances**: a frozen clock detected, the rate reset and locked, a healthy
+  advancing loop never touched, a loop *wrap* not mistaken for a stall, a muted
+  channel not reported as stalled, and — separately — a never-started channel
+  counted as pending with its pitch effect left alone.
 
 Delete checks when you delete the code they describe. A suite that only grows is
 not being maintained.
@@ -1432,7 +1791,7 @@ running at all.
 
 ## 19. Definition of done
 
-- `flight-lab.html` opens and flies with no console errors
+- `index.html` opens and flies with no console errors
 - `tests.html` is green
 - The full sortie completes: deck → launch → egress → intercept → defensive →
   terrain → final → extraction → complete
@@ -1444,9 +1803,28 @@ running at all.
 - `G` swaps collision policies live with identical detection
 - Terrain masking demonstrably defeats a SAM: the same geometry behind a ridge
   produces no launch, and the site does not appear on the radar either
-- No mouse gesture produces any control input
+- No mouse gesture produces any *unintended* control input: hovering on the
+  aircraft holds attitude, leaving the window releases the stick, and a held key
+  overrides a deflected cursor
+- `Esc` pauses and resumes; the world is frozen, the audio silent, the scene still
+  drawn, and no other key acts while paused
+- The sky is visibly different two minutes after launch and reaches sunset within
+  about three
+- The ocean has no visible edge at any altitude the aircraft can reach, and the
+  waterline is findable from the air
+- The hostile is an F-16C at 14.8 m and every SAM site is a launcher standing on
+  the ground — no floating, no burial, nose forward
+- The developer rail names the engine's audio state, so "no sound" is diagnosable
+  without a debugger
 
 ### Deliberately out of scope
 
 No landing, no mesh fracture, no pilot ejection, no damage subsystem, no
-persistent wreckage, no wingmen, no scoring system, no music.
+persistent wreckage, no wingmen, no scoring system, no music, no weather system,
+no options or settings menu, no reflection camera, no second render pass.
+
+**Pointer steering is IN** — see §7. An earlier revision of this document listed
+it here; it was reintroduced because §16's no-instructions rule depends on having
+one self-teaching control, and WASD alone is not one. What remains out of scope is
+steering from *relative* movement with a synthesised origin, which was tried, cost
+six fixes and never worked.
