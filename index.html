@@ -39,17 +39,21 @@
      i.e. pitching down — would otherwise trigger. */
   html, body { touch-action: none; overscroll-behavior: none; }
   #stage { display: block; width: 100vw; height: 100vh; touch-action: none; }
-  /* Both overlays live in one fixed column pinned top and bottom, so they
-     cannot meet however short the viewport gets. Two rules matter here:
+  /* THE KEY LEGEND IS GONE. It used to sit under the rail — "H rail · J HUD ·
+     K audio…" — and §16 is unambiguous: no control legend, on screen or off,
+     and no legend behind a toggle either, because that only puts the violation
+     one keypress away. It was visible in play at the phone viewport, drawn
+     across the middle of the frame over the game.
 
-     - #keys is flex: 0 0 auto. It must NEVER shrink: it is the only place the
-       controls are written down, and Stage 03.15 found it silently truncating
-       the fire/HUD line, which made the primary weapon undiscoverable.
-     - #hud scrolls rather than clipping. Stage 03.15 also found five rows
-       (ENG, ATM, CARR, TERR, IN) cut off with no scrollbar and no visual cue,
-       so the diagnostics for the systems that stage added were invisible. A
-       scrollbar is an ugly answer but a silent crop is a wrong one — the rows
-       themselves were folded down to 18 so it should not appear at 1080. */
+     Nothing is lost. The developer keys are written down in CLAUDE.md §7, which
+     is where whoever works on this repo reads them; the player was never meant
+     to have them, and the game teaches itself instead.
+
+     What remains here is one fixed column holding the diagnostic rail. #hud
+     scrolls rather than clipping: Stage 03.15 found five rows (ENG, ATM, CARR,
+     TERR, IN) cut off with no scrollbar and no visual cue, so the diagnostics
+     for the systems that stage added were invisible. A scrollbar is an ugly
+     answer but a silent crop is a wrong one. */
   #rail {
     position: fixed;
     top: 20px;
@@ -80,15 +84,34 @@
      to eat the frame. minmax(0, 1fr) inside a max-width lets a long row wrap
      instead of pushing the panel wider. */
   #rail #hud { position: static; box-sizing: border-box; min-height: 0; max-width: 340px; overflow-y: auto; overflow-x: hidden; flex: 0 1 auto; scrollbar-width: thin; }
-  /* If the rail IS summoned with H on a phone, it has to fit rather than sit
-     across the game. It stays legible by shrinking, not by cropping — a silent
-     crop is what §Stage 03.15 already found and fixed once. */
+  /* HALF SIZE ON A PHONE, via one transform rather than a dozen retuned values.
+     The rail starts hidden here (main.js) but `H` brings it back, and at full
+     size it covered the top half of a 390x844 frame — over the HUD, which is
+     the display that matters in flight.
+
+     `scale()` is the right lever precisely because it is indiscriminate: font
+     size, letter-spacing, padding, the label/value grid and the rule lines all
+     halve together and stay in proportion. Halving a font-size alone leaves the
+     gaps and the column gutter at full width, which reads as a panel that has
+     been squashed rather than scaled.
+
+     transform-origin pins it to the corner it is anchored to, so it shrinks
+     toward the top-left rather than away from it. The layout box keeps its
+     unscaled height, so #hud's scrollport still runs the full height of the
+     viewport and MORE rows fit on screen than before, not fewer. */
   @media (max-width: 1000px), (max-height: 620px) {
-    #rail { top: 10px; bottom: 10px; left: 10px; }
-    #rail #hud { max-width: min(300px, 62vw); font-size: 10px; letter-spacing: 0.04em; }
-    #rail #keys { font-size: 10px; }
+    #rail {
+      top: 10px;
+      bottom: 10px;
+      left: 10px;
+      transform: scale(0.5);
+      transform-origin: top left;
+    }
+    /* Laid out at full width and painted at half, so the panel occupies ~31% of
+       a 390 px frame instead of 62%. Sized here rather than left to shrink-to-fit
+       so a long mission line cannot widen it back out. */
+    #rail #hud { max-width: min(300px, 62vw); letter-spacing: 0.04em; }
   }
-  #rail #keys { position: static; overflow: visible; flex: 0 0 auto; }
   #hud {
     padding: 8px 14px 9px;
     border-radius: 3px;
@@ -121,9 +144,6 @@
     opacity: 0.22;
   }
   #hud .bar .cell.on { opacity: 1; }
-  #keys { color: rgba(232, 240, 246, 0.62); }
-  #keys div { display: flex; gap: 10px; flex-wrap: wrap; }
-  #keys b { font-weight: 400; color: #e8f0f6; }
   #asset-note {
     bottom: 20px;
     right: 22px;
@@ -420,10 +440,6 @@
 
      Every key still works. Nothing is disabled; it is simply undocumented
      in-game, which is what "play teaches whatever comes next" asks for. -->
-<section class="panel" id="keys" hidden>
-  <div><span style="opacity:.55">developer reference — not shown in play</span></div>
-  <div><b>H</b> rail &nbsp; <b>J</b> HUD &nbsp; <b>K</b> audio &nbsp; <b>P</b> probes &nbsp; <b>O</b> anchors &nbsp; <b>N</b> nav &nbsp; <b>G</b> policy &nbsp; <b>T</b> mode</div>
-</section>
 </div>
 
 <section class="panel" id="asset-note" hidden>

@@ -1254,7 +1254,6 @@ input.onPitchModeToggle((inverted, name) => combatHud.flash(`PITCH \u00b7 W = ${
  * rail fits its box at 540 px instead of silently cropping its last five rows.
  * Every fold keeps every value — nothing was dropped to make room.
  */
-const keysEl = document.getElementById("keys");
 const hud = {
   root: document.getElementById("hud"),
   mode: document.getElementById("v-mode"),
@@ -1342,11 +1341,12 @@ window.addEventListener("keydown", (e) => {
     }
     return;
   }
-  // H owns the whole developer overlay — stats panel and key legend together —
-  // so what is left on screen is the combat interface alone (§35).
+  // H owns the diagnostic rail, and only that: the key legend it used to carry
+  // with it is deleted rather than hidden, because §16 rules out a legend
+  // behind a toggle as much as one on screen. What is left is the combat
+  // interface alone (§35).
   if (k === "h") {
     hud.root.hidden = !hud.root.hidden;
-    if (keysEl) keysEl.hidden = hud.root.hidden;
     measureRail();
   }
   if (k === "j") combatHud.toggle();
@@ -2600,7 +2600,6 @@ Promise.all([
    */
   if (window.matchMedia("(max-width: 1000px), (max-height: 620px)").matches) {
     hud.root.hidden = true;
-    if (keysEl) keysEl.hidden = true;
   }
   measureRail();
   lastTime = performance.now();
