@@ -71,7 +71,7 @@ import { setGearVisual, setGearForFlight, GEAR_NODES } from "./aircraft.js";
 import { REARM, createRearmTimer, createRearmSystem } from "./rearm.js";
 import { AUDIO, Cue, Priority, engineVoice, takeIndex, mayFire, groundWarning, secondsToGround, flybyTriggered, createAudioDirector } from "./audio.js";
 import { DAY, NIGHT, createWorldClock, wrapTau, sunElevation, sunDirection, nightFactor, dayFactor, paletteFor, environmentFor } from "./world-time.js";
-import { LIGHTS, seeded, habitable, planSettlements } from "./night-lights.js";
+import { LIGHTS, seeded, habitable, planSettlements, createCarrierLights } from "./night-lights.js";
 import { OCEAN } from "./ocean.js";
 import { breakDirection } from "./hostile.js";
 import { SAM, SAM_MISSILE, SamState, lineOfSight, inEngagementRange, samTransition, samThreatLevel, createSamSite, createSamNetwork, wreckSamSite, resetSamSite, normalizeSamModel, installSamVisual } from "./sam.js";
@@ -3803,7 +3803,34 @@ const makeTerrain = (f, half = 100) => {
   // — the wait is a countdown rather than a delay.
   check("launch: the dwell holds the whole engine start-up", LAUNCH.deckDwell > 9 && LAUNCH.deckDwell < 13, LAUNCH.deckDwell);
   check("launch: the burner lights before the cat fires", LAUNCH.afterburnerAt < LAUNCH.deckDwell, [LAUNCH.afterburnerAt, LAUNCH.deckDwell]);
-  check("launch: the shake grows across the dwell rather than sitting flat", LAUNCH.deckShimmerPeak > LAUNCH.deckShimmer * 3, [LAUNCH.deckShimmer, LAUNCH.deckShimmerPeak]);
+  /**
+   * THE DECK IS STILL AND THE CATAPULT IS NOT. The dwell used to ramp a shimmer
+   * from 0.02 to 0.16; it ran for the full eleven seconds of the engine
+   * start-up, before the player had touched anything, and an unsteady frame that
+   * early reads as a fault in the game rather than as power in the aircraft.
+   *
+   * The old check asserted that the ramp existed, so it is deleted rather than
+   * adapted (§18) and replaced by the property that now matters: the contrast.
+   * Asserted through the sequence itself, not off the config — the constant
+   * being zero says nothing about what the player is shown.
+   */
+  {
+    // ARMED, then driven. An un-armed sequence sits in IDLE with shake 0, so
+    // "the deck does not shake" would pass without the deck ever existing —
+    // which is what the first draft of this check did, and the stroke assertion
+    // below is what caught it (§17.14).
+    const shakeAt = (t) => {
+      const seq = createLaunchSequence();
+      seq.arm({ x: 0, y: 18, z: -1546.75 }, { x: 0, y: 18, z: -1746.43 });
+      for (let i = 0; i < Math.round(t * 60); i++) seq.update(1 / 60, false);
+      return { shake: seq.state.shake, stage: seq.state.stage };
+    };
+    const parked = [0.5, 3, 6, 9, 10.5].map(shakeAt);
+    check("launch: the spool-up really is the DECK stage", parked.every((r) => r.stage === LaunchStage.DECK), parked.map((r) => r.stage));
+    check("launch: and the deck does not shake at any point in it", parked.every((r) => r.shake === 0), parked.map((r) => r.shake));
+    const rolling = shakeAt(LAUNCH.deckDwell + 1);
+    check("launch: ...while the catapult stroke does", rolling.stage === LaunchStage.STROKE && rolling.shake > 0, rolling);
+  }
 }
 
 {
@@ -5021,6 +5048,54 @@ const holdStep = (d, pos, dt) =>
   const again = planSettlements({ bounds: { minX: -8000, maxX: 8000, minZ: -8000, maxZ: 8000 }, sampleHeight: island });
   check("settlements: generation is seeded and repeatable", again.count === plan.count && again.positions[0] === plan.positions[0] && again.positions[plan.count * 3 - 1] === plan.positions[plan.count * 3 - 1]);
   const differentSeed = planSettlements({ bounds: { minX: -8000, maxX: 8000, minZ: -8000, maxZ: 8000 }, sampleHeight: island, seed: 12345 });
+
+/**
+ * §43 — the carrier's own lights, and the one thing about them that is easy to
+ * get wrong in a way nobody can name: WHICH END THE ISLAND IS ON.
+ *
+ * Reported from play as the bridge light sitting forward of the bridge. It was:
+ * the cluster ran 0.02–0.08 of the length, barely aft of midships. Reading the
+ * carrier mesh, the geometry standing above the flight deck — the only thing up
+ * there — is a compact structure centred 0.195 L from midships, spanning
+ * 0.174–0.218 L. These checks hold the lights on it.
+ *
+ * The SIGN is what they really protect. In this space +Z is aft (world.js:
+ * `launchStartZ` 0.16 is "the aft end of the catapult run", `launchEndZ` -0.44
+ * is "short of the bow"), so an island at negative Z would be on the bow. That
+ * reads as wrong instantly and explains itself to nobody, which is exactly the
+ * kind of thing a check should hold still.
+ */
+{
+  const length = 332.8;
+  const lights = createCarrierLights({ local: { DeckReference: { x: 0, y: 18, z: 0 } } }, { length });
+  const sprites = lights.root.children.map((c) => c.position);
+  check("carrier lights: the ship is lit at all", sprites.length > 20, sprites.length);
+
+  // The island cluster is the only thing well above the deck.
+  const islandLights = sprites.filter((p) => p.y > 18 + 5);
+  const deckLights = sprites.filter((p) => p.y <= 18 + 5);
+  check("carrier lights: a deck run and a taller island cluster", islandLights.length === 7 && deckLights.length > 20, [islandLights.length, deckLights.length]);
+
+  const zs = islandLights.map((p) => p.z / length);
+  check(
+    "carrier lights: the island is AFT of midships, not forward (+Z is aft)",
+    zs.every((z) => z > 0),
+    zs.map((z) => +z.toFixed(3))
+  );
+  check(
+    "carrier lights: ...and sits on the structure measured off the hull, 0.174–0.218 L",
+    zs.every((z) => z >= 0.17 && z <= 0.222),
+    zs.map((z) => +z.toFixed(3))
+  );
+  check("carrier lights: the island is to starboard, as every carrier's is", islandLights.every((p) => p.x > 0), islandLights.map((p) => Math.round(p.x)));
+  check("carrier lights: it stands above the deck rather than on it", Math.max(...islandLights.map((p) => p.y)) > 18 + 15, Math.max(...islandLights.map((p) => p.y)));
+
+  // The deck run has to stay inside the hull, or the ship is outlined in lights
+  // floating off its own bow and stern.
+  const deckZ = deckLights.map((p) => p.z / length);
+  check("carrier lights: the deck run stays within the hull", Math.min(...deckZ) > -0.5 && Math.max(...deckZ) < 0.5, [Math.min(...deckZ).toFixed(3), Math.max(...deckZ).toFixed(3)]);
+}
+
   check("settlements: ...but the seed is what decides it", differentSeed.positions[0] !== plan.positions[0]);
   check("prng: seeded() is deterministic", seeded(7)() === seeded(7)() && seeded(7)() !== seeded(8)());
 

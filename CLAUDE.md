@@ -663,13 +663,21 @@ reconcile. No wheel physics, no suspension, no throttle input.
 
 ```
 0.0–11.0   parked. The engine start-up plays IN FULL at double speed (a ~22 s
-           recording finishing in ~11 s), fired once. Shake ramps 0.02 → 0.16.
-9.6        afterburner lights (shake ×1.5)
+           recording finishing in ~11 s), fired once. NO SHAKE — see below.
+9.6        afterburner lights
 11.0       catapult fires on the start-up's last note. Engine loop takes over.
 13.8       release point — exactly the measured deck run. 152 m/s.
 14.2       rotate to 12° pitch, gear up
 14.7       control handoff at 172 m/s, throttle 0.92, afterburner lit
 ```
+
+**The deck is STILL, and the catapult is not.** The spool-up shimmer this
+timeline used to ramp (0.02 → 0.16, ×1.5 on the burner) is gone. It ran for the
+full eleven seconds of the start-up, before the player had touched anything, and
+a camera that will not hold still for eleven seconds reads as a fault in the game
+rather than as power in the aircraft. The stroke keeps its shake, and the
+contrast is what makes it land: a still deck and then the whole frame moving at
+once is a harder cut than a shake that merely gets worse.
 
 **The deck must be HELD until audio is armed.** A browser will not start audio
 before a user gesture, and the launch begins on the first frame of a fresh load —

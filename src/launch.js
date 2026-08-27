@@ -84,13 +84,18 @@ export const LAUNCH = {
   /**
    * §13 — cheap FX, reusing the existing camera-offset channel.
    *
-   * The deck shimmer RAMPS across the dwell now rather than sitting flat: the
-   * aircraft should look like it is being wound up, and a constant vibration for
-   * three and a half seconds reads as a rendering artefact rather than as an
-   * engine. `deckShimmerPeak` is what it reaches just before the cat fires.
    */
-  deckShimmer: 0.02,
-  deckShimmerPeak: 0.16,
+  /**
+   * THE DECK IS STILL. The spool-up shake was removed from play: it runs for the
+   * full 11 s of the engine start-up, before the player has touched anything,
+   * and a camera that will not hold still for eleven seconds reads as a fault in
+   * the game rather than as power in the aircraft.
+   *
+   * The catapult keeps its shake, which is the point — the contrast is what
+   * makes the stroke hit. A still deck for eleven seconds and then the whole
+   * frame moving at once is a harder cut than a shake that merely gets worse.
+   */
+  deckShimmer: 0,
   strokeShake: 0.3,
 
   /** §11 — how long the launch composition takes to hand the rig back. */
@@ -290,10 +295,11 @@ export function createLaunchSequence({ cfg = LAUNCH } = {}) {
       state.throttle = spoolThrottle(state.t, cfg);
       state.afterburner = state.t >= cfg.afterburnerAt;
       state.speed = 0;
-      // Winding up: the shake grows across the dwell, and harder once the burner
-      // lights. Nothing is moving yet, which is the point.
-      const wind = clamp01((state.t - cfg.spoolAt) / Math.max(0.01, cfg.deckDwell - cfg.spoolAt));
-      state.shake = lerp(cfg.deckShimmer, cfg.deckShimmerPeak, wind) * (state.afterburner ? 1.5 : 1);
+      // No shake while parked. The engine start-up is the whole eleven seconds
+      // of this stage and it is doing the work on its own; a shimmer that ramps
+      // underneath it just makes the frame unsteady before the player has any
+      // control to be unsteady with. The stroke below still shakes.
+      state.shake = cfg.deckShimmer;
     } else {
       state.stroke = state.t - cfg.deckDwell;
       state.throttle = 1;

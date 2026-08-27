@@ -283,11 +283,33 @@ export function createCarrierLights(references, { length = 332.8 } = {}) {
       root.add(s);
     }
   }
-  // The island: a taller, brighter cluster so the ship has a recognisable shape
-  // from the air rather than a flat outline of dots.
+  /**
+   * The island: a taller, brighter cluster so the ship has a recognisable shape
+   * from the air rather than a flat outline of dots.
+   *
+   * MEASURED FROM THE HULL, not guessed. Reported from play as the bridge light
+   * sitting forward of where the bridge is, and it was: the cluster ran from
+   * 0.02 to 0.08 of the length, barely aft of midships, while the model's actual
+   * superstructure is much further back.
+   *
+   * Reading the carrier's own mesh (12,878 vertices of assets-src/carrier), the
+   * geometry standing above the flight deck — the only thing up there — is a
+   * compact structure centred 0.195 L from midships and spanning 0.174–0.218 L,
+   * about 15 m long on a 332.8 m ship. That is the island, and these are its
+   * numbers. A first correction to 0.10 L was still half short; the mesh is what
+   * settled it, not another look at the screen.
+   *
+   * The SIGN is the easy half to get backwards, so it is derived rather than
+   * eyeballed. In model space the island sits toward negative long-axis, and the
+   * hull tapers toward positive — a bow narrows, a stern does not — so negative
+   * is aft. In this space +Z is aft too: `launchStartZ` is 0.16 and documented
+   * as "the aft end of the catapult run", `launchEndZ` is -0.44 and "short of
+   * the bow" (world.js). Hence +0.174 L and forward from there.
+   */
+  const islandZ = length * 0.174;
   for (let i = 0; i < 7; i++) {
     const s = new THREE.Sprite(material);
-    s.position.set(halfBeam * 0.72, deckY + 6 + i * 3.4, length * (0.02 + 0.03 * (i % 3)));
+    s.position.set(halfBeam * 0.72, deckY + 6 + i * 3.4, islandZ + length * 0.022 * (i % 3));
     s.scale.setScalar(7);
     root.add(s);
   }
