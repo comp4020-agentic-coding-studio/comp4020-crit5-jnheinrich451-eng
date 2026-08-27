@@ -1,19 +1,25 @@
 # Credits
 
-Operation Vector ships four third-party 3D models and fourteen audio files.
-Every model's licence text travels with it in `public/models/<name>/license.txt`
-and is deployed alongside the game.
+Operation Vector ships four third-party 3D models and fourteen audio files, and
+carries two more models that are credited but **not yet in the build**. Every
+shipped model's licence text travels with it in
+`public/models/<name>/license.txt` and is deployed alongside the game.
 
 ## Licence summary — read this first
 
 **This project cannot be released commercially, and it must stay share-alike.**
 
-| asset | licence | commercial | share-alike |
-| --- | --- | --- | --- |
-| F-15E Strike Eagle | CC-BY-NC-SA-4.0 | **no** | **yes** |
-| Ireland Terrain | CC-BY-NC-4.0 | **no** | no |
-| USS Dwight D. Eisenhower | CC-BY-4.0 | yes | no |
-| AIM-9 missile | CC-BY-4.0 | yes | no |
+| asset | licence | commercial | share-alike | in the build |
+| --- | --- | --- | --- | --- |
+| F-15E Strike Eagle | CC-BY-NC-SA-4.0 | **no** | **yes** | yes |
+| Ireland Terrain | CC-BY-NC-4.0 | **no** | no | yes |
+| USS Dwight D. Eisenhower | CC-BY-4.0 | yes | no | yes |
+| AIM-9 missile | CC-BY-4.0 | yes | no | yes |
+| NOMADS SAM system | CC-BY-4.0 | yes | no | not yet |
+| F16-C Falcon | CC-BY-4.0 | yes | no | not yet |
+
+The two newest are both plain CC-BY, so neither tightens the constraints below
+— those come entirely from the F-15E and the terrain.
 
 Two consequences worth stating deliberately rather than discovering at ship
 time:
@@ -48,6 +54,56 @@ time:
 > (https://sketchfab.com/3d-models/aim-9-missile-caaf15b49bac4144b6c6be577c2b872a)
 > by RickSlash (https://sketchfab.com/RickSlash) licensed under CC-BY-4.0
 > (http://creativecommons.org/licenses/by/4.0/)
+
+### Credited but not yet in the build
+
+These two are present in the untracked `assets/models/` and are **not** in
+`public/models/`, so they are not deployed and not part of the current site.
+Credited here anyway, so the record is complete before they are wired in rather
+than after.
+
+> This work is based on "NOMADS SAM system"
+> (https://sketchfab.com/3d-models/nomads-sam-system-2f54eb14a7d649b68e196c1835f6a820)
+> by Jeyhun1985 (https://sketchfab.com/Jeyhun1985) licensed under CC-BY-4.0
+> (http://creativecommons.org/licenses/by/4.0/)
+
+> This work is based on "F16-C Falcon"
+> (https://sketchfab.com/3d-models/f16-c-falcon-4bc2ff75dc584af2afd0aa6bd8b79015)
+> by Carlos.Maciel (https://sketchfab.com/Carlos.Maciel) licensed under
+> CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+
+`CLAUDE.md` §2 gives them their normalisation targets: the F-16C to **14.8 m**
+length and the Nomad SAM vehicle to **6.9 m**. Both would replace primitives —
+the hostile is a cone and each SAM site is a cylinder and a box — and neither
+needs a logic change to land, only the same treatment every other asset got:
+measured normalisation, orientation read from the LOADED object rather than
+from raw accessors, and a pass through `pnpm assets`.
+
+**Measured before committing to either, and the two are not comparable:**
+
+| | triangles | meshes | textures | materials |
+| --- | --- | --- | --- | --- |
+| F16-C Falcon | 4,504 | 19 | 3 | 4 |
+| NOMADS SAM system | **265,350** | 35 | 33 | 16 |
+| *(the whole Ireland terrain, for scale)* | *182,272* | *2* | *2* | *1* |
+
+The F-16 is ideal — 4.5k triangles is cheaper than the cone it would replace
+once the cone's smoothing is counted, and three textures is nothing.
+
+The SAM is a different proposition. **One vehicle carries more geometry than
+the entire island**, and the design calls for six of them. That is ~1.6 M
+triangles against the 216 k the whole scene draws today, plus 33 texture binds
+per site. Geometry passes through `pnpm assets` UNTOUCHED — only textures are
+re-encoded — so its 20 MB `scene.bin` would ship whole and take the build from
+13.5 MB to roughly 34 MB, undoing the entire compression pass and then some.
+
+None of that makes it unusable, but it is a decision rather than a drop-in.
+The honest options, cheapest first: decimate the mesh offline before it enters
+`assets/`; use it for a hero site or two and keep primitives for the rest; or
+accept the download and verify the frame rate on the machine the crit will
+actually run on. Worth deciding deliberately — the current build holds 144 fps
+under software rendering, and that headroom is what makes it safe on an unknown
+laptop.
 
 ### Modifications made
 
