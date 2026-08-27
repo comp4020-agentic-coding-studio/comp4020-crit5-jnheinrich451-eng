@@ -112,6 +112,13 @@ import {
   damageTarget,
   isTargetable,
 } from "./enemy.js";
+import {
+  ENGINE_FX,
+  createEngineFx,
+  plumeLength,
+  plumeOpacity,
+  stepBurner,
+} from "./engine-fx.js";
 import { createTargeting } from "./targeting.js";
 import {
   AIM9,
@@ -2391,6 +2398,192 @@ const observerAt = (position, forward = { x: 0, y: 0, z: -1 }) => ({
   position,
   forward,
 });
+
+// ── Change 4 (DIAGNOSIS B1): the engine ───────────────────────────────────
+
+// The measured nozzle anchors this airframe actually produces, so the gates
+// exercise the same geometry the game draws. A TEST DOUBLE MUST MATCH THE REAL
+// THING (§17.13): these are the values aircraft.js logs at load.
+const NOZZLES = [
+  { x: -1.63, y: -0.59, z: 9.14 },
+  { x: 1.63, y: -0.59, z: 9.14 },
+];
+
+function testEngineFx() {
+  const engine = createEngineFx(NOZZLES);
+
+  // THE BUDGET. 2 plume sprites per nozzle, one burner ring per nozzle, 3
+  // shock diamonds per nozzle -- 12 sprites for the whole engine, allocated
+  // once.
+  const per = ENGINE_FX.plumesPerNozzle + 1 + ENGINE_FX.diamondsPerNozzle;
+  check(
+    "the pool is the budget, and no larger",
+    engine.sprites.length === NOZZLES.length * per,
+    `${engine.sprites.length} vs ${NOZZLES.length * per}`,
+  );
+  check(
+    "two plume sprites per nozzle",
+    engine.sprites.filter((s) => s.kind === "plume").length === NOZZLES.length * 2,
+  );
+  check(
+    "one burner ring per nozzle",
+    engine.sprites.filter((s) => s.kind === "ring").length === NOZZLES.length,
+  );
+  check(
+    "three shock diamonds per nozzle",
+    engine.sprites.filter((s) => s.kind === "diamond").length === NOZZLES.length * 3,
+  );
+
+  // EVERYTHING IS POOLED, and the gate is IDENTITY, not count: a pool that
+  // rebuilt its records every frame would keep the count constant and still
+  // allocate 43,000 objects a minute.
+  const list = engine.sprites;
+  const records = [...list];
+  let sameArray = true;
+  let sameRecords = true;
+  const dt = 1 / 60;
+  for (let i = 0; i < 600; i++) {
+    // Varying throttle, and the burner crossing in both directions.
+    const throttle = 0.5 + 0.5 * Math.sin(i / 37);
+    const returned = engine.update(dt, { throttle, afterburner: throttle > 0.85 });
+    if (returned !== list) sameArray = false;
+    if (returned.length !== records.length) sameArray = false;
+    for (let k = 0; k < records.length; k++) {
+      if (returned[k] !== records[k]) sameRecords = false;
+    }
+  }
+  check("600 frames of varying throttle return the same array", sameArray);
+  check("and the same sprite records -- nothing is allocated", sameRecords);
+  check(
+    "the sprite count never changed",
+    engine.sprites.length === NOZZLES.length * per,
+    `${engine.sprites.length}`,
+  );
+
+  // PLUME LENGTH IS MONOTONIC IN THROTTLE. This is the readability claim: a
+  // player learns what the lever does by watching the back of their aircraft.
+  for (const burner of [0, 0.5, 1]) {
+    let prev = -Infinity;
+    let monotonic = true;
+    for (let i = 0; i <= 200; i++) {
+      const v = plumeLength(i / 200, burner);
+      if (v < prev - 1e-12) monotonic = false;
+      prev = v;
+    }
+    check(`plume length is monotonic in throttle at burner ${burner}`, monotonic);
+  }
+  check(
+    "idle is 0.9 m and full dry is 5.5 m",
+    plumeLength(0, 0) === ENGINE_FX.plumeIdle && plumeLength(1, 0) === ENGINE_FX.plumeDry,
+    `${plumeLength(0, 0)} / ${plumeLength(1, 0)}`,
+  );
+  check(
+    "the burner adds 7.5 m of elongation on top",
+    Math.abs(plumeLength(1, 1) - (ENGINE_FX.plumeDry + 7.5)) < 1e-9,
+    `${plumeLength(1, 1)}`,
+  );
+  check("throttle is clamped, not extrapolated", plumeLength(4, 0) === plumeLength(1, 0));
+  check("opacity runs 0.25 -> 0.75 over the dry range",
+    plumeOpacity(0, 0) === 0.25 && Math.abs(plumeOpacity(1, 0) - 0.75) < 1e-12,
+    `${plumeOpacity(0, 0)} / ${plumeOpacity(1, 0)}`);
+  let opacityMonotonic = true;
+  let prevA = -Infinity;
+  for (let i = 0; i <= 200; i++) {
+    const v = plumeOpacity(i / 200, 0);
+    if (v < prevA - 1e-12) opacityMonotonic = false;
+    prevA = v;
+  }
+  check("and opacity is monotonic in throttle too", opacityMonotonic);
+
+  // THE BURNER FADES IN OVER 0.18 s. A hard cut reads as a bug, so the ring and
+  // the elongation share ONE weight and it is eased in both directions.
+  let w = 0;
+  const frames = Math.round(ENGINE_FX.ringFade / dt);
+  for (let i = 0; i < frames; i++) w = stepBurner(w, true, dt);
+  check("the burner weight reaches 1 after the fade window", Math.abs(w - 1) < 1e-9, `${w}`);
+  check("it is part-way in half-way through", stepBurner(0, true, ENGINE_FX.ringFade / 2) > 0.4);
+  check("it never overshoots", stepBurner(1, true, 10) === 1);
+  let down = 1;
+  for (let i = 0; i < frames; i++) down = stepBurner(down, false, dt);
+  check("and it eases back out rather than cutting", Math.abs(down) < 1e-9, `${down}`);
+  check("it never goes negative", stepBurner(0, false, 10) === 0);
+
+  // SHOCK DIAMONDS EXIST ONLY WITH THE BURNER LIT.
+  const dry = createEngineFx(NOZZLES);
+  for (let i = 0; i < 120; i++) dry.update(dt, { throttle: 1, afterburner: false });
+  const dryDiamonds = dry.sprites.filter((s) => s.kind === "diamond");
+  check("no diamonds at full dry power", dryDiamonds.every((s) => !s.visible));
+  check("and no burner ring either", dry.sprites.filter((s) => s.kind === "ring").every((s) => !s.visible));
+  check("but the plume is at its full dry length", Math.abs(dry.state.length - ENGINE_FX.plumeDry) < 1e-9);
+
+  const lit = createEngineFx(NOZZLES);
+  for (let i = 0; i < 120; i++) lit.update(dt, { throttle: 1, afterburner: true });
+  const litDiamonds = lit.sprites.filter((s) => s.kind === "diamond");
+  check("diamonds exist with the burner lit", litDiamonds.every((s) => s.visible));
+  check("all six of them", litDiamonds.length === 6);
+  check("the burner ring is in", lit.sprites.filter((s) => s.kind === "ring").every((s) => s.visible));
+  check(
+    "and the plume is elongated",
+    lit.state.length > dry.state.length + 7,
+    `${lit.state.length.toFixed(2)} vs ${dry.state.length.toFixed(2)}`,
+  );
+
+  // They sit INSIDE the plume, spaced 1.4 m along it, aft of the nozzle. Aft is
+  // +Z: the project's forward is -Z (§5), and a sign error here points the
+  // exhaust at the nose.
+  const oneSide = litDiamonds.filter((s) => s.nozzle === 0).sort((a, b) => a.slot - b.slot);
+  check(
+    "the diamonds are spaced 1.4 m apart",
+    Math.abs(oneSide[1].z - oneSide[0].z - ENGINE_FX.diamondSpacing) < 1e-9 &&
+      Math.abs(oneSide[2].z - oneSide[1].z - ENGINE_FX.diamondSpacing) < 1e-9,
+    `${oneSide.map((s) => s.z.toFixed(2)).join(", ")}`,
+  );
+  check(
+    "they are aft of the nozzle, not forward of it",
+    oneSide.every((s) => s.z > NOZZLES[0].z),
+  );
+  check(
+    "and inside the plume rather than past its end",
+    oneSide[2].z < NOZZLES[0].z + lit.state.length,
+    `${oneSide[2].z.toFixed(2)} vs ${(NOZZLES[0].z + lit.state.length).toFixed(2)}`,
+  );
+  check("every plume sprite is aft of its nozzle",
+    lit.sprites.filter((s) => s.kind === "plume").every((s) => s.z > NOZZLES[s.nozzle].z));
+  check("and laterally on its own nozzle",
+    lit.sprites.every((s) => s.x === NOZZLES[s.nozzle].x && s.y === NOZZLES[s.nozzle].y));
+
+  // The diamonds oscillate 0.35-0.7 at ~14 Hz. Sampled across a whole number of
+  // cycles, the extremes must be reached and nothing may leave the band.
+  const osc = createEngineFx(NOZZLES);
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < 600; i++) {
+    osc.update(1 / 600, { throttle: 1, afterburner: true });
+    if (osc.state.burner < 1) continue; // ignore the fade-in
+    const d = osc.sprites.find((s) => s.kind === "diamond" && s.slot === 0);
+    lo = Math.min(lo, d.opacity);
+    hi = Math.max(hi, d.opacity);
+  }
+  check(
+    "the diamonds oscillate across their whole band",
+    lo < ENGINE_FX.diamondLow + 0.02 && hi > ENGINE_FX.diamondHigh - 0.02,
+    `${lo.toFixed(3)} .. ${hi.toFixed(3)}`,
+  );
+  check(
+    "and never outside it",
+    lo >= ENGINE_FX.diamondLow - 1e-9 && hi <= ENGINE_FX.diamondHigh + 1e-9,
+    `${lo.toFixed(3)} .. ${hi.toFixed(3)}`,
+  );
+
+  // PRESENTATION RESETS, GAMEPLAY DOES NOT (§17.11): clear() takes the plume,
+  // and takes nothing else, because there is nothing else here to take.
+  lit.clear();
+  check("clear() hides every sprite", lit.sprites.every((s) => !s.visible && s.opacity === 0));
+  check("and drops the burner weight", lit.state.burner === 0);
+  check("and the pool survives it", lit.sprites.length === NOZZLES.length * per);
+  lit.update(dt, { throttle: 0.4, afterburner: false });
+  check("and the engine runs again after a clear", lit.state.length > ENGINE_FX.plumeIdle);
+}
 
 function testTargetContract() {
   // §5: the contract is load-bearing. Stage 8's SAM sites publish this same
@@ -5093,6 +5286,7 @@ const SUITES = [
   ["parked pose", testParkedPose],
   ["launch camera blend", testLaunchCameraBlend],
   ["the script owns the aircraft", testLaunchOwnsTheAircraft],
+  ["the engine", testEngineFx],
   ["target contract", testTargetContract],
   ["lock progression", testLockProgression],
   ["lead solution", testLeadSolution],

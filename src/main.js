@@ -774,6 +774,9 @@ function step(now) {
       crashFlashEl.style.opacity = String(flash);
     }
     fx.renderCrash(crash);
+    // A destroyed aircraft has no exhaust: the plume is cleared rather than
+    // left running behind a tumbling wreck.
+    airframe?.clearEngineFx();
     rig.update(dt, state);
     world.update(dt, state);
     world.render();
@@ -1020,6 +1023,10 @@ function step(now) {
   fx.syncMissiles(missiles.rounds);
   fx.syncTracers(gun.tracers);
   fx.update(dt);
+  // The engine reads the SAME throttle and afterburner the HUD and the sound
+  // read, so the plume, the amber THR readout and the burner cue cannot
+  // disagree about what the aircraft is doing.
+  airframe?.updateEngineFx(dt, state, world.camera);
   updateDroneMesh();
   updateHostileMesh();
 
