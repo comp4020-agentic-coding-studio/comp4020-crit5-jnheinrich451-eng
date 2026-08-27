@@ -16,6 +16,14 @@ Every shipped model's licence text travels with it in
 | AIM-9 missile | CC-BY-4.0 | yes | no | yes |
 | NOMADS SAM system | CC-BY-4.0 | yes | no | yes |
 | F16-C Falcon | CC-BY-4.0 | yes | no | yes |
+| `gun.mp3` (M134, Freesound) | CC-BY-NC-4.0 | **no** | no | yes |
+
+The audio is listed in full further down; `gun.mp3` appears here because it is
+the one sound file whose licence constrains the project rather than merely
+permitting it. Everything else from Pixabay is unconditional, and seven files
+from a soundboard site carry no licence at all — recorded honestly under
+[Still open](#still-open-seven-files-from-voicemod-tuna) rather than left to
+look settled.
 
 The two newest are both plain CC-BY, so neither tightens the constraints below
 — those come entirely from the F-15E and the terrain.
@@ -129,38 +137,74 @@ cross-checked against `public/assets/audio/` and nothing is uncredited.
 | `lock-1.mp3`, `lock-2.mp3`, `lock-3.mp3` | [Voicemod Tuna 832d4f48](https://tuna.voicemod.net/sound/832d4f48-9e13-4f2a-93e8-051af86d4b9a) | yes |
 | `missile-1.mp3`, `missile-2.mp3` | [Voicemod Tuna bdb78af4](https://tuna.voicemod.net/sound/bdb78af4-7942-4b0a-8357-0649493ba828) | yes |
 | `missile-hit.mp3` | [Pixabay — "distant explosion" 90743](https://pixabay.com/sound-effects/film-special-effects-distant-explosion-90743/) | no |
-| `missile-launch.mp3` | Pixabay — [missile search](https://pixabay.com/sound-effects/search/missile/) | no |
-| `engine-start.mp3`, `engine-loop.mp3` | Pixabay — [jet-engine search](https://pixabay.com/sound-effects/search/jet-engine/) | yes |
-| `flyby.mp3` | Pixabay — [jet search](https://pixabay.com/sound-effects/search/jet/) | no |
-| `gun.mp3` | myinstants — [A-10 search](https://www.myinstants.com/en/search/?name=a10) | no |
-| `flares.mp3` | myinstants — [flares search](https://www.myinstants.com/en/search/?name=flares) | no |
+| `missile-launch.mp3` | Pixabay — [missile search](https://pixabay.com/sound-effects/film-special-effects-launching-missile-313226/) | no |
+| `engine-start.mp3`, `engine-loop.mp3` | Pixabay — [jet-engine search](https://pixabay.com/sound-effects/film-special-effects-jet-engine-starting-303626/) | yes |
+| `flyby.mp3` | Pixabay — [jet search](https://pixabay.com/sound-effects/film-special-effects-fighter-jet-behind-355465/) | no |
+| `gun.mp3` | Freesound — ["M134 Minigun Firing" by SoundFX.studio](https://freesound.org/people/SoundFX.studio/sounds/474125/), **CC-BY-NC 4.0** | yes — clipped |
+| `flares.mp3` | Pixabay — ["ROAD FLARE" 82168](https://pixabay.com/sound-effects/film-special-effects-road-flare-82168/), by frankelmedico | yes — clipped and sped up |
 
 The three Voicemod takes were edited into the multi-take cues the mix rotates
 through (`LOCK` x3, `MISSILE` x2), and the two engine files were edited into a
-start-up and a seamless loop.
+start-up and a seamless loop. `gun.mp3` is an 11.3 s recording clipped to a
+1.5 s loop; `flares.mp3` is a 12 s recording clipped AND sped up to 1.1 s,
+because a road flare igniting is a slower event than a dispenser thump.
 
-### Two things still open on this table
+### One row here has conditions attached
 
-**Six files point at a SEARCH PAGE rather than a specific asset.** A search URL
-does not identify a work or its creator, and the course asks for title, creator,
-source URL and licence per asset. Still needed:
+**`gun.mp3` is CC-BY-NC 4.0** — the only audio on this page whose licence asks
+for anything. Both conditions are met, and which is which is worth writing down:
 
-- from Pixabay: `missile-launch`, `engine-start`, `engine-loop`, `flyby` — the
-  asset URL carries the uploader's name, so these should be quick to recover
-  from browser history
-- from myinstants: `gun`, `flares`
+> "You are free to share (to copy, distribute and transmit) and to remix (to
+> adapt and modify) as long as you credit the author of the sound and do not use
+> the sound for commercial purposes."
 
-The other eight files — three Voicemod sounds and `missile-hit` — already point
-at a specific work and need nothing further.
+- **Credit** — SoundFX.studio, named in the table with a link to the original.
+  That naming *is* the attribution, which is why it lives in a file that travels
+  with the repository rather than in a commit message.
+- **Non-commercial** — already true of this project independently: the F-15E
+  model is CC-BY-NC-SA, so nothing here was ever releasable commercially.
 
-**myinstants is the one worth a second look.** Pixabay's Content License is
-permissive and Voicemod Tuna's uploads are intended for reuse, so those rows are
-low risk. myinstants is a user-upload soundboard with no per-clip licensing and
-a lot of its content is ripped from games and films — an A-10 cannon and a flare
-dispenser are exactly the kind of clip that tends to be. This repo goes public
-and gets deployed, so it is worth either finding those two on Pixabay instead or
-deciding deliberately to keep them. Confirm the terms rather than taking this
-paragraph as the finding.
+Everything sourced from Pixabay carries no such condition. The Pixabay Content
+License requires no attribution and permits modification and use in a game; the
+creators are named above because the course asks for a creator per asset, not
+because the licence compels it.
+
+### Why the gun and the flares were re-sourced
+
+Both were soundboard clips before — myinstants — and a soundboard grants no
+licence at all. It is built for Discord, not for redistribution, and these files
+are committed to this repository and copied into `dist/`, so this project *does*
+redistribute them. "Nobody has said no" is not "someone has said yes".
+
+The search for replacements made that concrete rather than theoretical. Two
+Voicemod Tuna candidates were checked first and rejected on the evidence of
+their own pages: the minigun one is titled "A-10 Thunderbolt GAU-8 sound (War
+Thunder)" and its uploader writes "This is the War Thunder GAU-8 sound effect,
+not mine", while the flare one is tagged `warthunder`. A documented rip from a
+commercial game is a worse position than an undocumented one, not a better one.
+
+The M134 also suits the aircraft better than the GAU-8 did. The GAU-8 is the
+A-10's gun; an F-15E carries an M61 Vulcan, and a 7.62 mm rotary is far closer
+to that buzzsaw than a 30 mm tank-killer is.
+
+### Still open: seven files from Voicemod Tuna
+
+`altitude`, `pull-up`, `lock-1/2/3` and `missile-1/2` come from Voicemod Tuna,
+which is the same kind of user-upload soundboard as myinstants and grants no
+licence either. Read page by page the picture is uneven rather than uniformly
+bad, and the difference matters:
+
+- `altitude` / `pull-up` — the uploader describes it as "an F-16 warning found
+  on youtube" and disclaims ownership. Known third-party origin.
+- `missile-1/2` — "F15 missile warnings to scare your friends playing dcs". No
+  source stated and no disclaimer: origin unknown.
+- `lock-1/2/3` — no description, no attribution, no disclaimer: origin unknown.
+
+Unknown is not the same as infringing and this page does not claim otherwise.
+It is recorded because a credits table that gives a source URL for every file
+implies the rights are settled, and for these seven they are not. Replacing them
+means finding four voice warnings that still read as cockpit audio, which is a
+real search — so this is a deliberate deferral, not an oversight.
 
 ## Libraries
 
