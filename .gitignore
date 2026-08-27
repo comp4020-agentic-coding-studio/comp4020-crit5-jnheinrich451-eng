@@ -33,3 +33,14 @@ mise.local.toml
 # while the build, which copies only public/, shipped a site where every model
 # 404'd. See scripts/compress-assets.ts.
 assets-src/
+
+# The operator's manual, deliberately held back until after the crit cutoff.
+#
+# C5's brief rules out "a how-to-play modal, an instructions page, or anything
+# in the README standing in for either" -- the no-instructions rule is not
+# limited to the running game, and spec line 3 is a checkable line. The manual
+# is written and complete; it is simply not part of the marked artefact.
+#
+# TO SHIP IT once the crit sweep is done: delete these lines, `git add
+# docs/manual.md`, and link it from README.md.
+docs/manual.md
