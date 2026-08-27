@@ -186,7 +186,8 @@ index.html        add #fade and the #complete screen
 ```
 
 **Runnable:** the full nine-phase mission completes.
-**Gate:** the transition table across every phase, floor and fallback; the
+**Gate:** the transition table across every phase and floor, and that no phase
+advances on time; the
 INTERCEPT/COASTLINE non-overlap; `bandFeature` using the weaker flank; zoning
 against a clustered field; three end-to-end runs (direct, combat ignored, one
 failure) each asserting COMPLETE and the phase order.
@@ -718,17 +719,38 @@ Nine phases, one pure transition function:
 DECK → LAUNCH → EGRESS → INTERCEPT → DEFENSIVE → TERRAIN → FINAL → EXTRACTION → COMPLETE
 ```
 
-| phase | advances on | floor | fallback |
-|---|---|---|---|
-| DECK | catapult fires | — | — |
-| LAUNCH | control handoff | — | — |
-| EGRESS | intercept waypoint reached | — | 30 s |
-| INTERCEPT | kill, or next region reached | 26 s (6 s after a kill) | 34 s |
-| DEFENSIVE | kill, magazine spent, or next region | 30 s (6 s after a kill) | 40 s |
-| TERRAIN | last of three inland legs | — | 66 s |
-| FINAL | seaward waypoint reached | — | 42 s |
-| EXTRACTION | recovery cinematic ends | — | 52 s to start |
-| COMPLETE | terminal | — | — |
+| phase | advances on | floor |
+|---|---|---|
+| DECK | catapult fires | — |
+| LAUNCH | control handoff | — |
+| EGRESS | intercept waypoint reached | — |
+| INTERCEPT | kill, or next region reached | 26 s (6 s after a kill) |
+| DEFENSIVE | kill, magazine spent, or next region | 30 s (6 s after a kill) |
+| TERRAIN | last of three inland legs | — |
+| FINAL | seaward waypoint reached | — |
+| EXTRACTION | recovery cinematic ends | — |
+| COMPLETE | terminal | — |
+
+**No phase advances on time.** There is one clock in the mission and it is the
+five-minute deadline below.
+
+Each phase used to carry its own time fallback as well. In play they were not a
+safety net, they were the normal path: TERRAIN's was 66 s for an inland route
+that is ~15 km — over 75 s at cruise before a single SAM is dodged — and FINAL's
+was 42 s for an 8 km leg. Both expired on every run, so RIDGE and SEAWARD
+advanced whether or not the player ever went there. A waypoint that arrives
+without being flown to is not a waypoint.
+
+The route is therefore strictly sequential, and two legs may share airspace
+without harm: PASS is reachable before SEAWARD and SEAWARD only after PASS,
+because a phase's legs are checked **in order** and only the current one counts.
+
+One consequence to keep: **a leg the player already flew through under an earlier
+phase counts immediately.** COASTLINE is authored twice at identical coordinates
+so one waterline can serve two consecutive encounters — INTERCEPT consumes it,
+and DEFENSIVE would otherwise inherit a waypoint kilometres behind the player and
+never end. Nav already skipped it; the trigger has to agree, or the two disagree
+and the phase stalls.
 
 ### The five-minute deadline
 
@@ -736,21 +758,24 @@ DECK → LAUNCH → EGRESS → INTERCEPT → DEFENSIVE → TERRAIN → FINAL →
 has closed and the run is lost — diegetically, enemy reinforcements arrive. The
 loss screen is the same furniture as the out-of-pilots one, with its own line.
 
-The deadline sits **above the worst-case fallback path** and must stay there:
-`sum(limit)` is 264 s and the closing cinematic brings the worst case to ~277 s.
-So you cannot be failed by the clock for ignoring combat or missing every
-waypoint — only for genuinely spending the time, by circling, fighting too long,
-or dying repeatedly. §10's no-soft-lock guarantee is unaffected, and the
-relationship is asserted rather than assumed.
-
 It is a **policy in the orchestrator reading one pure rule** (`missionExpired`),
 not a tenth phase: the transition table promotes phases and nothing else, and
 "the run is over" is a decision about the run (§4). MISSION only — a deadline in a
 sandbox mode would turn practice into a test (§11).
 
-**Every phase needs a time fallback.** No combination of missed shots or ignored
-enemies may soft-lock a sortie. Write two tests that fly the whole mission with a
-hostile that is never destroyed and never runs dry.
+**The deadline is what guarantees no soft-lock.** The rule that matters is that
+the run must always END; it does not have to end in a win. No combination of
+missed shots or ignored enemies can hang a sortie, because the clock closes it
+either way — and a run that never flies its route is now a LOSS rather than a
+free pass, which is what a losable game requires. Assert both halves: that such a
+run does not reach COMPLETE, and that the clock does run out. A phase machine
+that simply hangs satisfies the first on its own.
+
+The bar the route must clear is that flying every leg, at cruise, through both
+floors and the closing cinematic, finishes with room to spare — otherwise the
+deadline is not a stake, it is an impossibility. Measure it with the bot and keep
+the margin visible; a straight-line bot is a lower bound on the route, not a
+playtest.
 
 **The floors are required, not decorative.** Without them the combat phases end in
 about twelve seconds, because the terrain-entry volume that serves as their "next
@@ -906,8 +931,9 @@ respawn altitude   4000 m, fixed
 - **The loss screen mirrors the win screen** — same furniture, salmon instead of
   green — so a win and a loss read as the same kind of event. It carries the same
   summary rows and `R` / Enter restarts.
-- **The time fallbacks stay.** You still cannot lose on the clock and nothing
-  soft-locks; you can only run out of aircraft.
+- **There are two ways to lose, and the clock is one of them.** Running out of
+  pilots is the other. Nothing soft-locks — the deadline always closes the run —
+  but a sortie that is never flown home is failed rather than finished.
 
 **Lives are MISSION only.** FREE and PEACE are practice, and counting deaths in a
 sandbox turns it into a test.
@@ -1697,7 +1723,9 @@ Each of these describes a real failure. Violating one reproduces it.
    work with no special cases.
 9. **A latched direction stays latched.** Break directions, tumble axes and dodge
    signs are chosen once at entry; recomputing per frame oscillates to zero.
-10. **Every mission phase needs a time fallback.** No soft-locks.
+10. **The run must always end.** No soft-locks — but ending is not the same as
+    winning, and no phase may advance on a clock of its own. One deadline closes
+    the sortie; everything else is reached by flying to it.
 11. **Presentation resets, gameplay does not** — and the reverse: a phase
     transition clears tracers, not ammunition.
 12. **A respawn must be flyable.** Levelled, at cruise, above the ground *ahead*.
@@ -1753,8 +1781,8 @@ Target ~1400+ checks. What must be covered:
 - **Every pure rule** with a synthetic sampler: line of sight over a ridge, the
   band-feature score using the weaker flank, zoning against a clustered field,
   spawn clearance with ground ahead versus behind.
-- **Every transition table** across all states, floors, fallbacks and terminal
-  conditions.
+- **Every transition table** across all states, floors and terminal conditions,
+  including that no mission phase advances on time alone.
 - **The launch curve** against a numeric integral of itself, both inverses, the
   clamp path, and a full 60 Hz *and* 20 Hz sequence asserting one handoff, the
   release point, and the deck-edge → gear → handoff ordering.

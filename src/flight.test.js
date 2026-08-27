@@ -3993,19 +3993,38 @@ const makeTerrain = (f, half = 100) => {
   check("table: DECK waits for the catapult", T(P.DECK, 5, false) === P.DECK && T(P.DECK, 0.1, false, { strokeStarted: true }) === P.LAUNCH);
   check("table: LAUNCH waits for the handoff, not a timer", T(P.LAUNCH, 30, false, { strokeStarted: true }) === P.LAUNCH && T(P.LAUNCH, 1, false, { launchDone: true }) === P.EGRESS);
   check("table: EGRESS advances on arrival", T(P.EGRESS, 5, true) === P.INTERCEPT && T(P.EGRESS, 5, false) === P.EGRESS);
-  check("table: ...or on the fallback, so it cannot stall (§21)", T(P.EGRESS, MISSION.limit.EGRESS, false) === P.INTERCEPT);
 
   check("table: INTERCEPT holds for its floor even if the region is met", T(P.INTERCEPT, 5, true) === P.INTERCEPT);
   check("table: INTERCEPT ends on a kill without waiting out the floor (§23)", T(P.INTERCEPT, 8, false, { hostileAlive: false }) === P.DEFENSIVE);
   check("table: but a kill still gets a beat to land", T(P.INTERCEPT, 2, false, { hostileAlive: false }) === P.INTERCEPT);
-  check("table: ignoring combat entirely still advances (§51)", T(P.INTERCEPT, MISSION.limit.INTERCEPT, false) === P.DEFENSIVE);
+  check("table: ignoring combat entirely still advances, on the region (§51)", T(P.INTERCEPT, MISSION.floor.INTERCEPT, true) === P.DEFENSIVE);
 
   check("table: DEFENSIVE ends when the attack cycle is done (§25)", T(P.DEFENSIVE, MISSION.floor.DEFENSIVE, false, { hostileSpent: true }) === P.TERRAIN);
   check("table: ...but not before its floor", T(P.DEFENSIVE, 5, false, { hostileSpent: true }) === P.DEFENSIVE);
   check("table: DEFENSIVE also ends at the terrain volume", T(P.DEFENSIVE, MISSION.floor.DEFENSIVE, true) === P.TERRAIN);
-  check("table: and has a fallback of its own", T(P.DEFENSIVE, MISSION.limit.DEFENSIVE, false) === P.TERRAIN);
 
-  check("table: TERRAIN and FINAL advance on the last leg or the fallback", T(P.TERRAIN, 1, true) === P.FINAL && T(P.TERRAIN, MISSION.limit.TERRAIN, false) === P.FINAL && T(P.FINAL, 1, true) === P.EXTRACTION && T(P.FINAL, MISSION.limit.FINAL, false) === P.EXTRACTION);
+  check("table: TERRAIN and FINAL advance on the last leg", T(P.TERRAIN, 1, true) === P.FINAL && T(P.FINAL, 1, true) === P.EXTRACTION);
+
+  /**
+   * NO PHASE ADVANCES ON TIME. The per-phase fallbacks were removed after they
+   * turned out to be the normal path rather than a safety net: TERRAIN's was
+   * 66 s for a ~15 km inland route that takes over 75 s at cruise, so RIDGE and
+   * SEAWARD advanced on their own every run whether or not the player went
+   * there. Reported from play as "they are automatically achieved, even I am
+   * not here".
+   *
+   * Asserted by holding every phase at an absurd phaseTime with its condition
+   * unmet — §17.14, because "the mission completes" passes either way. What has
+   * to hold is that the clock alone moves nothing.
+   */
+  const stallable = [P.EGRESS, P.INTERCEPT, P.DEFENSIVE, P.TERRAIN, P.FINAL];
+  check(
+    "table: no phase advances on time alone — the clock moves nothing (§10)",
+    stallable.every((p) => T(p, 100000, false) === p),
+    stallable.filter((p) => T(p, 100000, false) !== p)
+  );
+  check("table: EXTRACTION does not start its cinematic on a timer either", T(P.EXTRACTION, 100000, false) === P.EXTRACTION);
+  check("table: the run still ends — the deadline is what ends it", missionExpired(MISSION.deadline, P.TERRAIN) === true);
   check("table: EXTRACTION waits for the cinematic, not the trigger", T(P.EXTRACTION, 200, true) === P.EXTRACTION && T(P.EXTRACTION, 1, false, { recoveryDone: true }) === P.COMPLETE);
   check("table: COMPLETE is terminal", T(P.COMPLETE, 999, true, { hostileAlive: false }) === P.COMPLETE);
   check("table: no phase promotes itself twice in one call", PHASE_ORDER.every((p) => PHASE_ORDER.indexOf(T(p, 0, false)) - PHASE_ORDER.indexOf(p) <= 1));
@@ -4044,25 +4063,49 @@ const makeTerrain = (f, half = 100) => {
   check("summary: the AIM-9 row is a pure count with no denominator", !rows[3].value.includes("/"), rows[3].value);
   check("summary: ground kills default to zero rather than undefined", missionSummary({ time: 0, kills: 0, aim9Fired: 0, aim9Loadout: 2, gunFired: 0 })[2].value === "0");
 
-  /* ---- the five-minute deadline ---- */
-  const fallbackSum = Object.values(MISSION.limit).reduce((a, b) => a + b, 0);
+  /* ---- the five-minute deadline: now the ONLY clock in the mission ---- */
   const recoveryCost = MISSION.recovery.handover + MISSION.recovery.hold + MISSION.recovery.fade;
   check("deadline: the sortie is capped at five minutes", MISSION.deadline === 300, MISSION.deadline);
+  check("deadline: and it is the only timer left — no phase carries its own", MISSION.limit === undefined, MISSION.limit);
   /**
-   * THE LOAD-BEARING RELATIONSHIP. The deadline must sit ABOVE the worst-case
-   * fallback path, or a player who ignores combat and misses every waypoint is
-   * failed by the clock for taking the path the fallbacks exist to guarantee —
-   * which inverts §10's no-soft-lock rule into a soft-loss rule.
+   * THE LOAD-BEARING RELATIONSHIP, restated for a route that must actually be
+   * flown. There are no fallbacks to sum any more, so the bar is the route
+   * itself: flying every leg, at cruise, through both floors and the closing
+   * cinematic, has to finish with room to spare. Otherwise the deadline is not
+   * a stake, it is an impossibility.
+   *
+   * The floors are the only guaranteed dead time — INTERCEPT and DEFENSIVE hold
+   * for 26 s and 30 s whatever the player does.
    */
-  check(
-    "deadline: every fallback firing in sequence still finishes inside it",
-    fallbackSum + recoveryCost < MISSION.deadline,
-    { fallbackSum, recoveryCost, deadline: MISSION.deadline }
-  );
-  check("deadline: ...with real margin, not by a hair", MISSION.deadline - (fallbackSum + recoveryCost) > 15, MISSION.deadline - (fallbackSum + recoveryCost));
-  // Each combat phase's fallback must still be later than its floor, or the
-  // floor can never be observed and the encounter has no minimum length.
-  check("deadline: the retuned fallbacks still clear their floors", MISSION.limit.INTERCEPT > MISSION.floor.INTERCEPT && MISSION.limit.DEFENSIVE > MISSION.floor.DEFENSIVE, [MISSION.limit.INTERCEPT, MISSION.floor.INTERCEPT, MISSION.limit.DEFENSIVE, MISSION.floor.DEFENSIVE]);
+  const floorCost = MISSION.floor.INTERCEPT + MISSION.floor.DEFENSIVE;
+  check("deadline: the mandatory floors and cinematic leave most of the clock for flying", floorCost + recoveryCost < MISSION.deadline * 0.3, { floorCost, recoveryCost, deadline: MISSION.deadline });
+
+  /**
+   * THE SORTIE IS NOW LOSABLE ON THE CLOCK, which is the whole point of taking
+   * the per-phase fallbacks out — C5's brief asks for a game that can be lost.
+   *
+   * Before, a player who stopped flying was carried to COMPLETE by six timers
+   * firing in sequence. Now nothing advances without them, so the run ends at
+   * the deadline as a failure. Both halves are asserted: that it does NOT
+   * finish, and that the clock does run out — a phase machine that simply
+   * hangs would satisfy the first on its own.
+   */
+  {
+    const d = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+    d.setRoute(planRoute({ coastZ: -7600, features: [] }));
+    d.reset();
+    const pos = { x: 0, y: 600, z: -1546 };
+    const dt = 1 / 5;
+    let t = 0;
+    // Fly the launch, then park: the aircraft is airborne and going nowhere.
+    while (t < 400 && d.state.phase !== MissionPhase.COMPLETE) {
+      t += dt;
+      d.update({ position: pos, strokeStarted: t >= 1.7, launchDone: t >= 5.42, hostileAlive: true, hostileSpent: false }, dt);
+    }
+    check("deadline: a player who never flies the route does NOT reach COMPLETE", d.state.phase !== MissionPhase.COMPLETE, d.state.phase);
+    check("deadline: ...they run out of clock instead, and the run is lost", missionExpired(d.state.missionTime, d.state.phase) === true, Math.round(d.state.missionTime));
+    check("deadline: and the phase machine stalls where the player stopped, not at the end", d.state.phase === MissionPhase.EGRESS, d.state.phase);
+  }
 
   check("deadline: not expired before it", missionExpired(299.9, MissionPhase.FINAL) === false);
   check("deadline: expired at it", missionExpired(300, MissionPhase.FINAL) === true);
@@ -4328,15 +4371,15 @@ const SKIPPED_ROUTE = [
 const skippedRoute = () => planRoute({ coastZ: -7600, features: SKIPPED_ROUTE });
 const legNamed = (name) => skippedRoute().find((l) => l.name === name);
 
-/** A director walked to TERRAIN with PASS behind it, then placed at `position`. */
-function terrainDirectorAt(position) {
+/** Fly the bot along the published route until `phase`, then place it at `at`. */
+function directorAt(phase, at) {
   const d = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
   d.setRoute(skippedRoute());
   d.reset();
   const pos = { x: 0, y: 600, z: -1546 };
   const dt = 1 / 20;
   let t = 0;
-  while (t < 300 && d.state.phase !== MissionPhase.TERRAIN) {
+  while (t < 600 && d.state.phase !== phase) {
     t += dt;
     const m = d.state;
     if (m.navValid && d.playerFlies) {
@@ -4348,8 +4391,8 @@ function terrainDirectorAt(position) {
     } else if (d.playerFlies) pos.z -= 190 * dt;
     d.update({ position: pos, strokeStarted: t >= 1.7, launchDone: t >= 5.42, hostileAlive: t < 40, hostileSpent: t >= 95 }, dt);
   }
-  Object.assign(pos, position);
-  return { d, pos, dt };
+  if (at) Object.assign(pos, at);
+  return { d, pos, dt, t };
 }
 
 const holdStep = (d, pos, dt) =>
@@ -4364,44 +4407,25 @@ const holdStep = (d, pos, dt) =>
     Math.round(flatDistanceTo(pass.position, seaward.position))
   );
 
-  // Where respawnFromCrash() puts the aircraft after a kill between PASS and
-  // VALLEY: 1800 m back along the heading of travel, at the 4000 m floor.
-  const spawn = { x: 300, y: 4000, z: -8909 };
-  check(
-    "respawn: and the crash retreat lands inside that volume",
-    flatDistanceTo(spawn, seaward.position) < seaward.radius,
-    Math.round(flatDistanceTo(spawn, seaward.position))
-  );
+  // FINAL, with SEAWARD as the live waypoint, and the aircraft shot down on the
+  // way to it. `respawnFromCrash` backs it 1800 m along its heading of travel,
+  // which around here lands it inside the volume it was flying towards.
+  const spawn = { x: seaward.position.x + 300, y: 4000, z: seaward.position.z + 700 };
+  check("respawn: the retreat lands inside the volume being flown to", flatDistanceTo(spawn, seaward.position) < seaward.radius, Math.round(flatDistanceTo(spawn, seaward.position)));
 
-  const { d, pos, dt } = terrainDirectorAt(spawn);
-  check("respawn: the director is still in TERRAIN when the aircraft is placed", d.state.phase === MissionPhase.TERRAIN, d.state.phase);
+  const { d, pos, dt } = directorAt(MissionPhase.FINAL, spawn);
+  const reached = [];
+  d.on("leg", ({ leg }) => reached.push(leg.name));
+  check("respawn: the director is in FINAL when the aircraft is placed", d.state.phase === MissionPhase.FINAL, d.state.phase);
   d.notifyPlaced(pos);
 
-  // Hold still, as a player getting their bearings does, long enough for
-  // TERRAIN's 98 s fallback to expire and hand the mission to FINAL.
-  const seen = [];
-  let prev = null;
-  let t = 0;
-  while (t < 130 && d.state.phase !== MissionPhase.COMPLETE) {
-    t += dt;
-    holdStep(d, pos, dt);
-    const k = `${d.state.phase}/${d.state.navName}`;
-    if (k !== prev) {
-      seen.push(k);
-      prev = k;
-    }
-    if (d.state.phase === MissionPhase.FINAL && t > 60) break;
-  }
-  check("respawn: FINAL is reached, not skipped past", seen.some((k) => k.startsWith(MissionPhase.FINAL)), seen);
-  check(
-    "respawn: and SEAWARD is PUBLISHED, not satisfied by the placement (§17.14)",
-    d.state.phase === MissionPhase.FINAL && d.state.navName === "SEAWARD",
-    [d.state.phase, d.state.navName]
-  );
-  check("respawn: EXTRACTION is not entered on FINAL's own entry frame", !seen.includes(`${MissionPhase.EXTRACTION}/RECOVERY`), seen);
-}
+  // Sit still, as a player getting their bearings does. Nothing advances on a
+  // clock any more, so anything that moves here moved for a reason.
+  for (let i = 0; i < 20 * 30; i++) holdStep(d, pos, dt);
+  check("respawn: standing in SEAWARD does not satisfy it (§17.14)", !reached.includes("SEAWARD"), reached);
+  check("respawn: so the phase does not advance either", d.state.phase === MissionPhase.FINAL, d.state.phase);
+  check("respawn: and SEAWARD is still PUBLISHED as the thing to fly to", d.state.navName === "SEAWARD", d.state.navName);
 
-{
   // The waypoint is SUSPENDED, not destroyed: leaving and flying back in counts.
   //
   // Asserted on the `leg` EVENT rather than on state.legDone. Satisfying FINAL's
@@ -4409,13 +4433,6 @@ const holdStep = (d, pos, dt) =>
   // into EXTRACTION recomputes legDone against ITS legs -- so legDone reads
   // false again one line later and a check written on it fails while the code is
   // working. The event is the record of the fact; the flag is a phase's status.
-  const seaward = legNamed("SEAWARD");
-  const { d, pos, dt } = terrainDirectorAt({ x: 300, y: 4000, z: -8909 });
-  const reached = [];
-  d.on("leg", ({ leg }) => reached.push(leg.name));
-  d.notifyPlaced(pos);
-  for (let i = 0; i < 20 * 130 && d.state.phase !== MissionPhase.FINAL; i++) holdStep(d, pos, dt);
-  check("respawn: SEAWARD starts unsatisfied", d.state.phase === MissionPhase.FINAL && !reached.includes("SEAWARD"), [d.state.phase, reached]);
   pos.x = seaward.position.x;
   pos.z = seaward.position.z + 5000;
   holdStep(d, pos, dt);
@@ -4423,6 +4440,7 @@ const holdStep = (d, pos, dt) =>
   pos.z = seaward.position.z;
   holdStep(d, pos, dt);
   check("respawn: arriving at it counts — the waypoint was suspended, not lost", reached.includes("SEAWARD"), reached);
+  check("respawn: and only then does EXTRACTION follow", d.state.phase === MissionPhase.EXTRACTION, d.state.phase);
 }
 
 {
@@ -4453,6 +4471,7 @@ const holdStep = (d, pos, dt) =>
     if (d.state.navName && navs[navs.length - 1] !== d.state.navName) navs.push(d.state.navName);
   }
   check("no stall: an undisturbed run on the same route still completes", d.state.phase === MissionPhase.COMPLETE, d.state.phase);
+  check("no stall: and it finishes with most of the five minutes still unspent", d.state.missionTime < MISSION.deadline * 0.7, Math.round(d.state.missionTime));
   check(
     "no stall: and every waypoint is still published on the way",
     JSON.stringify(navs) === JSON.stringify(["COAST", "INTERCEPT", "COASTLINE", "PASS", "VALLEY", "RIDGE", "SEAWARD", "RECOVERY"]),

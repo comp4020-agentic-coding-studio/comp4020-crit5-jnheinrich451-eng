@@ -50,35 +50,38 @@ export const PHASE_ORDER = [
 export const MISSION = {
   title: "VECTOR",
 
-  /**
-   * §21/§23/§25 — every phase has a generous fallback. These are not the
-   * intended path; they are the guarantee that no combination of missed shots,
-   * ignored enemies or aimless flying can soft-lock the sortie (§51).
-   *
-   * RETUNED so the whole worst case fits inside the five-minute deadline below.
-   * They used to sum to 392 s (6:32), which is longer than the deadline — so a
-   * passive player would have been failed by the clock for taking the path the
-   * fallbacks exist to guarantee, which is the opposite of their purpose. They
-   * now sum to 264 s, and the closing cinematic brings the worst case to about
-   * 280 s: still under 300, with the margin as the whole point.
-   *
-   * Keep that relationship whenever these change. `sum(limit) + recovery` must
-   * stay comfortably below `deadline`, or ignoring combat becomes a loss.
-   */
-  limit: { EGRESS: 30, INTERCEPT: 34, DEFENSIVE: 40, TERRAIN: 66, FINAL: 42, EXTRACTION: 52 },
 
   /**
-   * The sortie's hard deadline, in seconds of mission clock (5:00).
+   * THE ONLY CLOCK IN THE MISSION, and the only way to lose to one (5:00 of
+   * mission time, which starts at catapult release and stops at COMPLETE — the
+   * scripted launch is outside it).
    *
-   * The clock starts at catapult release and stops at COMPLETE, so the scripted
-   * launch is outside it. Past this the recovery window has closed and the run is
-   * lost — diegetically, enemy reinforcements arrive.
+   * Every phase used to carry its own time fallback as well, so that no missed
+   * shot or ignored enemy could soft-lock a sortie. They were removed, because
+   * in play they were not a safety net, they were the normal path:
    *
-   * This is the one way to lose on the clock, and it is deliberately set ABOVE
-   * the worst-case fallback path: you cannot reach it by ignoring combat or
-   * missing every waypoint, only by genuinely spending the time — circling,
-   * fighting too long, or dying repeatedly. §10's no-soft-lock guarantee is
-   * unaffected.
+   *   TERRAIN's fallback was 66 s. Flying PASS -> VALLEY -> RIDGE is ~15 km,
+   *   over 75 s at cruise before a single SAM is dodged. FINAL's was 42 s for
+   *   an 8 km leg. Both expired every run, so RIDGE and SEAWARD advanced on
+   *   their own whether or not the player ever went there — reported from play
+   *   as "they are automatically achieved, even I am not here".
+   *
+   * A waypoint that arrives without being flown to is not a waypoint. So phases
+   * now advance ONLY on their own condition — a kill, a magazine, a volume
+   * actually entered — and the route is strictly sequential: PASS is reachable
+   * before SEAWARD and SEAWARD only after PASS, whatever airspace they share,
+   * because a phase's legs are checked in order and only the current one counts.
+   *
+   * §10's guarantee is kept, by a different mechanism. The invariant it was
+   * written to protect is "no combination of missed shots or ignored enemies may
+   * SOFT-LOCK a sortie" — the run must always end. It always does: past this
+   * deadline the recovery window has closed and the run is lost, diegetically to
+   * enemy reinforcements. What changed is that the ending can now be a LOSS
+   * rather than a free pass, which is what C5's brief asks for in the first
+   * place — a game has to be losable.
+   *
+   * The cost, stated: a slow or unlucky player can now run out of clock where
+   * before they were carried to COMPLETE. That is the intent.
    */
   deadline: 300,
   /**
@@ -511,26 +514,24 @@ export function missionTransition(m, ctx, cfg = MISSION) {
     case P.LAUNCH:
       return ctx.launchDone ? P.EGRESS : P.LAUNCH;
     case P.EGRESS:
-      // §21 — arriving advances it; a timer only rescues a player who never does.
-      return m.legDone || t >= cfg.limit.EGRESS ? P.INTERCEPT : P.EGRESS;
+      // §21 — arriving advances it. Nothing else does.
+      return m.legDone ? P.INTERCEPT : P.EGRESS;
     case P.INTERCEPT:
-      // §23 — a kill, or reaching the next region, or a fallback. Never "destroy
-      // the hostile" alone: two missed AIM-9s must not end the mission.
+      // §23 — a kill, or reaching the next region. Never "destroy the hostile"
+      // alone: two missed AIM-9s must not end the mission.
       if (!ctx.hostileAlive && t >= cfg.floor.kill) return P.DEFENSIVE;
       if (t < cfg.floor.INTERCEPT) return P.INTERCEPT;
-      if (m.legDone || t >= cfg.limit.INTERCEPT) return P.DEFENSIVE;
-      return P.INTERCEPT;
+      return m.legDone ? P.DEFENSIVE : P.INTERCEPT;
     case P.DEFENSIVE:
       // §25 — a kill, a completed attack cycle (magazine gone and nothing in the
-      // air), the terrain-entry volume, or the fallback.
+      // air), or the terrain-entry volume.
       if (!ctx.hostileAlive && t >= cfg.floor.kill) return P.TERRAIN;
       if (t < cfg.floor.DEFENSIVE) return P.DEFENSIVE;
-      if (ctx.hostileSpent || m.legDone || t >= cfg.limit.DEFENSIVE) return P.TERRAIN;
-      return P.DEFENSIVE;
+      return ctx.hostileSpent || m.legDone ? P.TERRAIN : P.DEFENSIVE;
     case P.TERRAIN:
-      return m.legDone || t >= cfg.limit.TERRAIN ? P.FINAL : P.TERRAIN;
+      return m.legDone ? P.FINAL : P.TERRAIN;
     case P.FINAL:
-      return m.legDone || t >= cfg.limit.FINAL ? P.EXTRACTION : P.FINAL;
+      return m.legDone ? P.EXTRACTION : P.FINAL;
     case P.EXTRACTION:
       return ctx.recoveryDone ? P.COMPLETE : P.EXTRACTION;
     case P.COMPLETE:
@@ -875,7 +876,30 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
 
     if (!state.legDone && legs.length) {
       const leg = legs[state.legIndex];
-      const inside = insideTrigger(leg, ctx.position);
+      /**
+       * A POINT ALREADY FLOWN THROUGH COUNTS, and does not have to be flown
+       * through twice.
+       *
+       * COASTLINE is authored twice on purpose, at identical coordinates, so one
+       * waterline can serve as the "next region" for two consecutive encounters
+       * (§19). INTERCEPT consumes it first; DEFENSIVE then inherits a waypoint
+       * that is BEHIND the player, several kilometres back out to sea.
+       *
+       * `publishNav` already skipped it — that is what "navigation falls forward"
+       * above is for — so nav pointed inland at PASS while the trigger sat
+       * waiting on a volume the player was flying away from. The two disagreed,
+       * and only DEFENSIVE's 40 s time fallback hid it. Removing the fallbacks
+       * turned that disagreement into a hard stall: the phase could never end,
+       * and the sortie ran to the deadline and was lost.
+       *
+       * So the trigger now reads the same `satisfied` set nav does. This is not
+       * a free pass: the key is name-and-position, so it fires only for a point
+       * the player genuinely flew through under an earlier phase. Every leg with
+       * its own coordinates — PASS, VALLEY, RIDGE, SEAWARD, RECOVERY — still has
+       * to be reached, in order, exactly once.
+       */
+      const alreadyFlown = satisfied.has(legKey(leg));
+      const inside = alreadyFlown || insideTrigger(leg, ctx.position);
       // Arms on the way OUT: a leg the aircraft was placed inside becomes
       // available again the moment it is left, so flying back in still counts.
       if (!armed && !inside) armed = true;
@@ -896,7 +920,11 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
     // starts the closing sequence. It is a sub-state of EXTRACTION rather than a
     // tenth phase: the enum in §3 is the contract.
     if (state.phase === MissionPhase.EXTRACTION) {
-      if (!state.recovering && (state.legDone || state.phaseTime >= cfg.limit.EXTRACTION)) {
+      // Reaching the recovery volume is the ONLY thing that starts the closing
+      // sequence. There is no "start it anyway" timer: a sortie that is never
+      // flown home is not a sortie that finishes itself, it is one the deadline
+      // ends as a loss.
+      if (!state.recovering && state.legDone) {
         state.recovering = true;
         state.recoveryTime = 0;
       }
