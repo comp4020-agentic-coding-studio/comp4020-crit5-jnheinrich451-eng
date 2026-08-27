@@ -35,7 +35,9 @@ import {
 import { createFlares } from "./flares.js";
 import { createRearm } from "./rearm.js";
 import { MISSION, createSandbox, nextMode, rulesFor } from "./modes.js";
-import { quatForward } from "./flight.js";
+import { createCrashFx, respawnFrom } from "./crash-fx.js";
+import { CUES, createAudio, groundWarning, isFlyby } from "./audio.js";
+import { quatForward, quatFromEulerYXZ } from "./flight.js";
 import { buildTerrainIndex, createPhysics } from "./physics.js";
 import { benchmarkIndex } from "./physics-benchmark.js";
 import { createDevelopmentRecovery, createMissionCheckpointResponse } from "./collision.js";
@@ -171,6 +173,7 @@ const missiles = createMissileSystem({
 
 function onKill(target) {
   fx.burst(target.position, 46);
+  audio.play("MISSILE_HIT");
   mission?.noteKill(target.label === "SAM" ? "sam" : "air");
   // Clearing the lock on a kill is what stops the bracket sitting on a corpse.
   targeting.clear();
@@ -193,6 +196,13 @@ const completeRows = document.getElementById("complete-rows");
 
 // Deploy the stage-6 hostile per phase (§7). One instance, three encounters.
 let mode = MISSION;
+const crash = createCrashFx();
+const audio = createAudio();
+const crashFlashEl = document.getElementById("crash-flash");
+let lives = rulesFor(MISSION).lives;
+let lost = false;
+let flybyRange = Infinity;
+let engineStarted = false;
 const sandbox = createSandbox();
 const flares = createFlares();
 const rearm = createRearm({
@@ -273,11 +283,25 @@ function installPolicies() {
   policies = [
     // The SHIPPED policy: a collision fails the run and restores a checkpoint.
     createMissionCheckpointResponse({
-      onFail: () => {
-        message = "MISSION FAILED";
-        messageUntil = clock + 2.2;
+      onFail: (event) => {
+        // The policy's HOLD is the crash window -- no second state machine.
+        crash.start({
+          reason: event.type === "ocean" ? "ocean" : event.type,
+          position: state.position,
+          velocity: {
+            x: quatForward(state.quat).x * state.speed,
+            y: quatForward(state.quat).y * state.speed,
+            z: quatForward(state.quat).z * state.speed,
+          },
+          quat: state.quat,
+          seed: crash.state.crashes + 1,
+        });
+        rig.addShake(crash.state.kick, 5.5);
+        audio.stopLoop("GUN");
+        audio.stopLoop("ENGINE_LOOP");
+        audio.play("MISSILE_HIT");
       },
-      onRestore: () => restoreCheckpoint(),
+      onRestore: () => respawnAfterCrash(),
       onFade: (v) => {
         if (fadeEl) fadeEl.style.opacity = String(v);
       },
@@ -290,6 +314,79 @@ function installPolicies() {
     }),
   ];
   physics.setPolicy(policies[policyIndex]);
+}
+
+/**
+ * The respawn, computed from WHERE THE PLAYER DIED rather than from a stored
+ * checkpoint.
+ *
+ * AN AIRBORNE DEATH MUST NOT GO THROUGH A CHECKPOINT REWIND (§15). A rewind
+ * restores a checkpoint's position AND PHASE, and if the phase checkpoint was
+ * never captured it falls back to the deck one -- flipping the phase to DECK
+ * and handing the aircraft to the launch script. Progression (stores, stats)
+ * is restored; position and phase are not touched.
+ */
+function respawnAfterCrash() {
+  // A PILOT IS SPENT AT THE RESTORE, not at the impact: the number is what the
+  // player has left to FLY, so it drops when the replacement is dispatched.
+  const rules = rulesFor(mode);
+  if (rules.lives !== null) {
+    lives = Math.max(0, lives - 1);
+    if (lives === 0) {
+      lost = true;
+      showComplete(true);
+      crash.finish();
+      return;
+    }
+    message = "A NEW PILOT IS NOW DEPLOYED TO YOUR LOCATION";
+    messageUntil = clock + 3.2;
+  }
+
+  const spawn = respawnFrom(
+    crash.state.position,
+    state.heading,
+    (x, z) => physics.groundAt(x, z),
+  );
+  state.position.x = spawn.position.x;
+  state.position.y = spawn.position.y;
+  state.position.z = spawn.position.z;
+  state.pitch = 0;
+  state.bank = 0;
+  state.sink = 0;
+  state.speed = spawn.speed;
+  state.quat = quatFromEulerYXZ(state.heading, 0, 0);
+
+  // VERIFY THE RESPAWN AS A POST-CONDITION. The altitude is a floor on
+  // ABSOLUTE altitude, so ending up in the sea should be impossible -- it was
+  // reported anyway at a lower floor, which means another writer can touch the
+  // transform afterwards. Raising the floor would hide that; this names it.
+  const clearanceNow =
+    state.position.y - physics.groundAt(state.position.x, state.position.z);
+  if (clearanceNow < 200) {
+    console.error(
+      `respawn post-condition FAILED: only ${clearanceNow.toFixed(0)} m of ` +
+        `clearance at (${state.position.x.toFixed(0)}, ${state.position.z.toFixed(0)}) ` +
+        `-- something wrote the transform after the respawn`,
+    );
+  }
+
+  // Progression only. Stores and stats, never position or phase.
+  const cp = mission?.latestCheckpoint();
+  if (cp) {
+    weapon = cp.weapon;
+    weapons?.setCount(cp.missiles);
+    gun.setRounds(cp.gunRounds);
+  }
+  missiles.expireOwner("hostile");
+  missiles.expireOwner("sam");
+  gun.clearFx();
+  threatMonitor.reset();
+  damage.reset();
+  evasion.reset();
+  flares.reset();
+  physics.reset(state, { keepPolicy: true });
+  rig.reset(state);
+  crash.finish();
 }
 
 /**
@@ -385,6 +482,13 @@ function restartSortie() {
   if (completeEl) completeEl.hidden = true;
   if (fadeEl) fadeEl.style.opacity = "0";
   policies.forEach((p) => p.resetAll?.() ?? p.reset?.());
+  crash.reset();
+  audio.reset();
+  engineStarted = false;
+  flybyRange = Infinity;
+  lives = rulesFor(mode).lives;
+  lost = false;
+  if (crashFlashEl) crashFlashEl.style.opacity = "0";
   flares.resetAll();
   rearm.reset();
   sandbox.resetAll();
@@ -493,7 +597,7 @@ function onPhaseChange(to, from) {
   if (to === COMPLETE) showComplete();
 }
 
-function showComplete() {
+function showComplete(failed = false) {
   if (!completeEl || !completeRows) return;
   const s = mission.mission.stats;
   const rows = [
@@ -510,6 +614,13 @@ function showComplete() {
     const dd = document.createElement("dd");
     dd.textContent = v;
     completeRows.append(dt, dd);
+  }
+  const title = document.getElementById("complete-title");
+  if (title) {
+    // THE LOSS SCREEN MIRRORS THE WIN SCREEN -- same furniture, salmon instead
+    // of green -- so a win and a loss read as the same KIND of event.
+    title.textContent = failed ? "MISSION FAILED" : "SORTIE COMPLETE";
+    title.style.color = failed ? "var(--salmon)" : "var(--green)";
   }
   completeEl.hidden = false;
 }
@@ -567,6 +678,8 @@ window.addEventListener("keydown", (event) => {
     rig.reset(state);
   }
   if (event.code === "KeyP" && physicsDebug) physicsDebug.toggle();
+  audio.arm(); // NOTHING PLAYS BEFORE A USER GESTURE
+  if (event.code === "KeyK") audio.setMuted(!audio.isMuted());
   if (event.code === "KeyJ") hud.setVisible(!hud.isVisible());
   if (event.code === "KeyT") {
     // T cycles AND restarts: every mode starts on the deck, and half a mission
@@ -629,6 +742,45 @@ function step(now) {
     // a branch that skips physics and forgets this freezes the game.
     physics.getPolicy()?.tick(dt);
   }
+  // ── the crash: a THIRD OWNER of the aircraft transform ─────────────────
+  //
+  // physics.update() is SKIPPED during a crash -- a destroyed aircraft runs no
+  // collision queries -- so the failure policy must be ticked explicitly here,
+  // or it sits in `hold` forever, the fade never starts and the respawn never
+  // comes.
+  //
+  // And the flag is RE-READ AFTER the tick. The tick is what fires the
+  // restore, which ends the crash and repositions the aircraft; a flag
+  // captured before it is stale, and the crash branch then copies the wreck's
+  // transform straight back over the fresh respawn -- putting the player back
+  // inside the terrain they were just lifted out of.
+  if (crash.state.active) {
+    crash.update(dt);
+    physics.getPolicy()?.tick(dt);
+    // Consume and DROP the discrete latches, so a trigger pull mid-explosion
+    // does not fire on the respawn frame.
+    input.dropLatches();
+    if (crash.state.active) {
+      state.position.x = crash.state.position.x;
+      state.position.y = crash.state.position.y;
+      state.position.z = crash.state.position.z;
+      state.quat = { ...crash.state.quat };
+      rig.blend("crash", CRASH_VIEW, Math.min(1, crash.state.t / 0.35));
+    } else {
+      rig.blend("crash", CRASH_VIEW, 0);
+    }
+    if (crashFlashEl) {
+      const flash = crash.state.t < 0.15 ? 0.5 * (1 - crash.state.t / 0.15) : 0;
+      crashFlashEl.style.opacity = String(flash);
+    }
+    fx.renderCrash(crash);
+    rig.update(dt, state);
+    world.update(dt, state);
+    world.render();
+    return;
+  }
+  fx.renderCrash(crash);
+
   const scripted = held ? true : (launch?.update(dt, state) ?? false);
   if (scripted) {
     // §9: no flight physics runs during the launch, and §17.4 -- a branch that
@@ -688,6 +840,9 @@ function step(now) {
     state.quat.w,
   );
 
+  // ── audio ──────────────────────────────────────────────────────────────
+  audio.tick(dt);
+
   // ── combat ─────────────────────────────────────────────────────────────
   clock += dt;
   drone.update(dt);
@@ -733,6 +888,8 @@ function step(now) {
         speed: state.speed,
         target: track.currentTarget,
       });
+      audio.play("MISSILE_LAUNCH");
+      mission?.mission && mission.mission.stats.missilesFired++;
       message = "MISSILE AWAY";
       messageUntil = clock + 1.6;
     }
@@ -802,6 +959,7 @@ function step(now) {
   // ── flares ─────────────────────────────────────────────────────────────
   if (!scripted && input.consumeLatch("flares")) {
     if (flares.dispense(state, forward, clock) > 0) {
+      audio.play("FLARES", { force: true });
       message = "FLARES";
       messageUntil = clock + 1.1;
     }
@@ -897,6 +1055,8 @@ function step(now) {
     });
   }
 
+  driveAudio(dt, t, scripted);
+
   world.render();
 
   railClock += dt;
@@ -909,6 +1069,9 @@ function step(now) {
 const NEUTRAL_STICK = { x: 0, y: 0, roll: 0, throttle: 0 };
 // A fourth blended composition (§7). Never a second camera.
 const RECOVERY_VIEW = { standoff: 44, height: 13, framingY: -0.1, lagScale: 1.5 };
+// Looser, so the rig TRAILS the tumbling aircraft and the fire, smoke and
+// debris are watchable rather than pressed against the lens.
+const CRASH_VIEW = { standoff: 34, height: 9, framingY: -0.12, lagScale: 0.34 };
 // Level out, turn home, settle, hold 4.4 s, fade 1.5 s. No touchdown is shown:
 // the player has already demonstrated skill and landing must not become
 // another test.
@@ -948,6 +1111,8 @@ function paintRail(axes) {
     `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
     `WEAPON    ${weapon}   AIM-9 ${weapons ? weapons.count : "--"}   GUN ${gun.rounds}`,
     `HOSTILE   ${hostile.isActive() ? hostile.ai.state + " ammo " + hostile.ai.ammo : "off"}  threat ${threat || "--"}`,
+    `LIVES     ${lives === null ? "--" : lives}${lost ? "  LOST" : ""}  crashes ${crash.state.crashes}`,
+    `AUDIO     ${audio.isArmed() ? (audio.isMuted() ? "muted" : "armed") : "waiting for a gesture"}  missing ${audio.missingCues().length}`,
     `MODE      ${mode}  sams ${sams.liveSites().length}/${sams.sites.length}  flares ${flares.remaining}`,
     `REARM     ${rearm.active().length ? rearm.active().map((n) => `${n} ${rearm.remaining(n).toFixed(0)}s`).join("  ") : "--"}`,
     `EVADE     ${evasion.isRolling() ? "ROLLING" : "--"}  defeated ${evasion.defeatedCount()}  hits ${damage.hitsTaken()}`,
@@ -1121,9 +1286,70 @@ function updateHostileMesh() {
   hostileMesh.material.emissive.setRGB(flash, flash * 0.4, 0);
 }
 
+/**
+ * Warnings are driven from THE THREAT MONITOR'S OWN ESCALATION, not a second
+ * set of conditions, so the sound and the HUD cannot disagree.
+ */
+function driveAudio(dt, threatState, scripted) {
+  if (!audio.isArmed()) return;
+
+  // THE ENGINE LOOP MUST NOT RUN DURING THE DECK PHASE. The start-up plays
+  // alone while the aircraft shakes in place, and is fired ONCE FROM A FLAG,
+  // not every frame governed by its minInterval -- an interval floor is a rate
+  // limiter, and a clip meant to run to its end once will retrigger mid-play
+  // as soon as the dwell exceeds the interval.
+  if (launch && !launch.hasHandedOff()) {
+    if (!engineStarted) {
+      engineStarted = true;
+      audio.play("ENGINE_START", { force: true });
+    }
+    if (launch.elapsed() >= launch.plan.fireAt) {
+      audio.stop("ENGINE_START");
+      audio.startLoop("ENGINE_LOOP", 0.6);
+    }
+    return;
+  }
+
+  if (state.throttle > 0.02) audio.startLoop("ENGINE_LOOP", 0.5 + state.throttle * 0.5);
+  else audio.stopLoop("ENGINE_LOOP");
+
+  if (!scripted && weapon === "GUN" && input.isFiring() && !gun.isEmpty()) {
+    audio.startLoop("GUN");
+  } else {
+    audio.stopLoop("GUN");
+  }
+
+  if (threatState.level === "LOCK") audio.play("LOCK");
+  else if (threatState.level === "MISSILE") audio.play("MISSILE");
+
+  const warn = groundWarning({
+    agl: physics.telemetry.agl,
+    forwardHazard: physics.telemetry.forwardHazard,
+    sink: state.sink,
+    speed: state.speed,
+  });
+  if (warn) audio.play(warn);
+
+  // The FLY-BY fires once per pass: a range that crossed the threshold THIS
+  // FRAME plus real closure, so a slow drift past is not a fly-by and a
+  // circling hostile does not retrigger.
+  if (hostile.isActive() && hostile.target.alive) {
+    const p = hostile.target.position;
+    const range = Math.hypot(
+      p.x - state.position.x, p.y - state.position.y, p.z - state.position.z,
+    );
+    const closing = (flybyRange - range) / Math.max(dt, 1e-6);
+    if (isFlyby(flybyRange, range, closing)) audio.play("FLYBY");
+    flybyRange = range;
+  } else {
+    flybyRange = Infinity;
+  }
+}
+
 function onResize() {
   world.resize();
 }
+window.addEventListener("pointerdown", () => audio.arm());
 window.addEventListener("resize", onResize);
 onResize();
 

@@ -115,7 +115,14 @@ export function createDevelopmentRecovery({ physics, getState, onEvent }) {
 // ── MissionCheckpointResponse (stage 7) ────────────────────────────────────
 
 export const MC = {
-  hold: 0.28, // stage 9 lengthens this to cover the crash presentation
+  // 1.2 s, lengthened from 0.28 in stage 9. THIS IS THE CRASH WINDOW: rather
+  // than building a second state machine for the crash, the presentation
+  // renders against this clock. Duplicate suppression then comes free, because
+  // trigger() already refuses re-entry -- which is exactly what stops a
+  // tumbling aircraft grinding through a mountain producing BOOM BOOM BOOM.
+  //
+  //   0.00 impact   1.20 fade begins   1.70 respawn at black   2.32 playable
+  hold: 1.2,
   fadeOut: 0.5,
   fadeIn: 0.62,
   cooldown: 0.55,

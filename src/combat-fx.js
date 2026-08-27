@@ -70,7 +70,106 @@ export function createCombatFx(scene) {
   const forward = new THREE.Vector3();
   const up = new THREE.Vector3(0, 1, 0);
 
+  // ── the crash presentation ───────────────────────────────────────────────
+  // crash-fx.js is three-free and describes the crash as numbers; this draws
+  // it. Everything is POOLED and shares two materials -- peak is ~55 live
+  // entities and allocating them per crash would stutter on the frame the
+  // player most needs to see clearly.
+  const smokeMat = new THREE.SpriteMaterial({
+    color: 0x9aa3ab, transparent: true, opacity: 0.5, depthWrite: false,
+  });
+  const crashGroup = new THREE.Group();
+  scene.add(crashGroup);
+  const crashPool = { spark: [], smoke: [], debris: [], ball: [] };
+  const sparkMat = new THREE.SpriteMaterial({
+    color: 0xffcf7a, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  const ballMat = new THREE.SpriteMaterial({
+    color: 0xff9a3c, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  const debrisGeoms = [
+    new THREE.BoxGeometry(1.6, 0.4, 2.6),
+    new THREE.BoxGeometry(0.9, 0.9, 1.4),
+    new THREE.ConeGeometry(0.7, 2.2, 5),
+    new THREE.BoxGeometry(2.4, 0.3, 0.8),
+  ];
+  const debrisMat = new THREE.MeshStandardMaterial({ color: 0x54595f, roughness: 0.8 });
+
+  function borrow(kind, factory) {
+    const pool = crashPool[kind];
+    const spare = pool.find((o) => !o.visible);
+    if (spare) {
+      spare.visible = true;
+      return spare;
+    }
+    const made = factory();
+    crashGroup.add(made);
+    pool.push(made);
+    return made;
+  }
+  function releaseAll() {
+    for (const pool of Object.values(crashPool)) {
+      for (const o of pool) o.visible = false;
+    }
+  }
+
   return {
+    /**
+     * Draw one frame of a crash. `mist` swaps additive fire for normal-blended
+     * spray, which is what makes an ocean impact read as water rather than as
+     * a fire that happens to be blue.
+     */
+    renderCrash(crash) {
+      if (!crash.state.active) {
+        releaseAll();
+        return;
+      }
+      const t = crash.state.t;
+      let used = { spark: 0, smoke: 0, debris: 0, ball: 0 };
+
+      for (const b of crash.fireball) {
+        if (t < b.born) continue;
+        const age = t - b.born;
+        const s = borrow("ball", () => new THREE.Sprite(ballMat.clone()));
+        used.ball++;
+        s.position.set(
+          crash.state.position.x + b.offset.x,
+          crash.state.position.y + b.offset.y,
+          crash.state.position.z + b.offset.z,
+        );
+        s.scale.setScalar(b.size * (0.4 + age * b.rate * 2.4));
+        s.material.opacity = Math.max(0, 1 - age * b.rate * 1.5);
+      }
+      for (const sp of crash.sparks) {
+        const s = borrow("spark", () => new THREE.Sprite(sparkMat));
+        used.spark++;
+        s.position.set(sp.position.x, sp.position.y, sp.position.z);
+        s.scale.setScalar(1.4);
+      }
+      for (const sm of crash.smoke) {
+        const s = borrow("smoke", () => new THREE.Sprite(smokeMat.clone()));
+        used.smoke++;
+        s.position.set(sm.position.x, sm.position.y, sm.position.z);
+        s.scale.setScalar(6 + sm.age * 20);
+        s.material.opacity = Math.max(0, 0.55 - sm.age * 0.5);
+        // Water goes UP as spray, not outward as smoke.
+        if (sm.mist > 0) s.material.color.setHex(0xcfe3ef);
+      }
+      for (const d of crash.debris) {
+        const m = borrow("debris", () =>
+          new THREE.Mesh(debrisGeoms[d.kind % debrisGeoms.length], debrisMat),
+        );
+        used.debris++;
+        m.position.set(d.position.x, d.position.y, d.position.z);
+        m.rotation.x += d.spin.x * 0.016;
+        m.rotation.z += d.spin.z * 0.016;
+      }
+
+      for (const [kind, pool] of Object.entries(crashPool)) {
+        for (let i = used[kind]; i < pool.length; i++) pool[i].visible = false;
+      }
+    },
+
     /** Match the pool to the rounds actually in the air. */
     syncMissiles(rounds) {
       for (const entry of missilePool) entry.claimed = false;
@@ -136,6 +235,7 @@ export function createCombatFx(scene) {
     },
 
     clear() {
+      releaseAll();
       for (const entry of missilePool) {
         entry.inUse = false;
         entry.group.visible = false;

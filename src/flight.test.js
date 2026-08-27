@@ -51,6 +51,7 @@ import {
 import { buildTerrainIndex, createPhysics, heightAtIndex } from "./physics.js";
 import {
   createDevelopmentRecovery,
+  MC,
   createMissionCheckpointResponse,
   createNullResponse,
 } from "./collision.js";
@@ -70,6 +71,14 @@ import { createRearm } from "./rearm.js";
 import {
   ALWAYS, FREE, MISSION, PEACE, createSandbox, nextMode, rulesFor,
 } from "./modes.js";
+import {
+  RESPAWN_ALTITUDE, RESPAWN_BACKOFF, SPAWN_CLEARANCE, T, VARIANTS,
+  causeFor, createCrashFx, respawnFrom, safeSpawnAltitude,
+} from "./crash-fx.js";
+import {
+  AMBIENT, CRITICAL, CUES, WARNING, WEAPON,
+  createAudio, groundWarning, isFlyby,
+} from "./audio.js";
 import {
   EASE,
   HANDOFF_SPEED,
@@ -3302,11 +3311,15 @@ function testMissionFailurePolicy() {
   check("the fade is clear again", p2.fade() === 0);
 
   // Refused during the settling cooldown.
+  // Derived from MC rather than hardcoded: stage 9 lengthens `hold` from 0.28
+  // to 1.2 so the policy's clock can carry the crash presentation, and a test
+  // with the old total baked in fails for a change that is correct.
+  const cycle = MC.hold + MC.fadeOut + MC.fadeIn + MC.cooldown;
   const p3 = createMissionCheckpointResponse({});
   p3.handleCollision(contact);
-  for (let t = 0; t < 1.45; t += 1 / 60) p3.tick(1 / 60);
+  for (let t = 0; t < cycle - 0.2; t += 1 / 60) p3.tick(1 / 60);
   check("still refused during the settling cooldown", p3.handleCollision(contact) === false, p3.stage());
-  for (let t = 0; t < 1; t += 1 / 60) p3.tick(1 / 60);
+  for (let t = 0; t < 0.5; t += 1 / 60) p3.tick(1 / 60);
   check("accepted once fully settled", p3.handleCollision(contact) === true);
 
   // A PREDICTED IMPACT DOES NOT FAIL THE MISSION; REAL CONTACT DOES. Failing a
@@ -3908,6 +3921,446 @@ function testParkedDirectorNeverCompletes() {
   check("and publishes no completion time", m.mission.stopped === null);
 }
 
+// ── stage 9: dying well, and sound ────────────────────────────────────────
+
+const crashStart = (over = {}) => ({
+  reason: "terrain",
+  position: { x: 0, y: 600, z: 0 },
+  velocity: { x: 0, y: 0, z: -200 },
+  quat: { x: 0, y: 0, z: 0, w: 1 },
+  seed: 7,
+  ...over,
+});
+
+function runCrash(over = {}, seconds = 2.4) {
+  const crash = createCrashFx();
+  crash.start(crashStart(over));
+  const frames = [];
+  for (let t = 0; t < seconds; t += 1 / 60) {
+    crash.update(1 / 60);
+    frames.push({
+      t: crash.state.t,
+      opacity: crash.state.aircraftOpacity,
+      kick: crash.state.kick,
+      y: crash.state.position.y,
+      z: crash.state.position.z,
+      sparks: crash.sparks.length,
+      smoke: crash.smoke.length,
+      debris: crash.debris.length,
+      entities: crash.entityCount(),
+    });
+  }
+  return { crash, frames };
+}
+
+function testCrashCauseMapping() {
+  // Mapped IN ONE PLACE, so a new failure reason cannot silently inherit the
+  // wrong explosion.
+  check("terrain maps to TERRAIN", causeFor("terrain") === "TERRAIN");
+  check("ground maps to TERRAIN", causeFor("ground") === "TERRAIN");
+  check("ocean maps to OCEAN", causeFor("ocean") === "OCEAN");
+  check("missile maps to MISSILE", causeFor("missile") === "MISSILE");
+  // AN UNKNOWN REASON STILL GETS A PRESENTATION -- silence would read as a
+  // freeze, which is worse than the wrong explosion.
+  check("an unknown reason still gets a presentation", VARIANTS[causeFor("wat")] !== undefined);
+  for (const name of ["MISSILE", "TERRAIN", "OCEAN"]) {
+    const v = VARIANTS[name];
+    for (const key of ["fire", "smoke", "sparks", "mist", "forward", "sink", "visible"]) {
+      check(`${name} defines ${key}`, key in v);
+    }
+  }
+  // The variants differ as DATA, not code paths.
+  check("OCEAN sinks hardest", VARIANTS.OCEAN.sink > VARIANTS.TERRAIN.sink);
+  check("OCEAN is least visible", VARIANTS.OCEAN.visible < VARIANTS.TERRAIN.visible);
+  check("OCEAN has the most mist and the least fire", (() => {
+    const o = VARIANTS.OCEAN;
+    return o.mist > VARIANTS.TERRAIN.mist && o.fire < VARIANTS.MISSILE.fire;
+  })());
+}
+
+function testCrashTimelineOrdering() {
+  check("flash before fireball", T.flash < T.fireball);
+  check("fireball before tumble", T.fireball < T.tumble);
+  check("tumble before smoke", T.tumble < T.smoke);
+  check("smoke before sparks", T.smoke < T.sparks);
+  // The crash must be VISIBLE before the fade starts.
+  check("the crash is visible before the fade begins", T.sparks < T.holdEnds);
+  // And the smoke must stop emitting before the fade completes.
+  check("smoke stops before the fade completes", T.smokeStops < T.respawn);
+  check("respawn is at full black", T.respawn === T.holdEnds + 0.5);
+  check(
+    "impact to playable is about 2.3 s",
+    Math.abs(T.playable - 2.32) < 1e-9,
+    `${T.playable}`,
+  );
+  // The policy's hold IS the crash window -- not a second state machine.
+  check("the policy hold matches the crash window", MC.hold === T.holdEnds, `${MC.hold}`);
+  check(
+    "the policy timeline reaches playable at the same moment",
+    Math.abs(MC.hold + MC.fadeOut + MC.fadeIn - T.playable) < 1e-9,
+  );
+}
+
+function testCrashAircraftVisibility() {
+  const { frames } = runCrash();
+  const at = (t) => frames.find((f) => f.t >= t);
+  // KEEP THE INTACT AIRCRAFT VISIBLE for ~0.72 s. Hiding it on the frame it
+  // dies is what makes a death read as a bug.
+  check("the aircraft is fully visible at 0.5 s", at(0.5).opacity === 1, `${at(0.5).opacity}`);
+  check("the aircraft is hidden by 1.0 s", at(1.0).opacity < 0.05, `${at(1.0).opacity}`);
+  check("opacity never goes negative", frames.every((f) => f.opacity >= 0));
+}
+
+function testCrashCamera() {
+  const { frames } = runCrash();
+  // ONE strong kick at impact, decaying fast, NEVER re-triggered: sustained
+  // shake is nauseating.
+  check("the kick peaks at impact", frames[0].kick > 0.4, `${frames[0].kick}`);
+  let monotonic = true;
+  for (let i = 1; i < frames.length; i++) {
+    if (frames[i].kick > frames[i - 1].kick + 1e-9) monotonic = false;
+  }
+  check("the kick only ever decays -- never re-triggered", monotonic);
+  const atRespawn = frames.find((f) => f.t >= T.respawn);
+  check("the kick is negligible by the respawn", atRespawn.kick < 0.01, `${atRespawn.kick}`);
+}
+
+function testCrashTumbleAndMomentum() {
+  // THE TUMBLE IS LATCHED at entry -- one angular velocity, applied as a LOCAL
+  // quaternion delta so it works from any starting attitude including
+  // inverted. (Same trap as the hostile's break direction in stage 6.)
+  const seen = [];
+  for (let seed = 1; seed <= 12; seed++) {
+    const c = createCrashFx();
+    c.start(crashStart({ seed }));
+    const latched = { ...c.state.tumble };
+    for (let t = 0; t < 1; t += 1 / 60) c.update(1 / 60);
+    check(
+      `seed ${seed}: the tumble never changed`,
+      c.state.tumble.x === latched.x && c.state.tumble.z === latched.z,
+    );
+    seen.push(latched.z);
+  }
+  check("the tumble goes both ways across seeds", seen.some((z) => z > 0) && seen.some((z) => z < 0));
+  check("the tumble is bounded", seen.every((z) => Math.abs(z) < 6), `max ${Math.max(...seen.map(Math.abs))}`);
+  // ROLL DOMINATES: a tumbling airframe reads as a roll first.
+  const c = createCrashFx();
+  c.start(crashStart({ seed: 3 }));
+  check(
+    "roll dominates the other axes",
+    Math.abs(c.state.tumble.z) > Math.abs(c.state.tumble.x) &&
+      Math.abs(c.state.tumble.z) > Math.abs(c.state.tumble.y),
+    JSON.stringify(c.state.tumble),
+  );
+  check("the quaternion stays normalised through the tumble", (() => {
+    for (let t = 0; t < 1.2; t += 1 / 60) c.update(1 / 60);
+    const q = c.state.quat;
+    return Math.abs(Math.hypot(q.x, q.y, q.z, q.w) - 1) < 1e-6;
+  })());
+
+  // MOMENTUM IS INHERITED -- the aircraft does not stop in midair -- and it
+  // FALLS while continuing forward.
+  const { frames } = runCrash({ velocity: { x: 0, y: 0, z: -250 } });
+  const end = frames[frames.length - 1];
+  check("the aircraft keeps moving forward", end.z < -30, `${end.z}`);
+  check("and falls while doing it", end.y < 600, `${end.y}`);
+  // A 250 m/s crash travels a BELIEVABLE distance rather than teleporting.
+  const travelled = Math.abs(end.z);
+  check(
+    "a 250 m/s crash travels a believable distance",
+    travelled > 40 && travelled < 260,
+    `${travelled.toFixed(0)} m in ${end.t.toFixed(2)} s`,
+  );
+}
+
+function testOceanCrashSinks() {
+  // WATER NEEDS REAL WORK, NOT A PALETTE SWAP. Without the plunge impulse the
+  // aircraft drifts two metres in three quarters of a second and visibly
+  // skates along the surface.
+  const ocean = runCrash({ reason: "ocean", position: { x: 0, y: 4, z: 0 } });
+  const terrain = runCrash({ reason: "terrain", position: { x: 0, y: 4, z: 0 } });
+  const oceanEnd = ocean.frames[ocean.frames.length - 1];
+  const terrainEnd = terrain.frames[terrain.frames.length - 1];
+  check("an ocean crash goes under", oceanEnd.y < -20, `${oceanEnd.y.toFixed(1)}`);
+  check(
+    "it sinks far faster than a terrain impact",
+    oceanEnd.y < terrainEnd.y - 20,
+    `ocean ${oceanEnd.y.toFixed(1)} vs terrain ${terrainEnd.y.toFixed(1)}`,
+  );
+  // Hidden BEFORE it is meaningfully under, so the intact airframe is never
+  // seen submerged and skating along the surface.
+  const hiddenAt = ocean.frames.find((f) => f.opacity < 0.05);
+  const deepAt = ocean.frames.find((f) => f.y < -25);
+  check(
+    "it is hidden before it is meaningfully under",
+    hiddenAt && deepAt && hiddenAt.t < deepAt.t,
+    `hidden ${hiddenAt?.t.toFixed(2)}s, deep ${deepAt?.t.toFixed(2)}s`,
+  );
+  // And far sooner than a terrain impact fades.
+  const terrainHidden = terrain.frames.find((f) => f.opacity < 0.05);
+  check(
+    "an ocean crash fades far sooner than a terrain one",
+    hiddenAt.t < terrainHidden.t - 0.3,
+    `ocean ${hiddenAt.t.toFixed(2)}s vs terrain ${terrainHidden.t.toFixed(2)}s`,
+  );
+}
+
+function testCrashDuplicateSuppression() {
+  // DUPLICATE SUPPRESSION ON EVERY FRAME of the crash window. A tumbling
+  // aircraft grinding through a mountain must not produce BOOM BOOM BOOM.
+  const policy = createMissionCheckpointResponse({});
+  const contact = { type: "terrain", predicted: false, position: { x: 0, y: 0, z: 0 }, speed: 200 };
+  check("the first impact is accepted", policy.handleCollision(contact) === true);
+  let extra = 0;
+  for (let t = 0; t < T.holdEnds; t += 1 / 60) {
+    if (policy.handleCollision(contact)) extra++;
+    policy.tick(1 / 60);
+  }
+  check("every frame of the crash window is refused", extra === 0, `${extra}`);
+  check("the failure count stayed at one", policy.failures() === 1, `${policy.failures()}`);
+
+  // reset() clears the clock and every entity; finish() restores opacity.
+  const { crash } = runCrash();
+  check("entities exist mid-crash", crash.entityCount() > 0);
+  check("the entity peak is within budget", crash.entityCount() < 90, `${crash.entityCount()}`);
+  crash.reset();
+  check("reset clears the clock", crash.state.t === 0);
+  check("reset clears every entity", crash.entityCount() === 0);
+  check("reset restores opacity", crash.state.aircraftOpacity === 1);
+
+  const c2 = createCrashFx();
+  c2.start(crashStart());
+  for (let t = 0; t < 1; t += 1 / 60) c2.update(1 / 60);
+  c2.finish();
+  check("finish restores aircraft opacity", c2.state.aircraftOpacity === 1);
+  check("finish ends the crash", c2.state.active === false);
+}
+
+function testSpawnClearance() {
+  const flat = () => 0;
+  // Flat ground gives the plain clearance.
+  check(
+    "flat ground gives the plain clearance",
+    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, flat) === SPAWN_CLEARANCE,
+  );
+
+  // GROUND *AHEAD* RAISES IT. Heading 0 is -Z, so a ridge at negative z is
+  // ahead. This is the whole point: a levelled attitude 320 m over a valley
+  // floor with a 600 m ridge 1.5 km ahead puts the player back into contact
+  // within two seconds and the crash repeats forever.
+  const ridgeAhead = (x, z) => (z < -1000 && z > -2000 ? 600 : 0);
+  check(
+    "ground ahead raises the spawn",
+    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, ridgeAhead) === 600 + SPAWN_CLEARANCE,
+    `${safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, ridgeAhead)}`,
+  );
+  // THE SAME POSITION FACING AWAY DOES NOT -- which is what proves it samples
+  // a corridor along the heading rather than a disc around the point.
+  check(
+    "the same position facing away does not",
+    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, Math.PI, ridgeAhead) === SPAWN_CLEARANCE,
+  );
+  // Ground at the spawn POINT itself is caught too (the d = 0 sample).
+  const underfoot = (x, z) => (Math.abs(z) < 50 ? 900 : 0);
+  check(
+    "ground at the spawn point itself is caught",
+    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, underfoot) === 900 + SPAWN_CLEARANCE,
+  );
+  // No sampler still yields a floor.
+  check("no sampler still yields a floor", safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, null) === SPAWN_CLEARANCE);
+
+  // The respawn: backed off along the heading of travel, levelled, at cruise.
+  const spawn = respawnFrom({ x: 0, y: 100, z: -5000 }, 0, flat);
+  check("the respawn backs off along the heading", spawn.position.z > -5000, `${spawn.position.z}`);
+  check(
+    "it backs off the full distance",
+    Math.abs(spawn.position.z - (-5000 + RESPAWN_BACKOFF)) < 1e-6,
+  );
+  check("the respawn is levelled", spawn.pitch === 0 && spawn.bank === 0);
+  check("sink is zeroed", spawn.sink === 0);
+  // NO ESCALATION: with a finite pilot count, converging over several deaths
+  // costs the player the run, so the FIRST attempt is simply high enough that
+  // terrain cannot be a factor -- 4000 m against a 643 m peak.
+  check(
+    "the respawn is high enough that terrain cannot be a factor",
+    spawn.position.y >= RESPAWN_ALTITUDE,
+    `${spawn.position.y}`,
+  );
+  check("4000 m clears the 643 m peak by a wide margin", RESPAWN_ALTITUDE > 643 * 5);
+  // A very tall ridge still raises it above the fixed floor.
+  const huge = respawnFrom({ x: 0, y: 100, z: -5000 }, 0, () => 6000);
+  check("a taller obstacle still raises the floor", huge.position.y > RESPAWN_ALTITUDE, `${huge.position.y}`);
+}
+
+// ── audio ─────────────────────────────────────────────────────────────────
+
+function fakeAudio() {
+  const made = [];
+  const el = () => {
+    const listeners = {};
+    const e = {
+      src: "", loop: false, volume: 1, currentTime: 0, playbackRate: 1,
+      networkState: 1, paused: true,
+      addEventListener: (t, fn) => (listeners[t] = fn),
+      play() { this.paused = false; },
+      pause() { this.paused = true; },
+      fail() { listeners.error?.(); },
+    };
+    made.push(e);
+    return e;
+  };
+  return { el, made };
+}
+
+function testAudioPriorityAndDucking() {
+  check("priorities are ordered AMBIENT < WEAPON < WARNING < CRITICAL",
+    AMBIENT < WEAPON && WEAPON < WARNING && WARNING < CRITICAL);
+  check("the engine loop is AMBIENT", CUES.ENGINE_LOOP.priority === AMBIENT);
+  check("the gun is WEAPON", CUES.GUN.priority === WEAPON);
+  check("LOCK is a WARNING", CUES.LOCK.priority === WARNING);
+  check("MISSILE is CRITICAL", CUES.MISSILE.priority === CRITICAL);
+  // THE PLAYER'S OWN LAUNCH IS WEAPON, NOT WARNING -- it confirms something
+  // they did and must never mask an inbound call.
+  check("the player's own launch is WEAPON, not WARNING", CUES.MISSILE_LAUNCH.priority === WEAPON);
+  // THE GUN IS A LOOP, not 48 one-shots a second.
+  check("the gun is a loop", CUES.GUN.loop === true);
+  check("the engine loop loops", CUES.ENGINE_LOOP.loop === true);
+  check("warnings are not loops", !CUES.LOCK.loop && !CUES.PULL_UP.loop);
+
+  const { el } = fakeAudio();
+  const audio = createAudio({ createElement: el });
+  audio.arm();
+  check("no duck at rest", audio.duckLevel() === 1);
+  audio.play("LOCK");
+  check("a warning ducks", audio.duckLevel() < 1, `${audio.duckLevel()}`);
+  const afterWarning = audio.duckLevel();
+  // A WARNING NEVER DUCKS ANOTHER WARNING -- the second is the one that
+  // matters, and pushing it down would bury the information.
+  audio.tick(4);
+  audio.play("MISSILE");
+  const afterCritical = audio.duckLevel();
+  check("a critical cue ducks harder than a warning", afterCritical < afterWarning,
+    `${afterCritical} vs ${afterWarning}`);
+  audio.tick(2);
+  check("the duck expires", audio.duckLevel() === 1);
+}
+
+function testAudioIntervalsAndTakes() {
+  const { el } = fakeAudio();
+  const audio = createAudio({ createElement: el });
+  audio.arm();
+
+  // EVERY ONE-SHOT HAS A MINIMUM INTERVAL: a cue that repeats is a cue nobody
+  // hears.
+  check("the first LOCK fires", audio.play("LOCK") === true);
+  check("an immediate second is refused", audio.play("LOCK") === false);
+  audio.tick(1);
+  check("still refused inside the interval", audio.mayFire("LOCK") === false);
+  audio.tick(3);
+  check("allowed once the interval has passed", audio.mayFire("LOCK") === true);
+
+  // FLARES is forced past its own floor -- it confirms a deliberate action.
+  check("a forced cue ignores its floor", audio.mayFire("FLARES") === true);
+
+  // MULTI-TAKE CUES ROTATE ROUND-ROBIN, so with three takes it is PROVABLY
+  // never twice in a row -- which random selection cannot promise.
+  const a2 = createAudio({ createElement: el });
+  a2.arm();
+  const takes = [];
+  for (let i = 0; i < 9; i++) takes.push(a2.nextTake("LOCK"));
+  check("three takes rotate 0,1,2", takes.join("") === "012012012", takes.join(""));
+  check("no take repeats consecutively", takes.every((t, i) => i === 0 || t !== takes[i - 1]));
+  const two = [];
+  for (let i = 0; i < 6; i++) two.push(a2.nextTake("MISSILE"));
+  check("two takes alternate", two.join("") === "010101", two.join(""));
+
+  // A one-shot cannot be looped, and a one-shot CAN be stopped early -- the
+  // engine start-up is cut the instant the catapult fires.
+  const a3 = createAudio({ createElement: el });
+  a3.arm();
+  check("startLoop refuses a one-shot", a3.startLoop("LOCK") === false);
+  check("startLoop accepts the gun", a3.startLoop("GUN") === true);
+  a3.play("ENGINE_START", { force: true });
+  check("the start-up is playing", a3.isPlaying("ENGINE_START") === true);
+  check("a one-shot can be stopped early", a3.stop("ENGINE_START") === true);
+  check("and is then not playing", a3.isPlaying("ENGINE_START") === false);
+  check("the start-up plays at double rate", CUES.ENGINE_START.rate === 2);
+}
+
+function testAudioGesturesAndMissingFiles() {
+  const { el, made } = fakeAudio();
+  const audio = createAudio({ createElement: el });
+  // NOTHING PLAYS BEFORE A USER GESTURE.
+  check("nothing plays before a gesture", audio.play("LOCK") === false);
+  check("arming reports the first time only", audio.arm() === true && audio.arm() === false);
+  check("and then it plays", audio.play("LOCK") === true);
+
+  audio.setMuted(true);
+  check("muted plays nothing", audio.play("MISSILE") === false);
+  audio.setMuted(false);
+  check("unmuted plays again", audio.play("MISSILE") === true);
+
+  // MISSING AUDIO FILES ARE A NORMAL STATE. Marked unavailable only on
+  // POSITIVE FAILURE -- never on readyState < 3, which is also the state of a
+  // file that simply has not finished loading and which would mark every
+  // working file as missing.
+  check("every cue starts available", audio.missingCues().length === 0);
+  check("a cue that has not loaded yet is still available", audio.isAvailable("PULL_UP") === true);
+  made[0].fail();
+  check("a positive error marks a cue missing", audio.missingCues().length === 1);
+  const failedName = audio.missingCues()[0];
+  check("a missing cue does not play", audio.play(failedName) === false);
+  check("the rest still play", audio.play("PULL_UP") === true);
+  // The game runs silent rather than throwing.
+  const silent = createAudio({ createElement: () => null });
+  silent.arm();
+  check("a build with no audio at all does not throw", silent.play("LOCK") === true);
+}
+
+function testGroundWarningsAndFlyby() {
+  // BOTH LEVELS READ AGL, NOT ALTITUDE ABOVE SEA LEVEL -- so 200 m over the
+  // ocean is quiet and 200 m into a 600 m ridge is not.
+  check(
+    "high above the ground is quiet",
+    groundWarning({ agl: 900, forwardHazard: Infinity, sink: 0, speed: 200 }) === null,
+  );
+  check(
+    "low AGL calls ALTITUDE",
+    groundWarning({ agl: 180, forwardHazard: Infinity, sink: 0, speed: 200 }) === "ALTITUDE",
+  );
+  check(
+    "an imminent forward hazard calls PULL UP",
+    groundWarning({ agl: 900, forwardHazard: 100, sink: 0, speed: 200 }) === "PULL_UP",
+  );
+  check(
+    "low and descending calls PULL UP",
+    groundWarning({ agl: 100, forwardHazard: Infinity, sink: 20, speed: 200 }) === "PULL_UP",
+  );
+  // THE POINT OF USING AGL: the SAME altitude reads differently depending on
+  // what is underneath. 200 m over open water is 200 m AGL; 200 m over a 600 m
+  // ridge is 400 m INSIDE it. An earlier version of this check asserted 201 m
+  // AGL was quiet, which is simply false -- the threshold is 220.
+  const overWater = groundWarning({
+    agl: 200, forwardHazard: Infinity, sink: 0, speed: 200,
+  });
+  const overRidge = groundWarning({
+    agl: 200 - 600, forwardHazard: 120, sink: 0, speed: 200,
+  });
+  check("200 m over water is only an ALTITUDE call", overWater === "ALTITUDE", String(overWater));
+  check("the same altitude into a ridge is a PULL UP", overRidge === "PULL_UP", String(overRidge));
+  check(
+    "well clear of the sea is silent",
+    groundWarning({ agl: 400, forwardHazard: Infinity, sink: 0, speed: 200 }) === null,
+  );
+
+  // THE FLY-BY FIRES ONCE PER PASS: a range that crossed the threshold THIS
+  // FRAME plus real closure.
+  check("a crossing with closure is a fly-by", isFlyby(400, 300, 300) === true);
+  check("a slow drift past is not", isFlyby(400, 300, 20) === false);
+  check("already inside is not a new pass", isFlyby(300, 280, 300) === false);
+  check("still outside is not", isFlyby(900, 800, 300) === false);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -3995,6 +4448,18 @@ const SUITES = [
   ["the modes table", testModesTable],
   ["the sandbox driver", testSandboxDriver],
   ["a parked director never completes", testParkedDirectorNeverCompletes],
+  ["crash cause mapping", testCrashCauseMapping],
+  ["crash timeline ordering", testCrashTimelineOrdering],
+  ["the aircraft stays visible, then fades", testCrashAircraftVisibility],
+  ["the crash camera kick", testCrashCamera],
+  ["tumble is latched, momentum inherited", testCrashTumbleAndMomentum],
+  ["an ocean crash sinks", testOceanCrashSinks],
+  ["crash duplicate suppression", testCrashDuplicateSuppression],
+  ["spawn clearance", testSpawnClearance],
+  ["audio priority and ducking", testAudioPriorityAndDucking],
+  ["audio intervals and takes", testAudioIntervalsAndTakes],
+  ["audio gestures and missing files", testAudioGesturesAndMissingFiles],
+  ["ground warnings and the fly-by", testGroundWarningsAndFlyby],
 ];
 
 export function run() {

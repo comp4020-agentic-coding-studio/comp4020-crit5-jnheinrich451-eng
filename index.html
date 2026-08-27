@@ -176,6 +176,15 @@
         pointer-events: none;
       }
 
+      #crash-flash {
+        position: fixed;
+        inset: 0;
+        background: #ffd2b0;
+        opacity: 0;
+        z-index: 19;
+        pointer-events: none;
+      }
+
       #complete {
         position: fixed;
         inset: 0;
@@ -265,6 +274,10 @@
       <p id="complete-title">SORTIE COMPLETE</p>
       <dl id="complete-rows"></dl>
     </div>
+
+    <!-- ABOVE the fade, and a SEPARATE element, so neither can strand the
+         other on. Under 0.15 s, low alpha. -->
+    <div id="crash-flash"></div>
 
     <pre id="rail" hidden></pre>
 
