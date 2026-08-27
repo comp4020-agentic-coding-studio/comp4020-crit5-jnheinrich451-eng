@@ -26,6 +26,26 @@ export const CHASE = {
   maxFov: 75,
   fovDamping: 3.0,
 
+  /**
+   * A FLOOR ON THE HORIZONTAL FIELD OF VIEW, because three.js's `fov` is the
+   * VERTICAL one and the phone marking viewport is 390x844 — portrait.
+   *
+   * Horizontal fov is 2*atan(tan(fov/2) * aspect), so at aspect 0.46 a 66°
+   * vertical lens shows about 34° across. The composition still "worked": the
+   * aircraft sat where the framing put it, and filled the frame, with the world
+   * it is flying through squeezed out either side. Nothing looked broken, which
+   * is what made it easy to miss — it just could not be flown.
+   *
+   * 46° is the narrowest horizontal view worth flying. Widening the vertical
+   * lens to buy it costs a tall, slightly fish-eyed frame on a phone held
+   * upright, which is the correct trade: the alternative is a game that only
+   * works one way up, and both marking viewports are marked.
+   *
+   * Inert on any landscape viewport — at 16:9 the horizontal view is already
+   * ~100°, so this never fires on the desktop composition.
+   */
+  minHorizontalFov: 46,
+
   // Very subtle speed standoff, also anchored on cruise: 110 -> 22.5 m,
   // 170 -> 24 m (unchanged), 250 -> 26 m. The aircraft stays the hero.
   minDistance: 22.5,
@@ -65,6 +85,17 @@ const view = { blend: 0, distance: 0, height: 0, framingY: 0, lagScale: 1, fov: 
  * @param over   { distance, height, framingY, lagScale } — any subset
  * @param fov    optional FOV target that overrides the speed curve while blended
  */
+/**
+ * Raise a vertical FOV until it shows at least `CHASE.minHorizontalFov` across.
+ * Pure, so the rule is testable without a camera.
+ */
+export function fovForAspect(verticalFovDeg, aspect, cfg = CHASE) {
+  if (!(aspect > 0)) return verticalFovDeg;
+  const half = THREE.MathUtils.degToRad(cfg.minHorizontalFov) / 2;
+  const needed = 2 * Math.atan(Math.tan(half) / aspect);
+  return Math.max(verticalFovDeg, THREE.MathUtils.radToDeg(needed));
+}
+
 export function setChaseView(blend, over = null, fov = null) {
   view.blend = THREE.MathUtils.clamp(blend, 0, 1);
   if (over) {
@@ -187,7 +218,7 @@ export function updateChaseCamera(camera, aircraftRoot, flightState, dt) {
     smoothedForward.copy(forward);
     smoothedUp.copy(targetUp);
     smoothedRoll = rollTarget;
-    camera.fov = blendedFov(flightState.speed);
+    camera.fov = fovForAspect(blendedFov(flightState.speed), camera.aspect);
     camera.updateProjectionMatrix();
   } else {
     // Forward damping is scaled by the active composition: a lower lagScale is
@@ -197,7 +228,7 @@ export function updateChaseCamera(camera, aircraftRoot, flightState, dt) {
     smoothedUp.lerp(targetUp, 1 - Math.exp(-CHASE.expertUpDamping * dt)).normalize();
     smoothedRoll = damp(smoothedRoll, rollTarget, CHASE.rollDamping, dt);
 
-    const fov = damp(camera.fov, blendedFov(flightState.speed), CHASE.fovDamping, dt);
+    const fov = damp(camera.fov, fovForAspect(blendedFov(flightState.speed), camera.aspect), CHASE.fovDamping, dt);
     if (Math.abs(fov - camera.fov) > 1e-4) {
       camera.fov = fov;
       camera.updateProjectionMatrix();

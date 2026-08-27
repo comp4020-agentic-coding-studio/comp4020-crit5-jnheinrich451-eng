@@ -159,9 +159,44 @@ export const HUD = {
    * floor only has to keep the columns off the boresight.
    */
   flankMin: 44,
+
+  /**
+   * THE VIEWPORT THE HUD WAS DRAWN FOR, and the floor it may shrink to.
+   *
+   * Sizes here are pixels at a 1080-tall desktop. The positions around them are
+   * already proportional (`w * 0.18`, `h * 0.075`), so at the 390x844 phone
+   * viewport the layout was right and the FURNITURE was wrong: a 19 px readout
+   * and a 74 px radar on a 390 px-wide frame crowd the boresight and run off the
+   * corner. Both marking viewports have to work, and the phone is where most of
+   * the web arrives.
+   *
+   * Scaled on the SMALLER dimension, so a phone gets the same treatment held
+   * either way up rather than looking correct in landscape and broken in
+   * portrait. The floor stops the instruments becoming unreadable in the pursuit
+   * of fitting: below it, they may crowd.
+   */
+  uiReference: 820,
+  uiScaleMin: 0.58,
 };
 
 /* ---- pure presentation math (§6–§8, §13) ---- */
+
+/**
+ * How large to draw the instruments, given a viewport.
+ *
+ * The HUD's POSITIONS are proportional already (`w * 0.18`, `h * 0.075`), so
+ * they were right on a phone. Its FURNITURE was not: a 19 px readout and a
+ * 74 px radar are a corner of a 1080-tall desktop and a third of a 390-wide
+ * phone, which crowded the boresight and ran the radar off the frame.
+ *
+ * Driven by the SMALLER dimension, so a phone is treated the same held either
+ * way up — scaling on width alone would leave portrait correct and landscape
+ * oversized, and both are marked. Never above 1: a larger monitor wants the
+ * same HUD, not a bigger one.
+ */
+export function uiScaleFor(w, h, cfg = HUD) {
+  return Math.max(cfg.uiScaleMin, Math.min(1, Math.min(w, h) / cfg.uiReference));
+}
 
 /** Frame-rate-independent exponential approach. */
 export function damp(current, target, lambda, dt) {
@@ -242,8 +277,18 @@ const el = (tag, attrs = {}, parent = null) => {
 
 const MONO = 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace';
 
-const text = (parent, attrs = {}) =>
-  el("text", { fill: COLOR.line, "font-family": MONO, "font-size": "13", "letter-spacing": "1.4", "text-anchor": "middle", ...attrs }, parent);
+/**
+ * Every HUD glyph records the size it was DESIGNED at, so `resize` can rescale
+ * the whole instrument set from one number instead of from a list that has to
+ * be kept in step with the code that creates them. A font-size written straight
+ * into an attribute is invisible to a later pass; `data-base-size` is not.
+ */
+const text = (parent, attrs = {}) => {
+  const node = el("text", { fill: COLOR.line, "font-family": MONO, "font-size": "13", "letter-spacing": "1.4", "text-anchor": "middle", ...attrs }, parent);
+  node.dataset.baseSize = String(attrs["font-size"] ?? 13);
+  node.dataset.baseSpacing = String(attrs["letter-spacing"] ?? 1.4);
+  return node;
+};
 
 export function createCombatHud(host = document.body, cfg = HUD) {
   const svg = el("svg", { id: "combat-hud", "shape-rendering": "geometricPrecision" });
@@ -470,10 +515,21 @@ export function createCombatHud(host = document.body, cfg = HUD) {
   /* ================= viewport ================= */
   let w = window.innerWidth;
   let h = window.innerHeight;
+  /**
+   * One number the whole instrument set is drawn against. 1 at the desktop
+   * viewport and below it on a phone; never above 1, because a 4K monitor
+   * wants the same HUD, not a bigger one.
+   */
+  let ui = 1;
   const resize = () => {
     w = window.innerWidth;
     h = window.innerHeight;
     svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    ui = uiScaleFor(w, h, cfg);
+    for (const node of svg.querySelectorAll("text[data-base-size]")) {
+      node.setAttribute("font-size", (Number(node.dataset.baseSize) * ui).toFixed(2));
+      node.setAttribute("letter-spacing", (Number(node.dataset.baseSpacing) * ui).toFixed(2));
+    }
   };
   resize();
   window.addEventListener("resize", resize);
@@ -544,7 +600,7 @@ export function createCombatHud(host = document.body, cfg = HUD) {
     }
 
     /* ================= ScreenFixedLayer ================= */
-    reticle.setAttribute("transform", `translate(${cx.toFixed(1)} ${cy.toFixed(1)})`);
+    reticle.setAttribute("transform", `translate(${cx.toFixed(1)} ${cy.toFixed(1)}) scale(${ui.toFixed(3)})`);
     // GUN mode gets its own reticle furniture (§17).
     const gun = ctx.gun || null;
     const gunMode = ctx.weapon === "GUN";
@@ -579,10 +635,10 @@ export function createCombatHud(host = document.body, cfg = HUD) {
     // and the right column's last pixel is altX. Both move together — an
     // asymmetric pair either side of the boresight reads as a mistake.
     const room = cx - Math.max(0, ctx.safeLeft || 0);
-    const flank = Math.max(cfg.flankMin, Math.min(300, Math.min(w * 0.18, room)));
+    const flank = Math.max(cfg.flankMin * ui, Math.min(300, Math.min(w * 0.18, room)));
     const spdX = cx - flank;
     const altX = cx + flank;
-    const RULE = 68;
+    const RULE = 68 * ui;
     for (const node of [spdLabel, spdValue, thrValue, advisoryValue]) node.setAttribute("text-anchor", "start");
     for (const node of [altLabel, altValue, modeValue]) node.setAttribute("text-anchor", "end");
     spdLabel.setAttribute("x", spdX);
@@ -765,9 +821,9 @@ export function createCombatHud(host = document.body, cfg = HUD) {
     const rad = ctx.radar || null;
     radar.style.display = rad ? "" : "none";
     if (rad) {
-      const R = cfg.radarRadius;
-      const rx = w - cfg.radarMargin - R;
-      const ry = h - cfg.radarMargin - R;
+      const R = cfg.radarRadius * ui;
+      const rx = w - cfg.radarMargin * ui - R;
+      const ry = h - cfg.radarMargin * ui - R;
       radar.setAttribute("transform", `translate(${rx} ${ry})`);
       radarRing.setAttribute("r", R);
       radarMid.setAttribute("r", R * 0.5);
@@ -989,7 +1045,7 @@ export function createCombatHud(host = document.body, cfg = HUD) {
     if (!pipVisible) pipPrimed = false;
     pipper.style.display = pipVisible ? "" : "none";
     if (pipVisible) {
-      pipper.setAttribute("transform", `translate(${hudState.pipX.toFixed(1)} ${hudState.pipY.toFixed(1)})`);
+      pipper.setAttribute("transform", `translate(${hudState.pipX.toFixed(1)} ${hudState.pipY.toFixed(1)}) scale(${ui.toFixed(3)})`);
       // Out past best gun range the cue dims rather than disappearing: the
       // geometry is still true, the rounds just stop mattering.
       const eff = gun.rangeEffect === undefined ? 1 : clamp01(gun.rangeEffect);

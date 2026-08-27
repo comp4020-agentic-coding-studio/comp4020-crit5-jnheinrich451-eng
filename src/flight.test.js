@@ -4,7 +4,7 @@
  * console. Ports to vitest/jest unchanged — flight.js imports nothing.
  */
 import { createFlightState, updateFlight, forwardFromAngles, bankSinkRate, requestRoll, bankDegrees, getTargetSpeed, speedToThrottle, moveTowards, resetFlightState, wrapAngle, turnBank, setFlightMode, toggleFlightMode, isExpert, attitudeVectors, quat, quatForward, quatUp, quatMultiply, quatFromEulerYXZ, quatNormalize, MODE, EXPERT, CRUISE_THROTTLE, SPEED, THROTTLE, DEG, FLIGHT, ROLL } from "./flight.js";
-import { framingTilt } from "./chase-camera.js";
+import { framingTilt, fovForAspect, CHASE } from "./chase-camera.js";
 import * as THREE from "three";
 import { captureFlightState, applyFlightState } from "./flight.js";
 import { PHYSICS, SURFACE, CONTACT, PROBES, lookAheadDistance, groundReference, classifyContact, isSafeToRecord, buildTerrainIndex, terrainHeightAt, terrainNormalAt, imminentForwardDistance, forwardTerrainHit, collectMeshes, createWorldPhysics } from "./physics.js";
@@ -17,7 +17,7 @@ import { ENEMY, createTargetDrone, updateTargetDrone, integrateDrone, resetTarge
 import { HOSTILE, HOSTILE_MISSILE, HostileState, wrapPi, aimAngles, forwardFrom, offNoseDeg, steerAngle, predictPoint, inAttackCone, altitudeGuard, hostileTransition, phaseSpeed, createHostileAI } from "./hostile.js";
 import { THREAT, ThreatLevel, ThreatTier, threatLevelOf, warningTier, threatBearing, dodgeWindow, inDodgePeak, evasionAuthority, evadeEarned, createThreatMonitor } from "./threat.js";
 import { DamageSource, createPlayerDamageEvent, createDevelopmentHitResponse } from "./damage.js";
-import { HUD, apparentSize, damp, dampAngle, derivePitchDeg, deriveBankDeg, deriveHeadingDeg } from "./combat-hud.js";
+import { HUD, apparentSize, damp, dampAngle, derivePitchDeg, deriveBankDeg, deriveHeadingDeg, uiScaleFor } from "./combat-hud.js";
 import { ENGINE_FX, engineIntensity, ringOpacity, flickerAt } from "./engine-fx.js";
 import { GUN, gunShots, rangeEffect, gunDamage, hitscanRange, leadSolution, createGunSystem } from "./gun.js";
 import { VAPOR, maneuverLoad, vaporIntensity, approach } from "./vapor-fx.js";
@@ -4009,6 +4009,57 @@ const makeTerrain = (f, half = 100) => {
   check("route: the recovery leg is offshore, back toward the carrier (§31)", route[route.length - 1].position.z > -7600, route[route.length - 1].position.z);
   // The island may have failed to load; the mission still has to be flyable.
   check("route: a build with no terrain index still gets a full route", planRoute({ coastZ: -7600, features: [] }).length === route.length);
+}
+
+/**
+ * BOTH MARKING VIEWPORTS, asserted as rules rather than looked at.
+ *
+ * The course marks every prototype at 1920x1080 and at 390x844 — the phone
+ * preset in Chrome DevTools' device toolbar — and both are full marking
+ * environments. The phone one is PORTRAIT, which is what these two rules exist
+ * for; a flight game is held sideways, but the marker's default is not, and
+ * "works cleanly at both" is the bar.
+ */
+const VIEWPORTS = { desktop: [1920, 1080], portrait: [390, 844], landscape: [844, 390] };
+
+{
+  // The instruments scale on the SMALLER dimension, so a phone is treated the
+  // same held either way up.
+  const desk = uiScaleFor(...VIEWPORTS.desktop);
+  const port = uiScaleFor(...VIEWPORTS.portrait);
+  const land = uiScaleFor(...VIEWPORTS.landscape);
+  check("viewport: the desktop HUD is the one it was drawn at", desk === 1, desk);
+  check("viewport: a phone shrinks the instruments", port < 0.8 && land < 0.8, [port, land]);
+  check("viewport: ...and by the same amount either way up", Math.abs(port - land) < 1e-9, [port, land]);
+  check("viewport: a bigger monitor does not get a bigger HUD", uiScaleFor(3840, 2160) === 1, uiScaleFor(3840, 2160));
+  check("viewport: and there is a floor, so instruments never vanish", uiScaleFor(200, 200) === HUD.uiScaleMin, uiScaleFor(200, 200));
+
+  // The radar has to stay inside the frame at the smallest viewport, which is
+  // the thing the scale exists to guarantee. 2R + margin, against the width.
+  const r = HUD.radarRadius * port;
+  check("viewport: the radar still fits the phone frame", 2 * r + 2 * HUD.radarMargin * port < VIEWPORTS.portrait[0], Math.round(2 * r + 2 * HUD.radarMargin * port));
+}
+
+{
+  /**
+   * three.js's `fov` is the VERTICAL one, so a portrait viewport narrows the
+   * view without changing a single number in the composition. At 390x844 a 66°
+   * lens showed ~34° across: the aircraft filled the frame and the world it was
+   * flying through was squeezed out either side. §17.14 — assert the horizontal
+   * angle, which is the thing that was wrong, not the vertical one, which was
+   * always fine.
+   */
+  const hFov = (v, aspect) => (2 * Math.atan(Math.tan((v * Math.PI) / 360) * aspect) * 180) / Math.PI;
+  for (const [name, [w, h]] of Object.entries(VIEWPORTS)) {
+    const aspect = w / h;
+    const v = fovForAspect(66, aspect);
+    check(`viewport: ${name} keeps a flyable horizontal field of view`, hFov(v, aspect) >= CHASE.minHorizontalFov - 1e-6, Math.round(hFov(v, aspect)));
+  }
+  const wide = fovForAspect(66, 1920 / 1080);
+  check("viewport: ...and a landscape viewport is left completely alone", wide === 66, wide);
+  const tall = fovForAspect(66, 390 / 844);
+  check("viewport: while a portrait one is widened to earn it", tall > 66, Math.round(tall));
+  check("viewport: an absurd aspect is not allowed to invert the lens", fovForAspect(66, 0) === 66 && fovForAspect(66, -1) === 66);
 }
 
 /* ---- the transition table (§3, §21–§25) ---- */

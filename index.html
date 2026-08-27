@@ -28,7 +28,17 @@
 </script>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1116; }
-  #stage { display: block; width: 100vw; height: 100vh; }
+  /* TOUCH IS A POINTER, and that is the whole mobile control scheme.
+     input.js already listens on pointerdown/pointermove/pointerup, which a
+     finger raises exactly as a mouse does — so steering from screen centre and
+     firing on press need no touch-specific code at all (§7).
+     What breaks it is the browser claiming the gesture first: without
+     `touch-action: none` a drag scrolls the page and the pointermove stream is
+     cancelled mid-turn, which reads as the aircraft freezing under your thumb.
+     `overscroll-behavior` stops the pull-to-refresh that a downward drag —
+     i.e. pitching down — would otherwise trigger. */
+  html, body { touch-action: none; overscroll-behavior: none; }
+  #stage { display: block; width: 100vw; height: 100vh; touch-action: none; }
   /* Both overlays live in one fixed column pinned top and bottom, so they
      cannot meet however short the viewport gets. Two rules matter here:
 
@@ -70,6 +80,14 @@
      to eat the frame. minmax(0, 1fr) inside a max-width lets a long row wrap
      instead of pushing the panel wider. */
   #rail #hud { position: static; box-sizing: border-box; min-height: 0; max-width: 340px; overflow-y: auto; overflow-x: hidden; flex: 0 1 auto; scrollbar-width: thin; }
+  /* If the rail IS summoned with H on a phone, it has to fit rather than sit
+     across the game. It stays legible by shrinking, not by cropping — a silent
+     crop is what §Stage 03.15 already found and fixed once. */
+  @media (max-width: 1000px), (max-height: 620px) {
+    #rail { top: 10px; bottom: 10px; left: 10px; }
+    #rail #hud { max-width: min(300px, 62vw); font-size: 10px; letter-spacing: 0.04em; }
+    #rail #keys { font-size: 10px; }
+  }
   #rail #keys { position: static; overflow: visible; flex: 0 0 auto; }
   #hud {
     padding: 8px 14px 9px;
@@ -145,9 +163,12 @@
   /* The checks link. Deliberately near-invisible and bottom-right: it is a
      landmark for a crawler and a way into tests.html, not a menu -- a game with
      visible navigation has already started explaining itself. */
+  /* Bottom-LEFT, because the radar owns the bottom-right corner at every
+     viewport: 74 px of radius plus its margin reaches ~170 px in from the edge,
+     and the link was sitting inside it. Left is empty at all three sizes. */
   nav {
     position: fixed;
-    right: 0.75rem;
+    left: 0.75rem;
     bottom: 0.6rem;
     z-index: 10;
     font: 12px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace;

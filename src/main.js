@@ -2584,6 +2584,24 @@ Promise.all([
 
   loadingEl.hidden = true;
   combatHud.reveal();
+  /**
+   * THE DEVELOPER RAIL IS OFF ON A SMALL VIEWPORT.
+   *
+   * It is bounded at 340 px and pins itself top-to-bottom, which is a modest
+   * corner of a 1920x1080 desktop and most of a 390x844 phone: measured, it
+   * covered the top 40% of the frame in portrait and the left 40% in landscape,
+   * with the combat HUD underneath it. It is instrumentation for whoever is
+   * building the game (§35), not for the player, so on a phone it starts
+   * hidden and `H` still brings it back.
+   *
+   * Decided ONCE, at load, rather than re-evaluated on resize: after the first
+   * `H` the state belongs to whoever pressed it, and a window drag that undoes
+   * a deliberate keypress is worse than a rail in the wrong place.
+   */
+  if (window.matchMedia("(max-width: 1000px), (max-height: 620px)").matches) {
+    hud.root.hidden = true;
+    if (keysEl) keysEl.hidden = true;
+  }
   measureRail();
   lastTime = performance.now();
   frame();
