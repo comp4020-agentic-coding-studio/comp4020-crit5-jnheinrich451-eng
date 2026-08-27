@@ -7,7 +7,7 @@
 // This module imports no three.js: the curve and its two inverses are the
 // part worth testing, and they are pure arithmetic.
 
-import { leverFor, quatFromEulerYXZ } from "./flight.js";
+import { BURNER_LEVER, isAfterburner, quatFromEulerYXZ } from "./flight.js";
 
 // The speed curve across the stroke: speed(u) = lerp(V0, V1, u^EASE).
 export const V0 = 8;
@@ -37,10 +37,61 @@ const GEAR_UP_AFTER = 0.58;
 // The engine start-up is played at this rate, and the deck dwell is its
 // duration divided by it -- see deckDwellFor().
 export const ENGINE_START_RATE = 2;
-const BURNER_BEFORE_FIRE = 1.4;
 const SHAKE_FROM = 0.02;
 const SHAKE_TO = 0.16;
 const BURNER_SHAKE_FACTOR = 1.5;
+
+// ── THE SPOOL RAMP ─────────────────────────────────────────────────────────
+//
+// The dwell used to write a near-constant throttle while the camera shake
+// ramped 0.02 -> 0.16, so the RIG told a spool-up story that the throttle, the
+// afterburner and the engine visuals did not: an 11-second recording winding
+// up against an aircraft that was already at 92% on frame one.
+//
+// Keyed in FRACTIONS OF THE DWELL, never in seconds. The dwell is derived from
+// the start-up recording's own length (deckDwellFor), so a ramp authored in
+// seconds would decouple the two again the moment the clip is replaced -- the
+// same coupling defect the dwell itself was written to close.
+//
+//   0.00 -> 0.30   idle, then the first push
+//   0.30 -> 0.87   the wind-up the recording is doing
+//   0.87           burner lights and the throttle goes to the stop
+//
+export const SPOOL = {
+  idleTo: 0.3,
+  windTo: 0.87, // = burnerAt, as a fraction of the dwell
+  idle: 0.18,
+  push: 0.42,
+  // THE TOP OF THE WIND-UP IS BURNER_LEVER, NOT AN AUTHORED 0.88.
+  //
+  // §9's ramp quotes 0.88, but flight.js puts the burner detent at 0.85 and
+  // `state.afterburner` is driven by isAfterburner(throttle) so ONE RULE OWNS
+  // IT. A wind-up that ran to 0.88 would therefore light the burner at
+  // 0.83 x dwell -- before the point the sequence and its gate both name --
+  // and the light would then be a side effect of the ramp rather than an
+  // event. Topping out ON the detent makes 0.87 x dwell the exact frame the
+  // burner lights, and derives the number instead of authoring a second one.
+  wind: BURNER_LEVER,
+  full: 1,
+};
+
+/**
+ * Throttle at time `t` of a dwell of length `dwell`. Pure, so the ramp is
+ * asserted directly rather than inferred from a running script.
+ *
+ * Monotonic non-decreasing across the whole dwell by construction: each
+ * segment ends where the next begins, and the last step is upward.
+ */
+export function spoolThrottle(t, dwell) {
+  if (!(dwell > 0)) return SPOOL.full;
+  const f = t <= 0 ? 0 : t >= dwell ? 1 : t / dwell;
+  if (f >= SPOOL.windTo) return SPOOL.full;
+  if (f <= SPOOL.idleTo) {
+    return SPOOL.idle + (SPOOL.push - SPOOL.idle) * (f / SPOOL.idleTo);
+  }
+  const u = (f - SPOOL.idleTo) / (SPOOL.windTo - SPOOL.idleTo);
+  return SPOOL.push + (SPOOL.wind - SPOOL.push) * u;
+}
 
 // LAUNCH_VIEW, blended into the one rig -- never a second camera. §16.
 export const LAUNCH_VIEW = {
@@ -128,7 +179,9 @@ export function buildLaunchPlan({ runLength, clipSeconds }) {
   return {
     ...stroke,
     dwell,
-    burnerAt: Math.max(0, dwell - BURNER_BEFORE_FIRE),
+    // Derived from the dwell, which is derived from the clip: the burner
+    // lights on the recording's own last push, whatever length it is.
+    burnerAt: dwell * SPOOL.windTo,
     fireAt: dwell,
     releaseAt: release,
     gearUpAt: release + GEAR_UP_AFTER,
@@ -179,14 +232,16 @@ export function createLaunch({
       state.speed = 0;
       state.pitch = 0;
       state.position.y = deckY;
-      state.throttle = leverFor(110) + (t / Math.max(plan.dwell, 1e-6)) * 0.35;
+      state.throttle = spoolThrottle(t, plan.dwell);
     } else if (t < plan.releaseAt) {
       state.speed = strokeSpeed(
         (t - plan.fireAt) / plan.time, V0, plan.exitSpeed, EASE,
       );
       state.pitch = 0;
       state.position.y = deckY;
-      state.throttle = HANDOFF_THROTTLE;
+      // The throttle HOLDS at the stop through the stroke: the catapult is not
+      // the moment to come off the burner.
+      state.throttle = SPOOL.full;
     } else {
       // Off the bow: rotate, climb away, and converge on the handoff state.
       const since = t - plan.releaseAt;
@@ -199,10 +254,17 @@ export function createLaunch({
       const dip = Math.sin(Math.min(since / HANDOFF_AFTER, 1) * Math.PI) * 2.6;
       state.position.y =
         deckY - dip + since * state.speed * Math.sin(state.pitch) * 0.5;
-      state.throttle = HANDOFF_THROTTLE;
+      // Settle from the stop onto the handoff lever across the same window the
+      // speed converges over, so the number the player inherits is one the
+      // script arrived at rather than one it jumped to.
+      state.throttle =
+        SPOOL.full + (HANDOFF_THROTTLE - SPOOL.full) * Math.min(since / HANDOFF_AFTER, 1);
     }
 
-    state.afterburner = t >= plan.burnerAt;
+    // ONE RULE OWNS THE AFTERBURNER: the lever position, read through
+    // flight.js's own detent. A second condition here is how the HUD, the
+    // sound and the plume come to disagree about whether it is lit.
+    state.afterburner = isAfterburner(state.throttle);
     state.quat = quatFromEulerYXZ(state.heading, state.pitch, state.bank);
   }
 
@@ -221,8 +283,23 @@ export function createLaunch({
       rig?.blend("launch", { ...LAUNCH_VIEW, fov: LAUNCH_FOV_DECK }, 1);
     },
 
-    /** Returns true while the script still owns the aircraft. */
-    update(dt, state) {
+    /**
+     * Returns true while the script still owns the aircraft.
+     *
+     * `hold` is the audio gate (§9). A browser will not start audio before a
+     * user gesture, and the launch begins on the first frame of a fresh load --
+     * so an unheld deck fires the engine start-up into a blocked audio context,
+     * marks it played, and runs the whole opening silent. (The symptom is
+     * confusing: cycling game mode appears to "fix" it, because by then a
+     * keypress has armed the director.) Callers pass `!audio.isArmed()`.
+     *
+     * THE HOLD APPLIES ONLY AT t = 0. It may DELAY a launch, never PAUSE one in
+     * progress: an audio context that is lost or re-suspended mid-stroke must
+     * not freeze an aircraft that is already 100 m down the deck with the
+     * camera moving. Once the clock has advanced by a single frame the flag is
+     * ignored for the rest of the sequence.
+     */
+    update(dt, state, hold = false) {
       if (!active) {
         // Blend the composition out over 1.4 s AFTER the handoff. By the time
         // it is gone the ordinary speed-driven FOV has arrived at the same
@@ -241,6 +318,15 @@ export function createLaunch({
           );
         }
         return false;
+      }
+
+      if (hold && t <= 0) {
+        // Held: the aircraft sits on the deck shaking at the idle amplitude,
+        // which is what makes the wait read as a jet running rather than as a
+        // frozen frame. Nothing is emitted, so the countdown starts intact.
+        writeState(state);
+        rig?.setShake(SHAKE_FROM);
+        return true;
       }
 
       t += dt;
@@ -292,7 +378,7 @@ export function createLaunch({
         // Seed the flight model with exactly what the script ended on.
         state.speed = HANDOFF_SPEED;
         state.throttle = HANDOFF_THROTTLE;
-        state.afterburner = true;
+        state.afterburner = isAfterburner(HANDOFF_THROTTLE);
         state.sink = 0;
         state.pitch = ROTATE_PITCH;
         state.bank = 0;

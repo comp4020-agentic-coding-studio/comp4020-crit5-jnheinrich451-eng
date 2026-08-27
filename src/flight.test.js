@@ -91,6 +91,7 @@ import {
   HANDOFF_THROTTLE,
   ROTATE_PITCH,
   STROKE_MAX,
+  SPOOL,
   STROKE_MIN,
   V0,
   V1,
@@ -100,6 +101,7 @@ import {
   solveExitSpeed,
   solveStroke,
   solveStrokeTime,
+  spoolThrottle,
   strokeDistance,
   strokePosition,
   strokeSpeed,
@@ -2053,6 +2055,251 @@ function testLaunchSequence() {
     "the release point is frame-rate independent",
     Math.abs(Math.min(fast.maxAlong, DECK_RUN) - Math.min(slow.maxAlong, DECK_RUN)) < 1e-6,
     `60 Hz ${fast.maxAlong.toFixed(4)} vs 20 Hz ${slow.maxAlong.toFixed(4)}`,
+  );
+}
+
+// ── Changes 2 and 3 (DIAGNOSIS B3): the deck holds for audio, and spools ───
+
+/**
+ * Drive a launch against a stub audio director that arms at a named wall time,
+ * the way main.js does: `update(dt, state, !audio.isArmed())`.
+ *
+ * A TEST DOUBLE MUST MATCH THE REAL THING (§17.13). This stub exposes the one
+ * method the caller actually reads -- isArmed() -- and arms once and stays
+ * armed, exactly as audio.js does.
+ */
+function flyHeldLaunch({ armAt, hz = 60, seconds = 30 }) {
+  const anchors = deckAnchors(DECK_RUN);
+  const state = createFlightState();
+  const events = [];
+  const timeline = [];
+  let wall = 0;
+  const launch = createLaunch({
+    anchors,
+    clipSeconds: 22,
+    rig: { reset() {}, setShake() {}, blend() {} },
+    groundOffset: 2.95,
+    setGear() {},
+    onEvent: (name) => events.push({ name, wall, t: launch.elapsed() }),
+  });
+  launch.start(state);
+
+  let armed = false;
+  const dt = 1 / hz;
+  const audio = { isArmed: () => armed };
+  for (let i = 0; i < hz * seconds; i++) {
+    wall += dt;
+    if (wall >= armAt) armed = true;
+    launch.update(dt, state, !audio.isArmed());
+    timeline.push({ wall, t: launch.elapsed(), throttle: state.throttle, ab: state.afterburner });
+    if (launch.hasHandedOff()) break;
+  }
+  return { launch, state, events, timeline, wall, plan: launch.plan };
+}
+
+function testDeckIsHeldForAudio() {
+  const dwell = deckDwellFor(22);
+  check("the dwell is the clip at its playback rate", Math.abs(dwell - 11) < 1e-9, `${dwell}`);
+
+  // A director armed at 0 s fires the catapult at the dwell: unheld behaviour
+  // is unchanged, which is what makes the hold safe to add.
+  const immediate = flyHeldLaunch({ armAt: 0 });
+  const fire0 = immediate.events.find((e) => e.name === "fire");
+  check(
+    "armed at 0 s: the catapult fires at the dwell",
+    Math.abs(fire0.wall - dwell) < 3 / 60,
+    `${fire0.wall.toFixed(3)} vs ${dwell.toFixed(3)}`,
+  );
+
+  // Armed at 3.0 s: the whole sequence slides, so the start-up recording plays
+  // IN FULL against the deck and the catapult still fires on its last note.
+  const late = flyHeldLaunch({ armAt: 3 });
+  const fire3 = late.events.find((e) => e.name === "fire");
+  check(
+    "armed at 3.0 s: the catapult fires at 3.0 + dwell",
+    Math.abs(fire3.wall - (3 + dwell)) < 3 / 60,
+    `${fire3.wall.toFixed(3)} vs ${(3 + dwell).toFixed(3)}`,
+  );
+  check(
+    "and the script's own clock still reads the dwell at the shot",
+    Math.abs(fire3.t - dwell) < 2 / 60,
+    `${fire3.t.toFixed(3)} vs ${dwell.toFixed(3)}`,
+  );
+  check(
+    "the held deck emits nothing while it waits",
+    late.timeline.filter((f) => f.wall < 3).every((f) => f.t === 0),
+    "the clock moved while held",
+  );
+  check(
+    "the held aircraft sits at the deck's own parked throttle",
+    late.timeline[0].throttle === spoolThrottle(0, dwell) && late.timeline[0].ab === false,
+    `${late.timeline[0].throttle}`,
+  );
+
+  // THE HOLD APPLIES ONLY AT t = 0. It may delay a launch, never pause one in
+  // progress -- an audio context lost mid-stroke must not freeze an aircraft
+  // 100 m down the deck with the camera moving.
+  const anchors = deckAnchors(DECK_RUN);
+  const state = createFlightState();
+  const events = [];
+  const running = createLaunch({
+    anchors, clipSeconds: 22,
+    rig: { reset() {}, setShake() {}, blend() {} },
+    groundOffset: 2.95, setGear() {},
+    onEvent: (name) => events.push(name),
+  });
+  running.start(state);
+  const dt = 1 / 60;
+  // Twelve seconds unheld: past the shot and into the stroke.
+  for (let i = 0; i < 60 * 12; i++) running.update(dt, state, false);
+  const tAtLoss = running.elapsed();
+  check("the stroke is running before the flag arrives", tAtLoss > running.plan.fireAt, `${tAtLoss}`);
+  // Now assert the flag every frame, as a director that arms only at 12 s would.
+  for (let i = 0; i < 60 * 6; i++) running.update(dt, state, true);
+  check(
+    "a director that arms at 12 s does not pause a stroke already running",
+    running.elapsed() >= running.plan.handoffAt - 1e-9,
+    `held from ${tAtLoss.toFixed(2)}, reached ${running.elapsed().toFixed(2)} of ${running.plan.handoffAt.toFixed(2)}`,
+  );
+  check("and the held-late launch still hands off", running.hasHandedOff() === true);
+  check(
+    "the ordering is unchanged under a late hold",
+    events.join(",") === "burner,fire,release,gearUp,handoff",
+    events.join(","),
+  );
+
+  // A hold asserted from frame one and never released holds forever: the deck
+  // is a wait, not a timeout that gives up and runs silent anyway.
+  const forever = flyHeldLaunch({ armAt: 1e9, seconds: 20 });
+  check(
+    "a director that never arms never fires the catapult",
+    forever.events.length === 0 && forever.launch.elapsed() === 0,
+    `${forever.events.map((e) => e.name).join(",")} t=${forever.launch.elapsed()}`,
+  );
+}
+
+function testSpoolRamp() {
+  const dwell = deckDwellFor(22);
+  const plan = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 22 });
+
+  // KEYED IN FRACTIONS OF THE DWELL, NOT SECONDS. The dwell is derived from the
+  // recording's own length, so a ramp authored in seconds decouples the two the
+  // moment the clip is replaced.
+  check("the burner point is a fraction of the dwell", SPOOL.windTo === 0.87);
+  check(
+    "burnerAt is derived from the dwell, not offset from the shot",
+    Math.abs(plan.burnerAt - dwell * SPOOL.windTo) < 1e-9,
+    `${plan.burnerAt} vs ${dwell * SPOOL.windTo}`,
+  );
+  // The coupling, asserted against a different clip: a longer recording must
+  // move the burner with it rather than leaving it a fixed 1.4 s before the shot.
+  const long = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 40 });
+  check(
+    "a longer clip moves the burner point with the dwell",
+    Math.abs(long.burnerAt / long.dwell - plan.burnerAt / plan.dwell) < 1e-12,
+    `${long.burnerAt / long.dwell} vs ${plan.burnerAt / plan.dwell}`,
+  );
+
+  // MONOTONIC NON-DECREASING from t = 0 to fireAt. A recording that winds up
+  // over eleven seconds needs a throttle that winds up with it.
+  let prev = -Infinity;
+  let monotonic = true;
+  let worst = "";
+  for (let i = 0; i <= 2000; i++) {
+    const t = (i / 2000) * dwell;
+    const v = spoolThrottle(t, dwell);
+    if (v < prev - 1e-12) {
+      monotonic = false;
+      worst = `${prev.toFixed(4)} -> ${v.toFixed(4)} at ${(t / dwell).toFixed(3)} dwell`;
+    }
+    prev = v;
+  }
+  check("the spool ramp is monotonic non-decreasing", monotonic, worst);
+  check("it starts at idle", Math.abs(spoolThrottle(0, dwell) - SPOOL.idle) < 1e-12, `${spoolThrottle(0, dwell)}`);
+  check(
+    "it reaches the first push at 0.30 dwell",
+    Math.abs(spoolThrottle(dwell * 0.3, dwell) - SPOOL.push) < 1e-9,
+    `${spoolThrottle(dwell * 0.3, dwell)}`,
+  );
+  check(
+    "it is at the stop from 0.87 dwell",
+    spoolThrottle(dwell * 0.87, dwell) === 1 && spoolThrottle(dwell, dwell) === 1,
+  );
+  check(
+    "the wind-up is genuinely a wind-up, not a step",
+    spoolThrottle(dwell * 0.6, dwell) > SPOOL.push &&
+      spoolThrottle(dwell * 0.6, dwell) < SPOOL.wind,
+    `${spoolThrottle(dwell * 0.6, dwell)}`,
+  );
+  // A degenerate dwell must not divide by zero and strand the aircraft at idle.
+  check("a zero dwell reads the stop", spoolThrottle(0, 0) === 1);
+
+  // ONE RULE OWNS THE AFTERBURNER: isAfterburner(throttle), so the HUD, the
+  // sound and the plume cannot disagree about whether it is lit. Off at 0.86
+  // dwell, on at 0.88.
+  check(
+    "the burner is off at 0.86 dwell",
+    isAfterburner(spoolThrottle(dwell * 0.86, dwell)) === false,
+    `${spoolThrottle(dwell * 0.86, dwell)}`,
+  );
+  check(
+    "the burner is lit at 0.88 dwell",
+    isAfterburner(spoolThrottle(dwell * 0.88, dwell)) === true,
+    `${spoolThrottle(dwell * 0.88, dwell)}`,
+  );
+  check(
+    "the wind-up tops out ON the detent rather than past it",
+    SPOOL.wind === BURNER_LEVER,
+    `${SPOOL.wind} vs ${BURNER_LEVER}`,
+  );
+
+  // The same, read off a RUNNING script rather than off the pure function --
+  // the ramp is worth nothing if writeState does not use it.
+  const flown = flyHeldLaunch({ armAt: 0 });
+  const at = (t) => flown.timeline.reduce((best, f) => (f.t <= t ? f : best), flown.timeline[0]);
+  check(
+    "the running script is at idle early on the deck",
+    at(0.1).throttle < 0.25,
+    `${at(0.1).throttle.toFixed(3)}`,
+  );
+  check(
+    "the running script has the burner lit at 0.88 dwell",
+    at(dwell * 0.88).ab === true,
+    `${at(dwell * 0.88).throttle.toFixed(3)}`,
+  );
+  check(
+    "and NOT at 0.86 dwell",
+    at(dwell * 0.86).ab === false,
+    `${at(dwell * 0.86).throttle.toFixed(3)}`,
+  );
+  let deckMonotonic = true;
+  let last = -Infinity;
+  for (const f of flown.timeline) {
+    if (f.t > plan.fireAt) break;
+    if (f.throttle < last - 1e-9) deckMonotonic = false;
+    last = f.throttle;
+  }
+  check("the flown deck throttle is monotonic to the shot", deckMonotonic);
+  check(
+    "the throttle holds at the stop through the stroke",
+    flown.timeline
+      .filter((f) => f.t > plan.fireAt && f.t < plan.releaseAt)
+      .every((f) => f.throttle === 1),
+  );
+
+  // HANDOFF THROTTLE IS UNCHANGED AT 0.92. The ramp is a deck story; the state
+  // the player inherits is the one §9 specifies and nothing here may move it.
+  check(
+    "the handoff throttle is unchanged at 0.92",
+    flown.state.throttle === HANDOFF_THROTTLE && HANDOFF_THROTTLE === 0.92,
+    `${flown.state.throttle}`,
+  );
+  check("and the burner is lit at the handoff", flown.state.afterburner === true);
+  check(
+    "the settle from the stop to the handoff lever is downward, not a jump",
+    flown.timeline
+      .filter((f) => f.t > flown.plan.releaseAt)
+      .every((f) => f.throttle <= 1 + 1e-9 && f.throttle >= HANDOFF_THROTTLE - 1e-9),
   );
 }
 
@@ -4841,6 +5088,8 @@ const SUITES = [
   ["solving against decks", testSolveAgainstDecks],
   ["deck dwell is measured", testDeckDwellIsMeasured],
   ["launch sequence at 60 and 20 Hz", testLaunchSequence],
+  ["the deck is held for audio", testDeckIsHeldForAudio],
+  ["the spool ramp", testSpoolRamp],
   ["parked pose", testParkedPose],
   ["launch camera blend", testLaunchCameraBlend],
   ["the script owns the aircraft", testLaunchOwnsTheAircraft],

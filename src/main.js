@@ -781,7 +781,14 @@ function step(now) {
   }
   fx.renderCrash(crash);
 
-  const scripted = held ? true : (launch?.update(dt, state) ?? false);
+  // THE DECK IS HELD UNTIL AUDIO IS ARMED (§9). A browser will not start audio
+  // before a user gesture and the launch begins on the first frame of a fresh
+  // load, so an unheld deck fires the engine start-up into a blocked context,
+  // marks it played, and runs the whole opening silent. The hold applies only
+  // at t = 0 -- it can delay a launch, never pause one in progress.
+  const scripted = held
+    ? true
+    : (launch?.update(dt, state, !audio.isArmed()) ?? false);
   if (scripted) {
     // §9: no flight physics runs during the launch, and §17.4 -- a branch that
     // skips physics.update() must tick the response policy ITSELF, or the game
