@@ -128,6 +128,13 @@ import {
 } from "./missile.js";
 import { createGun, leadSolution } from "./gun.js";
 import {
+  TRAIL,
+  TRAIL_INTERVAL,
+  createTrails,
+  trailOpacity,
+  trailWidth,
+} from "./missile-trail.js";
+import {
   HOSTILE_CFG,
   HOSTILE_MISSILE,
   createHostile,
@@ -2874,6 +2881,235 @@ function testMissileTurnRadius() {
   );
 }
 
+// ── Change 5 (DIAGNOSIS B2): the missile trail ────────────────────────────
+
+function testMissileTrail() {
+  // The budget, first: 14 segments per round, 0.6 s of life, 0.35 m at the
+  // nozzle spreading to 2.6 m, opacity 0.8 down to nothing.
+  check("14 segments per round", TRAIL.segments === 14);
+  check("0.6 s of segment life", TRAIL.life === 0.6);
+  check("one segment per life/14", Math.abs(TRAIL_INTERVAL - 0.6 / 14) < 1e-12);
+  check("strip thickness runs 0.35 -> 2.6", trailWidth(0) === 0.35 && Math.abs(trailWidth(TRAIL.life) - 2.6) < 1e-12);
+  check("opacity runs 0.8 -> 0", trailOpacity(0) === 0.8 && trailOpacity(TRAIL.life) === 0);
+  let wMono = true;
+  let oMono = true;
+  let pw = -Infinity;
+  let po = Infinity;
+  for (let i = 0; i <= 100; i++) {
+    const a = (i / 100) * TRAIL.life;
+    if (trailWidth(a) < pw - 1e-12) wMono = false;
+    if (trailOpacity(a) > po + 1e-12) oMono = false;
+    pw = trailWidth(a);
+    po = trailOpacity(a);
+  }
+  check("a segment only ever widens", wMono);
+  check("and only ever fades", oMono);
+
+  // A round flying straight and fast. 900 m/s is the AIM-9's own top speed, so
+  // 0.5 s of flight is 450 m -- comfortably past the 200 m the gate asks for.
+  const trails = createTrails();
+  const round = {
+    owner: "player",
+    position: { x: 0, y: 500, z: 0 },
+    velocity: { x: 0, y: 0, z: -900 },
+  };
+  const rounds = [round];
+  const dt = 1 / 60;
+  const fly = (seconds) => {
+    for (let i = 0; i < Math.round(seconds / dt); i++) {
+      round.position.z -= 900 * dt;
+      trails.update(dt, rounds);
+    }
+  };
+
+  fly(0.1);
+  check("smoke appears within the first tenth of a second", trails.count() > 0, `${trails.count()}`);
+
+  // A SEGMENT IS A SPAN, NOT A PUFF. One point every life/14 at 900 m/s is a
+  // point every 38 m; drawn as a 2.6 m blob the trail is a row of dots with
+  // 35 m of clear air between them. Consecutive segments must SHARE AN ENDPOINT
+  // so the ribbon is continuous by construction, whatever the round's speed.
+  const chain = [...trails.live.values()][0].segments
+    .filter((sg) => sg.alive)
+    .sort((p, q) => q.age - p.age);
+  check("a segment has two endpoints", chain[0].bz !== undefined && chain[0].az !== undefined);
+  check(
+    "and it spans real distance rather than sitting on a point",
+    Math.hypot(chain[0].bx - chain[0].ax, chain[0].by - chain[0].ay, chain[0].bz - chain[0].az) > 1,
+  );
+  let joined = true;
+  let gap = 0;
+  for (let i = 1; i < chain.length; i++) {
+    const d = Math.hypot(
+      chain[i].ax - chain[i - 1].bx,
+      chain[i].ay - chain[i - 1].by,
+      chain[i].az - chain[i - 1].bz,
+    );
+    gap = Math.max(gap, d);
+    if (d > 1e-9) joined = false;
+  }
+  check("consecutive segments share an endpoint -- no gaps", joined, `worst gap ${gap}`);
+
+  // SEGMENT COUNT PER ROUND NEVER EXCEEDS 14. The array is a ring, so a round
+  // that flies for its whole 6.5 s life overwrites rather than growing.
+  let peak = 0;
+  for (let i = 0; i < 60 * 6; i++) {
+    round.position.z -= 900 * dt;
+    trails.update(dt, rounds);
+    trails.each((t) => {
+      peak = Math.max(peak, t.segments.filter((s) => s.alive).length);
+    });
+    if (peak > TRAIL.segments) break;
+  }
+  check("segment count per round never exceeds 14", peak <= TRAIL.segments, `peak ${peak}`);
+  check("and a steady round keeps the budget alive", peak >= TRAIL.segments - 1, `peak ${peak}`);
+  check(
+    "the pool is exactly 14 records, alive or not",
+    [...trails.live.values()].every((t) => t.segments.length === TRAIL.segments),
+  );
+
+  // SEGMENTS PERSIST IN WORLD POSITION AFTER THE ROUND HAS MOVED 200 m. This is
+  // the load-bearing claim: a ribbon parented to the round moves with it and
+  // reads as an ornament bolted to the missile.
+  const persist = createTrails();
+  const r2 = { owner: "player", position: { x: 0, y: 500, z: 0 }, velocity: { x: 0, y: 0, z: -900 } };
+  persist.update(dt, [r2]);
+  const laidAt = { ...r2.position };
+  for (let i = 0; i < Math.round(0.25 / dt); i++) {
+    r2.position.z -= 900 * dt;
+    persist.update(dt, [r2]);
+  }
+  const travelled = Math.abs(r2.position.z - laidAt.z);
+  check("the round has moved more than 200 m", travelled > 200, `${travelled.toFixed(0)} m`);
+  const oldest = [...persist.live.values()][0].segments
+    .filter((s) => s.alive)
+    .reduce((a, b) => (a.age > b.age ? a : b));
+  check(
+    "the oldest segment still starts where it was laid",
+    Math.abs(oldest.az - laidAt.z) < 1e-6,
+    `${oldest.az.toFixed(2)} vs ${laidAt.z.toFixed(2)}`,
+  );
+  check(
+    "and therefore 200 m behind the round, not on it",
+    Math.abs(oldest.az - r2.position.z) > 200,
+    `${Math.abs(oldest.az - r2.position.z).toFixed(0)} m behind`,
+  );
+  check(
+    "the segments are strung out along the flight path, not stacked",
+    new Set(
+      [...persist.live.values()][0].segments.filter((s) => s.alive).map((s) => s.az.toFixed(1)),
+    ).size > 4,
+  );
+  // The ribbon reaches the round: the newest segment ends where it is now.
+  const newest = [...persist.live.values()][0].segments
+    .filter((s) => s.alive)
+    .reduce((a, b) => (a.age < b.age ? a : b));
+  check(
+    "the newest segment ends within a frame of the round",
+    Math.abs(newest.bz - r2.position.z) < 900 / 60 + 1e-6,
+    `${Math.abs(newest.bz - r2.position.z).toFixed(2)} m`,
+  );
+
+  // A KILLED ROUND'S SEGMENTS FADE OUT RATHER THAN VANISHING. missile.js
+  // compacts a dead round out of its list on the frame it detonates, so a trail
+  // that lived inside the round would disappear with it -- and a kill that
+  // leaves no smoke reads as having happened nowhere.
+  const before = persist.count();
+  check("there is smoke to lose", before > 0, `${before}`);
+  persist.update(dt, []); // the round is gone
+  check("the trail is orphaned, not deleted", persist.orphans.length === 1);
+  check("and its smoke survives the frame the round died", persist.count() > 0, `${persist.count()}`);
+  const decay = [];
+  for (let i = 0; i < Math.round(TRAIL.life / dt) + 4; i++) {
+    persist.update(dt, []);
+    decay.push(persist.count());
+  }
+  check("the orphaned smoke thins out rather than cutting", decay.some((n) => n > 0 && n < before));
+  let fading = true;
+  for (let i = 1; i < decay.length; i++) if (decay[i] > decay[i - 1]) fading = false;
+  check("and it only ever thins", fading, decay.join(","));
+  check("it is gone within one segment life", persist.count() === 0, `${persist.count()}`);
+  check("and the orphan is released", persist.orphans.length === 0);
+
+  // The SAM round is the case §14 wrote the sentence for: it launches UPWARD
+  // with zero inherited speed, and the trail is what makes that read as a
+  // ground launch rather than as a round that appeared already flying.
+  const ground = createTrails();
+  const sam = { owner: "sam", position: { x: 200, y: 40, z: -8000 }, velocity: { x: 0, y: 440, z: 0 } };
+  const launchedAt = { ...sam.position };
+  for (let i = 0; i < Math.round(0.4 / dt); i++) {
+    sam.position.y += 440 * dt;
+    ground.update(dt, [sam]);
+  }
+  const column = [...ground.live.values()][0].segments.filter((s) => s.alive);
+  check("a SAM launch lays a vertical column", column.every((s) => Math.abs(s.ax - launchedAt.x) < 1e-9));
+  check(
+    "rooted at the ground, not at the round",
+    Math.min(...column.map((s) => s.ay)) < launchedAt.y + 40,
+    `lowest ${Math.min(...column.map((s) => s.ay)).toFixed(0)} vs launch ${launchedAt.y}`,
+  );
+  check(
+    "and reaching up to it",
+    Math.max(...column.map((s) => s.by)) > launchedAt.y + 100,
+    `highest ${Math.max(...column.map((s) => s.by)).toFixed(0)}`,
+  );
+  check(
+    "the column is continuous, not a row of dots",
+    column
+      .sort((p, q) => p.ay - q.ay)
+      .every((sg, i, all) => i === 0 || Math.abs(sg.ay - all[i - 1].by) < 1e-9),
+  );
+  check("the trail carries its owner, so nothing has to ask the round",
+    [...ground.live.values()][0].owner === "sam");
+
+  // clearFx() DROPS ALL TRAILS WITHOUT TOUCHING AMMUNITION. reset() reloads a
+  // magazine; clearFx() cleans up. A phase transition wants the second only.
+  const mixed = createTrails();
+  const gun = createGun();
+  gun.update(0.4, {
+    firing: true,
+    origin: { x: 0, y: 0, z: 0 },
+    forward: { x: 0, y: 0, z: -1 },
+    candidates: [],
+  });
+  const spent = gun.rounds;
+  check("the gun has spent rounds to protect", spent < 500, `${spent}`);
+  const a = { owner: "player", position: { x: 0, y: 100, z: 0 }, velocity: { x: 0, y: 0, z: -900 } };
+  const b = { owner: "sam", position: { x: 50, y: 10, z: -50 }, velocity: { x: 0, y: 440, z: 0 } };
+  for (let i = 0; i < 20; i++) {
+    a.position.z -= 15;
+    b.position.y += 7;
+    mixed.update(dt, [a, b]);
+  }
+  mixed.update(dt, [a]); // b dies, and orphans
+  check("there are live trails and an orphan to clear", mixed.live.size === 1 && mixed.orphans.length === 1);
+  mixed.clearFx();
+  check("clearFx drops every live trail", mixed.live.size === 0);
+  check("and every orphan", mixed.orphans.length === 0);
+  check("and every segment with them", mixed.count() === 0);
+  check("clearFx does NOT touch the ammunition", gun.rounds === spent, `${gun.rounds} vs ${spent}`);
+  check("and the trail field still works afterwards", (() => {
+    for (let i = 0; i < 10; i++) {
+      a.position.z -= 15;
+      mixed.update(dt, [a]);
+    }
+    return mixed.count() > 0;
+  })());
+
+  // Pooling: a magazine's worth of rounds fired and lost must not grow the
+  // record store without bound.
+  const churn = createTrails();
+  for (let shot = 0; shot < 12; shot++) {
+    const r = { owner: "player", position: { x: 0, y: 300, z: 0 }, velocity: { x: 0, y: 0, z: -900 } };
+    for (let i = 0; i < 30; i++) {
+      r.position.z -= 15;
+      churn.update(dt, [r]);
+    }
+    for (let i = 0; i < Math.round(TRAIL.life / dt) + 2; i++) churn.update(dt, []);
+  }
+  check("twelve rounds later nothing is still held", churn.count() === 0 && churn.orphans.length === 0);
+}
+
 function testGunMagazineAndFx() {
   const hits = [];
   const gun = createGun({ onHit: (t) => hits.push(t) });
@@ -5295,6 +5531,7 @@ const SUITES = [
   ["a defeated round keeps flying", testDefeatedRoundKeepsFlying],
   ["expireOwner", testExpireOwner],
   ["missile turn radius", testMissileTurnRadius],
+  ["the missile trail", testMissileTrail],
   ["gun magazine and fx", testGunMagazineAndFx],
   ["hostile transition table", testHostileTransitionTable],
   ["ammo 0 is the design tool", testAmmoZeroIsTheDesignTool],

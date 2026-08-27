@@ -13,6 +13,7 @@ import { createWeapons } from "./weapons.js";
 import { createDrone, damageTarget } from "./enemy.js";
 import { createTargeting, LOCK } from "./targeting.js";
 import { AIM9, createMissileSystem } from "./missile.js";
+import { createTrails } from "./missile-trail.js";
 import { createGun, leadSolution } from "./gun.js";
 import { createCombatHud } from "./combat-hud.js";
 import { createCombatFx } from "./combat-fx.js";
@@ -136,6 +137,11 @@ const damage = createDamageResponse({
     messageUntil = clock + 1.2;
   },
 });
+
+// The smoke every round leaves behind (§14). Held beside the missile system
+// rather than inside it: the segments OUTLIVE the round that laid them, and
+// missile.js compacts a dead round out of its list on the frame it detonates.
+const trails = createTrails();
 
 const missiles = createMissileSystem({
   // THE single counter-measure hook (§14). The barrel roll attaches here and
@@ -381,6 +387,7 @@ function respawnAfterCrash() {
   missiles.expireOwner("hostile");
   missiles.expireOwner("sam");
   gun.clearFx();
+  trails.clearFx();
   threatMonitor.reset();
   damage.reset();
   evasion.reset();
@@ -408,6 +415,7 @@ function restoreCheckpoint() {
   }
   missiles.expireOwner("hostile");
   gun.clearFx();
+  trails.clearFx();
   threatMonitor.reset();
   damage.reset();
   evasion.reset();
@@ -467,6 +475,7 @@ function restartSortie() {
   // reason -- a restart wants both, a phase change wants only one.
   gun.reset();
   gun.clearFx();
+  trails.clearFx();
   missiles.clear();
   fx.clear();
   targeting.clear();
@@ -543,6 +552,7 @@ function onPhaseChange(to, from) {
   // the restore above.
   missiles.expireOwner("hostile");
   gun.clearFx();
+  trails.clearFx();
   threatMonitor.reset();
   damage.reset();
 
@@ -1020,6 +1030,11 @@ function step(now) {
       messageUntil = clock + 1.4;
     }
   }
+  // The trail is stepped AFTER the rounds have moved, so a segment is laid at
+  // the position the round actually reached this frame. Stepping it first lays
+  // the smoke one frame ahead of the missile.
+  trails.update(dt, missiles.rounds);
+  fx.syncTrails(trails, world.camera);
   fx.syncMissiles(missiles.rounds);
   fx.syncTracers(gun.tracers);
   fx.update(dt);
@@ -1444,6 +1459,11 @@ if (new URLSearchParams(location.search).has("test")) {
 // headless browser. Not used by gameplay.
 globalThis.__vector = {
   get state() { return state; },
+  get missiles() { return missiles; },
+  get trails() { return trails; },
+  get sams() { return sams; },
+  get weapons() { return weapons; },
+  get hud() { return hud; },
   get airframe() { return airframe; },
   get launch() { return launch; },
   get anchors() { return carrierAnchors; },

@@ -11,6 +11,32 @@ const TRACER_COLOUR = 0xffd79a;
 const MISSILE_COLOUR = 0xd8dde5;
 const PLUME_COLOUR = 0xffc078;
 
+/** A strip that is opaque down its spine and soft at both edges. */
+function softTexture() {
+  const w = 32;
+  const h = 4;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  const image = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const r = Math.abs(x / (w - 1) - 0.5) * 2;
+      const a = Math.pow(Math.max(0, 1 - r * r), 1.4);
+      const i = (y * w + x) * 4;
+      image.data[i] = 255;
+      image.data[i + 1] = 255;
+      image.data[i + 2] = 255;
+      image.data[i + 3] = Math.round(255 * a);
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 export function createCombatFx(scene) {
   // ── missiles ─────────────────────────────────────────────────────────────
   const missileGeom = new THREE.CylinderGeometry(0.14, 0.14, 2.85, 8);
@@ -42,6 +68,57 @@ export function createCombatFx(scene) {
     missilePool.push(entry);
     return entry;
   }
+
+  // ── missile trails ───────────────────────────────────────────────────────
+  //
+  // The round must LEAVE the smoke behind, so every segment is drawn at the
+  // WORLD position missile-trail.js recorded it at and is never moved again.
+  // Same approach as the crash smoke below, which already got this right.
+  //
+  // NORMAL blending, not additive: a rocket motor's smoke is grey and it
+  // OCCLUDES what is behind it. Additive smoke over the ocean turns into a pale
+  // haze that reads as lens dirt.
+  //
+  // Pooled and reused, and the pool is shared across every round in the air --
+  // a magazine of two, a hostile pair and a SAM salvo peak at well under a
+  // hundred segments between them.
+  // A SEGMENT IS A QUAD SPANNING ITS TWO ENDPOINTS, billboarded about the span
+  // -- the same trick the engine plume uses, and for the same reason. A
+  // camera-facing sprite cannot stretch along a world axis, and one segment of
+  // an AIM-9's trail is 38 m long: drawn as a sprite it is either a 38 m ball
+  // or a 2.6 m dot with 35 m of clear air on either side.
+  const trailGeom = new THREE.PlaneGeometry(1, 1);
+  const trailTex = softTexture();
+  const trailMat = new THREE.MeshBasicMaterial({
+    map: trailTex, color: 0xb9c0c7, transparent: true, opacity: 0,
+    depthWrite: false, side: THREE.DoubleSide, fog: true,
+  });
+  const trailPool = [];
+
+  function borrowTrail() {
+    for (const mesh of trailPool) {
+      if (!mesh.visible) {
+        mesh.visible = true;
+        return mesh;
+      }
+    }
+    const mesh = new THREE.Mesh(trailGeom, trailMat.clone());
+    mesh.frustumCulled = false;
+    mesh.renderOrder = -1;
+    scene.add(mesh);
+    trailPool.push(mesh);
+    return mesh;
+  }
+
+  // Hoisted: this runs for every live segment of every round in the air.
+  const segA = new THREE.Vector3();
+  const segB = new THREE.Vector3();
+  const segMid = new THREE.Vector3();
+  const segAxis = new THREE.Vector3();
+  const segToCam = new THREE.Vector3();
+  const segRight = new THREE.Vector3();
+  const segNormal = new THREE.Vector3();
+  const segBasis = new THREE.Matrix4();
 
   // ── tracers ──────────────────────────────────────────────────────────────
   // One LineSegments for ALL tracers, rewritten each frame. A mesh per tracer
@@ -189,6 +266,43 @@ export function createCombatFx(scene) {
       }
     },
 
+    /** Draw every live segment of every trail, live rounds and orphans alike. */
+    syncTrails(trails, camera) {
+      let used = 0;
+      trails.each((trail) => {
+        for (const seg of trail.segments) {
+          if (!seg.alive) continue;
+          segA.set(seg.ax, seg.ay, seg.az);
+          segB.set(seg.bx, seg.by, seg.bz);
+          segAxis.subVectors(segB, segA);
+          const length = segAxis.length();
+          if (length < 1e-4) continue;
+          const mesh = borrowTrail();
+          used++;
+          segMid.addVectors(segA, segB).multiplyScalar(0.5);
+          mesh.position.copy(segMid);
+          // The quad's local +Y runs along the span and it spins about that
+          // axis until its face is toward the camera, so the strip reads the
+          // same from every angle instead of vanishing edge-on.
+          segAxis.multiplyScalar(1 / length);
+          segToCam.subVectors(camera.position, segMid);
+          segRight.crossVectors(segAxis, segToCam);
+          if (segRight.lengthSq() < 1e-8) segRight.set(1, 0, 0);
+          segRight.normalize();
+          segNormal.crossVectors(segRight, segAxis).normalize();
+          segBasis.makeBasis(segRight, segAxis, segNormal);
+          mesh.quaternion.setFromRotationMatrix(segBasis);
+          // Overlapped very slightly along the span so consecutive quads share
+          // an edge rather than showing a seam at the join.
+          mesh.scale.set(seg.width, length * 1.02, 1);
+          mesh.material.opacity = seg.opacity;
+        }
+      });
+      // Everything past the high-water mark goes back rather than being left
+      // parked at wherever the last round died.
+      for (let i = used; i < trailPool.length; i++) trailPool[i].visible = false;
+    },
+
     syncTracers(list) {
       const n = Math.min(list.length, MAX_TRACERS);
       for (let i = 0; i < n; i++) {
@@ -236,6 +350,7 @@ export function createCombatFx(scene) {
 
     clear() {
       releaseAll();
+      for (const sprite of trailPool) sprite.visible = false;
       for (const entry of missilePool) {
         entry.inUse = false;
         entry.group.visible = false;
