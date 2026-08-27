@@ -135,6 +135,14 @@ export const MISSION = {
     /** §04.7 — how far ahead a respawn checks for ground before it commits. */
     spawnLookAhead: 4000,
     spawnStep: 300,
+    /**
+     * How far the aircraft must fly from where it was PLACED before that
+     * placement stops suppressing leg credit. See `armCurrentLeg` below.
+     *
+     * Larger than every leg radius except RECOVERY's 2400, so by the time it
+     * lapses the aircraft has genuinely left any volume it was dropped into.
+     */
+    placedClear: 2600,
   },
 
   /** §38 — four checkpoints, not one every few seconds. */
@@ -448,6 +456,44 @@ export function safeSpawnAltitude(position, heading, sampleHeight, cfg = MISSION
   return Math.max(r.minTerrainAltitude, highest + lift);
 }
 
+/**
+ * Every pair of legs whose trigger volumes share airspace, as a pure report.
+ *
+ * §19 already demands one instance of this by hand — "assert that the INTERCEPT
+ * and COASTLINE volumes do not overlap", because if they touch, entering the
+ * intercept area instantly satisfies "reached the next region" for a fight that
+ * has not started. That reasoning was never generalised, and the case that bit
+ * was a different pair entirely: on a surveyed route PASS(TERRAIN) came out
+ * 696 m from SEAWARD(FINAL), close enough that PASS's centre lies inside
+ * SEAWARD's volume.
+ *
+ * Overlap is not automatically a fault. The route deliberately revisits its own
+ * airspace — RECOVERY sits almost on top of COAST, because the sortie flies out
+ * and comes home — and that is harmless when the phases are far apart in time.
+ * It is `contained` that is worth reading: one leg's centre inside another's
+ * volume means a player standing on one waypoint is standing on the other.
+ *
+ * The two COASTLINE copies are excluded. They are authored at identical
+ * coordinates on purpose, so one waterline can serve as the "next region" for
+ * two consecutive encounters (§19).
+ *
+ * @returns {{ a: object, b: object, distance: number, contained: boolean }[]}
+ */
+export function routeOverlaps(route) {
+  const out = [];
+  for (let i = 0; i < route.length; i++) {
+    for (let j = i + 1; j < route.length; j++) {
+      const a = route[i];
+      const b = route[j];
+      if (a.name === b.name) continue;
+      const distance = flatDistanceTo(a.position, b.position);
+      if (distance >= a.radius + b.radius) continue;
+      out.push({ a, b, distance, contained: distance < Math.max(a.radius, b.radius) });
+    }
+  }
+  return out;
+}
+
 /* ---- the transition table (§3) ---- *//**
  * The one place a phase may change. Every condition in the stage brief lives
  * here, and nothing in an update loop is allowed to promote a phase — the same
@@ -629,6 +675,43 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
 
   const stats = { time: 0, kills: 0, groundKills: 0, aim9Fired: 0, aim9Loadout: 2, gunFired: 0, gunHits: 0, evasions: 0, checkpointsUsed: 0 };
 
+  /**
+   * A LEG IS SATISFIED BY ARRIVING AT IT, NOT BY STANDING IN IT.
+   *
+   * Reported from play: killed by a SAM while approaching VALLEY, and after the
+   * respawn the nav marker was on RECOVERY — RIDGE and SEAWARD both gone. The
+   * cause is two volumes sharing airspace plus one teleport. Measured on the
+   * shipped terrain, and logged by main.js at load:
+   *
+   *   TERRAIN/PASS <-> FINAL/SEAWARD   1517 m apart, and SEAWARD's radius is 1600
+   *
+   * So PASS's centre lies inside SEAWARD's volume, with 83 m to spare — close
+   * enough that standing on one waypoint is standing on the other, and marginal
+   * enough that a different survey could make it worse. The collision is between
+   * a leg the terrain survey DERIVES (PASS, 1.2-10.5 km inland) and one the
+   * config AUTHORS (SEAWARD, a fixed `seawardBack` 2000 m inland); nothing
+   * reconciles the two, so how close they land is left to the height field.
+   *
+   * `respawnFromCrash` backs the aircraft 1800 m along its heading of travel,
+   * which from a death between PASS and VALLEY lands it back inside SEAWARD's
+   * volume. Nothing fires yet, because only the CURRENT phase's leg is ever
+   * checked. Then TERRAIN's 98 s fallback expires, FINAL is entered, and its one
+   * leg is satisfied on the entry frame by a position the player never flew to.
+   * legDone goes true and EXTRACTION follows in the same frame. Two waypoints
+   * vanish at once and the sortie skips to its ending.
+   *
+   * The guard is deliberately scoped to PLACEMENT, not to phase entry. Being
+   * inside a leg when its phase begins is NORMAL and correct — on a clean run
+   * the player is already inside PASS when TERRAIN starts, because they spent
+   * DEFENSIVE flying to it. Requiring an exit there would mean overflying the
+   * waypoint and doubling back, which is a worse bug than the one being fixed.
+   * What is not normal is being PUT somewhere by a respawn or a checkpoint
+   * restore. So credit is suspended only for a volume the aircraft was placed
+   * inside, and only until it has flown clear of where it was placed.
+   */
+  let placedAt = null;
+  let armed = true;
+
   let route = [];
   let legs = [];
   const checkpoints = new Array(cfg.checkpoints).fill(null);
@@ -642,11 +725,39 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
     return route;
   }
 
+  /**
+   * Decide whether the CURRENT leg may be satisfied by simply being inside it.
+   *
+   * It may not, if the aircraft was placed inside it and has not yet flown clear
+   * of where it was placed. In that case the leg arms on the way OUT, so it
+   * still counts the moment the player flies back in — the waypoint is not lost,
+   * it just has to be reached.
+   */
+  function armCurrentLeg() {
+    const leg = legs[state.legIndex];
+    armed = !(placedAt && leg && insideTrigger(leg, placedAt));
+  }
+
+  /**
+   * The aircraft was PUT here rather than flying here — a crash respawn, or a
+   * checkpoint restore. Called by the orchestrator after it writes the transform,
+   * because the director cannot see a position it was not handed.
+   */
+  function notifyPlaced(position) {
+    placedAt = position ? { x: position.x, y: position.y, z: position.z } : null;
+    armCurrentLeg();
+    return placedAt;
+  }
+
   /** Legs belonging to the current phase, in order. */
   function selectLegs() {
     legs = route.filter((l) => l.phase === state.phase);
     state.legIndex = 0;
     state.legDone = legs.length === 0;
+    // Re-armed against the placement, not the phase: a phase entered while the
+    // aircraft still sits where a respawn dropped it must not hand out credit
+    // for a waypoint it was dropped on top of.
+    armCurrentLeg();
     publishNav();
   }
 
@@ -757,13 +868,25 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
 
     // Leg progression: broad volumes, checked against the CURRENT leg only, so
     // flying through a later volume early cannot skip the route.
+    // A placement stops suppressing credit once the aircraft has flown clear of
+    // it. Checked before the trigger, so the frame the player earns their way
+    // out is the frame the guard lifts.
+    if (placedAt && ctx.position && flatDistanceTo(placedAt, ctx.position) > cfg.route.placedClear) placedAt = null;
+
     if (!state.legDone && legs.length) {
       const leg = legs[state.legIndex];
-      if (insideTrigger(leg, ctx.position)) {
+      const inside = insideTrigger(leg, ctx.position);
+      // Arms on the way OUT: a leg the aircraft was placed inside becomes
+      // available again the moment it is left, so flying back in still counts.
+      if (!armed && !inside) armed = true;
+      if (armed && inside) {
         satisfied.add(legKey(leg));
         emit("leg", { leg, index: state.legIndex, phase: state.phase });
         state.legIndex += 1;
         if (state.legIndex >= legs.length) state.legDone = true;
+        // The NEXT leg gets the same test against the same placement — one
+        // respawn can sit inside two volumes.
+        armCurrentLeg();
         publishNav();
       }
     }
@@ -842,6 +965,8 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
   }
 
   function reset() {
+    placedAt = null;
+    armed = true;
     state.phase = MissionPhase.DECK;
     state.prevPhase = null;
     state.phaseTime = 0;
@@ -888,6 +1013,7 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
     fail,
     rewind,
     reset,
+    notifyPlaced,
     /** MISSION runs the phase machine; FREE and PEACE park after the launch. */
     setSandbox(on) {
       state.sandbox = !!on;

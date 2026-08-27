@@ -27,6 +27,7 @@ import {
   bearingTo,
   formatClock,
   formatShortClock,
+  routeOverlaps,
 } from "./mission.js";
 import { createPhysicsDebug, createCarrierAnchorDebug } from "./physics-debug.js";
 import { WEAPONS, WeaponMode, cycleWeapon, createWeaponMounts, createMountedMissiles, loadAim9 } from "./weapons.js";
@@ -468,6 +469,17 @@ function respawnFromCrash() {
     flightState.position.y = below + RESPAWN.clearance;
     syncAircraft();
   }
+  /**
+   * Tell the director the aircraft was PUT here, not flown here.
+   *
+   * Without this the respawn hands out waypoint credit for wherever it drops
+   * you. Reported from play: shot down approaching VALLEY, and the nav marker
+   * came back on RECOVERY with RIDGE and SEAWARD both skipped — the retreat had
+   * landed the aircraft inside SEAWARD's volume, and the next phase change
+   * satisfied it on its entry frame. mission.js's `armCurrentLeg` carries the
+   * full account.
+   */
+  director.notifyPlaced(flightState.position);
   console.log("[respawn]", { impact: [Math.round(crashFx.state.origin.x), Math.round(crashFx.state.origin.z)], spawn: [Math.round(x), Math.round(y), Math.round(z)], headingDeg: Math.round((h * 180) / Math.PI), lives });
   // Diegetic, and deliberately a little cold: the aircraft you were flying is
   // gone, and so is whoever was in it.
@@ -513,6 +525,10 @@ function restoreMissionState(snapshot) {
   atmosphere.reset();
   prevPitchDeg = flightState.pitch / DEG;
   pitchRateDeg = 0;
+  // A checkpoint restore is a placement too — same reason as the crash respawn.
+  // rewind() re-selects the phase's legs BEFORE calling this, so this is the
+  // call that arms them against where the aircraft actually ended up.
+  director.notifyPlaced(flightState.position);
 }
 
 const director = createMissionDirector({
@@ -770,6 +786,25 @@ function buildRoute() {
 
   director.setRoute(route);
   console.log("[mission] route", { coastZ, features, legs: route.map((l) => `${l.phase}/${l.name} @ ${Math.round(l.position.x)},${Math.round(l.position.z)} r${l.radius}`) });
+  /**
+   * The route survey is data-driven, so its geometry is not knowable until the
+   * terrain has loaded — which means a collision between a SURVEYED leg and an
+   * AUTHORED one can only be reported here, at runtime, not asserted at build
+   * time. This one is real on the shipped terrain: PASS comes out 1517 m from
+   * SEAWARD, whose radius is 1600 — inside it, with 83 m to spare.
+   *
+   * No longer harmful — mission.js suspends leg credit for a volume the aircraft
+   * was PLACED inside — but still worth naming, because it is what turned one
+   * respawn into two skipped waypoints, and a future survey could put a worse
+   * pair on top of each other.
+   */
+  const overlaps = routeOverlaps(route).filter((o) => o.contained);
+  if (overlaps.length) {
+    console.warn(
+      "[mission] legs sharing airspace — one waypoint's centre lies inside another's volume",
+      overlaps.map((o) => `${o.a.phase}/${o.a.name} <-> ${o.b.phase}/${o.b.name} ${Math.round(o.distance)}m`)
+    );
+  }
   return route;
 }
 

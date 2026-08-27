@@ -63,6 +63,7 @@ import {
   formatShortClock,
   missionSummary,
   missionExpired,
+  routeOverlaps,
   createMissionDirector,
 } from "./mission.js";
 import { MISSION_FAILURE, createMissionCheckpointResponse } from "./collision.js";
@@ -4297,6 +4298,216 @@ function flyMission({ hostileDiesAt = null, hostileSpentAt = null, failAt = null
   // Sitting inside a TERRAIN volume while still on the deck changes nothing.
   for (let i = 0; i < 30; i++) director.update({ position: terrainLeg.position, strokeStarted: false, launchDone: false, hostileAlive: true, hostileSpent: false }, 1 / 30);
   check("mission: a later phase's volume cannot pull the mission forward", director.state.phase === MissionPhase.DECK, director.state.phase);
+}
+
+/**
+ * A LEG IS SATISFIED BY ARRIVING AT IT, NOT BY STANDING IN IT.
+ *
+ * Reported from play: shot down by a SAM while approaching VALLEY, and after the
+ * respawn the nav marker read RECOVERY — RIDGE and SEAWARD both skipped. The
+ * On the shipped terrain the game logs the collision at load:
+ *
+ *   TERRAIN/PASS <-> FINAL/SEAWARD   1517 m, and SEAWARD's radius is 1600
+ *
+ * The fixture below is a SYNTHETIC stand-in for that, not a copy of it: the real
+ * survey needs the terrain mesh, which this suite deliberately cannot load. It
+ * is built to reproduce the same RELATIONSHIP — a surveyed PASS close enough
+ * inland that the authored SEAWARD contains it — rather than the same numbers,
+ * and it sits tighter than the real route so the case stays unambiguous if the
+ * radii are ever retuned.
+ *
+ * §17.14 — assert the MECHANISM. "The mission still completes" passes with this
+ * bug fully present, because skipping two waypoints reaches COMPLETE sooner.
+ * What has to hold is that the skipped waypoints are actually published.
+ */
+const SKIPPED_ROUTE = [
+  { x: 303, z: -10100, height: 42 },
+  { x: 303, z: -12700, height: 105 },
+  { x: -2260, z: -17900, height: 108 },
+];
+const skippedRoute = () => planRoute({ coastZ: -7600, features: SKIPPED_ROUTE });
+const legNamed = (name) => skippedRoute().find((l) => l.name === name);
+
+/** A director walked to TERRAIN with PASS behind it, then placed at `position`. */
+function terrainDirectorAt(position) {
+  const d = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  d.setRoute(skippedRoute());
+  d.reset();
+  const pos = { x: 0, y: 600, z: -1546 };
+  const dt = 1 / 20;
+  let t = 0;
+  while (t < 300 && d.state.phase !== MissionPhase.TERRAIN) {
+    t += dt;
+    const m = d.state;
+    if (m.navValid && d.playerFlies) {
+      const dx = m.navPosition.x - pos.x;
+      const dz = m.navPosition.z - pos.z;
+      const len = Math.hypot(dx, dz) || 1;
+      pos.x += (dx / len) * 190 * dt;
+      pos.z += (dz / len) * 190 * dt;
+    } else if (d.playerFlies) pos.z -= 190 * dt;
+    d.update({ position: pos, strokeStarted: t >= 1.7, launchDone: t >= 5.42, hostileAlive: t < 40, hostileSpent: t >= 95 }, dt);
+  }
+  Object.assign(pos, position);
+  return { d, pos, dt };
+}
+
+const holdStep = (d, pos, dt) =>
+  d.update({ position: pos, strokeStarted: true, launchDone: true, hostileAlive: false, hostileSpent: true }, dt);
+
+{
+  const seaward = legNamed("SEAWARD");
+  const pass = legNamed("PASS");
+  check(
+    "route: the reported geometry is real — PASS stands inside SEAWARD's volume",
+    flatDistanceTo(pass.position, seaward.position) < seaward.radius,
+    Math.round(flatDistanceTo(pass.position, seaward.position))
+  );
+
+  // Where respawnFromCrash() puts the aircraft after a kill between PASS and
+  // VALLEY: 1800 m back along the heading of travel, at the 4000 m floor.
+  const spawn = { x: 300, y: 4000, z: -8909 };
+  check(
+    "respawn: and the crash retreat lands inside that volume",
+    flatDistanceTo(spawn, seaward.position) < seaward.radius,
+    Math.round(flatDistanceTo(spawn, seaward.position))
+  );
+
+  const { d, pos, dt } = terrainDirectorAt(spawn);
+  check("respawn: the director is still in TERRAIN when the aircraft is placed", d.state.phase === MissionPhase.TERRAIN, d.state.phase);
+  d.notifyPlaced(pos);
+
+  // Hold still, as a player getting their bearings does, long enough for
+  // TERRAIN's 98 s fallback to expire and hand the mission to FINAL.
+  const seen = [];
+  let prev = null;
+  let t = 0;
+  while (t < 130 && d.state.phase !== MissionPhase.COMPLETE) {
+    t += dt;
+    holdStep(d, pos, dt);
+    const k = `${d.state.phase}/${d.state.navName}`;
+    if (k !== prev) {
+      seen.push(k);
+      prev = k;
+    }
+    if (d.state.phase === MissionPhase.FINAL && t > 60) break;
+  }
+  check("respawn: FINAL is reached, not skipped past", seen.some((k) => k.startsWith(MissionPhase.FINAL)), seen);
+  check(
+    "respawn: and SEAWARD is PUBLISHED, not satisfied by the placement (§17.14)",
+    d.state.phase === MissionPhase.FINAL && d.state.navName === "SEAWARD",
+    [d.state.phase, d.state.navName]
+  );
+  check("respawn: EXTRACTION is not entered on FINAL's own entry frame", !seen.includes(`${MissionPhase.EXTRACTION}/RECOVERY`), seen);
+}
+
+{
+  // The waypoint is SUSPENDED, not destroyed: leaving and flying back in counts.
+  //
+  // Asserted on the `leg` EVENT rather than on state.legDone. Satisfying FINAL's
+  // only leg promotes the phase inside the same update() call, and the entry
+  // into EXTRACTION recomputes legDone against ITS legs -- so legDone reads
+  // false again one line later and a check written on it fails while the code is
+  // working. The event is the record of the fact; the flag is a phase's status.
+  const seaward = legNamed("SEAWARD");
+  const { d, pos, dt } = terrainDirectorAt({ x: 300, y: 4000, z: -8909 });
+  const reached = [];
+  d.on("leg", ({ leg }) => reached.push(leg.name));
+  d.notifyPlaced(pos);
+  for (let i = 0; i < 20 * 130 && d.state.phase !== MissionPhase.FINAL; i++) holdStep(d, pos, dt);
+  check("respawn: SEAWARD starts unsatisfied", d.state.phase === MissionPhase.FINAL && !reached.includes("SEAWARD"), [d.state.phase, reached]);
+  pos.x = seaward.position.x;
+  pos.z = seaward.position.z + 5000;
+  holdStep(d, pos, dt);
+  check("respawn: ...still unsatisfied while outside it", !reached.includes("SEAWARD"), reached);
+  pos.z = seaward.position.z;
+  holdStep(d, pos, dt);
+  check("respawn: arriving at it counts — the waypoint was suspended, not lost", reached.includes("SEAWARD"), reached);
+}
+
+{
+  // NO STALL. Being inside a leg when its phase begins is normal and correct: on
+  // a clean run the player is already inside PASS when TERRAIN starts, because
+  // they spent DEFENSIVE flying to it. Requiring an exit THERE would mean
+  // overflying the waypoint and doubling back — a worse bug than the one fixed.
+  const d = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  d.setRoute(skippedRoute());
+  d.reset();
+  const pos = { x: 0, y: 600, z: -1546 };
+  const dt = 1 / 20;
+  let t = 0;
+  const phases = [];
+  const navs = [];
+  while (t < 500 && d.state.phase !== MissionPhase.COMPLETE) {
+    t += dt;
+    const m = d.state;
+    if (m.navValid && d.playerFlies) {
+      const dx = m.navPosition.x - pos.x;
+      const dz = m.navPosition.z - pos.z;
+      const len = Math.hypot(dx, dz) || 1;
+      pos.x += (dx / len) * 190 * dt;
+      pos.z += (dz / len) * 190 * dt;
+    } else if (d.playerFlies) pos.z -= 190 * dt;
+    d.update({ position: pos, strokeStarted: t >= 1.7, launchDone: t >= 5.42, hostileAlive: t < 40, hostileSpent: t >= 95 }, dt);
+    if (phases[phases.length - 1] !== d.state.phase) phases.push(d.state.phase);
+    if (d.state.navName && navs[navs.length - 1] !== d.state.navName) navs.push(d.state.navName);
+  }
+  check("no stall: an undisturbed run on the same route still completes", d.state.phase === MissionPhase.COMPLETE, d.state.phase);
+  check(
+    "no stall: and every waypoint is still published on the way",
+    JSON.stringify(navs) === JSON.stringify(["COAST", "INTERCEPT", "COASTLINE", "PASS", "VALLEY", "RIDGE", "SEAWARD", "RECOVERY"]),
+    navs
+  );
+}
+
+{
+  // §19's overlap assertion, generalised from the single pair it names.
+  const authored = planRoute({ coastZ: -7600, features: [] });
+  const surveyed = skippedRoute();
+  const contained = (route) => routeOverlaps(route).filter((o) => o.contained);
+
+  const intercept = authored.find((l) => l.name === "INTERCEPT");
+  const coastline = authored.find((l) => l.name === "COASTLINE");
+  check(
+    "route: INTERCEPT and COASTLINE do not overlap (§19)",
+    flatDistanceTo(intercept.position, coastline.position) >= intercept.radius + coastline.radius,
+    Math.round(flatDistanceTo(intercept.position, coastline.position))
+  );
+  /**
+   * Scoped to phases that are ADJACENT in PHASE_ORDER, because that is where
+   * containment can actually hurt: the aircraft is somewhere when a phase ends,
+   * and the next phase's leg is tested against that same position.
+   *
+   * Route-wide would be the wrong bar and would fail on a correct route. The
+   * sortie deliberately comes home to where it started -- RECOVERY (r=2400) sits
+   * 200 m from COAST and contains it outright -- and that is harmless precisely
+   * because EGRESS and EXTRACTION are four phases apart.
+   */
+  const adjacent = (a, b) => Math.abs(PHASE_ORDER.indexOf(a) - PHASE_ORDER.indexOf(b)) === 1;
+  const risky = (route) => contained(route).filter((o) => adjacent(o.a.phase, o.b.phase));
+  check(
+    "route: the authored fallback has no leg standing inside the NEXT phase's leg",
+    risky(authored).length === 0,
+    risky(authored).map((o) => `${o.a.name}/${o.b.name} ${Math.round(o.distance)}`)
+  );
+  check(
+    "route: ...and the far-apart overlaps it does have are left alone",
+    contained(authored).some((o) => !adjacent(o.a.phase, o.b.phase)),
+    contained(authored).map((o) => `${o.a.name}/${o.b.name}`)
+  );
+  check(
+    "route: the surveyed route that was reported DOES trip the adjacent-phase bar",
+    risky(surveyed).some((o) => [o.a.name, o.b.name].includes("SEAWARD")),
+    risky(surveyed).map((o) => `${o.a.name}/${o.b.name} ${Math.round(o.distance)}`)
+  );
+  // The detector has to see the case that was actually reported, or it is a
+  // check that can only ever pass (§17.14).
+  const found = contained(surveyed).find((o) => [o.a.name, o.b.name].includes("PASS") && [o.a.name, o.b.name].includes("SEAWARD"));
+  check("route: routeOverlaps names the PASS/SEAWARD collision that was reported", !!found, found && Math.round(found.distance));
+  check(
+    "route: a mere overlap is reported without being flagged as containment",
+    routeOverlaps(surveyed).some((o) => !o.contained)
+  );
 }
 
 /* ---- hostile activation and reuse (§5/§42/§43) ---- */
