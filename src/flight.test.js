@@ -80,10 +80,10 @@ import {
   createAudio, groundWarning, isFlyby,
 } from "./audio.js";
 import {
-  AGL_DANGER, AGL_WARN, C, CASING, FLANK_FRACTION, RADAR_MARGIN,
-  RADAR_RADIUS, RAMP, STACK_SLOTS,
-  aglReadout, flankColumns, flankOffset, fontPx, hudScale, modeSegment,
-  stackY, storesPanel,
+  AGL_DANGER, AGL_WARN, C, CASING, FLANK_FRACTION, HUD_REVEAL_SECONDS,
+  RADAR_MARGIN, RADAR_RADIUS, RAMP, STACK_SLOTS,
+  aglReadout, flankColumns, flankOffset, fontPx, hudRevealAlpha, hudScale,
+  modeSegment, stackY, storesPanel,
 } from "./hud-layout.js";
 import {
   EASE,
@@ -5178,6 +5178,81 @@ function testGroundWarningsAndFlyby() {
 
 // ── HUD.md H13 gates ──────────────────────────────────────────────────────
 
+// ── Change 6 (DIAGNOSIS B5): the HUD comes up with the aircraft ───────────
+
+function testHudRevealEnvelope() {
+  const plan = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 22 });
+  const A = (t) => hudRevealAlpha(t, plan.fireAt);
+
+  // THE GATE, exactly as stated: dark at the shot, part-way in 0.2 s later,
+  // complete by the release point.
+  check("the HUD is dark on the deck", A(plan.fireAt - 0.01) === 0, `${A(plan.fireAt - 0.01)}`);
+  check("dark from the first frame, not just the last deck frame", A(0) === 0);
+  check("and dark all the way through the dwell", A(plan.fireAt * 0.99) === 0);
+  const mid = A(plan.fireAt + 0.2);
+  check("it is part-way in 0.2 s after the catapult", mid > 0 && mid < 1, `${mid}`);
+  check(
+    "and complete at the release point",
+    A(plan.releaseAt) === 1,
+    `${A(plan.releaseAt)}`,
+  );
+  check("still complete at the handoff", A(plan.handoffAt) === 1);
+
+  // The fade is 0.4 s, and it is complete WELL before the release point -- the
+  // stroke is 2.77 s long, so there is no frame rate at which the two race.
+  check("the fade is 0.4 s", HUD_REVEAL_SECONDS === 0.4);
+  check(
+    "the fade finishes long before the release point",
+    plan.releaseAt - plan.fireAt > HUD_REVEAL_SECONDS * 4,
+    `${(plan.releaseAt - plan.fireAt).toFixed(2)} s of stroke`,
+  );
+  check("it is exactly complete at fireAt + the fade", A(plan.fireAt + HUD_REVEAL_SECONDS) === 1);
+
+  // Monotonic and clamped: the display comes up once and does not flicker.
+  let prev = -Infinity;
+  let monotonic = true;
+  for (let i = 0; i <= 400; i++) {
+    const v = A((i / 400) * plan.handoffAt);
+    if (v < prev - 1e-12) monotonic = false;
+    if (v < 0 || v > 1) monotonic = false;
+    prev = v;
+  }
+  check("the envelope is monotonic and stays in [0, 1]", monotonic);
+
+  // A BUILD WITH NO LAUNCH SCRIPT STILL GETS A HUD. §2: if an asset fails to
+  // load the game must remain playable, and a carrier that never arrived must
+  // not take the instruments with it.
+  check("no launch script means a full HUD", hudRevealAlpha(0, null) === 1);
+  check("and so does an undefined one", hudRevealAlpha(12, undefined) === 1);
+  check("a zero fade snaps rather than dividing by zero", hudRevealAlpha(1, 0.5, 0) === 1);
+
+  // Read against a RUNNING script, not just the pure function -- the envelope
+  // is worth nothing if the clock it reads is not the one the catapult uses.
+  const flown = flyHeldLaunch({ armAt: 0 });
+  const at = (t) => flown.timeline.reduce((best, f) => (f.t <= t ? f : best), flown.timeline[0]);
+  check(
+    "the flown deck is dark for its whole dwell",
+    flown.timeline
+      .filter((f) => f.t < plan.fireAt)
+      .every((f) => hudRevealAlpha(f.t, plan.fireAt) === 0),
+  );
+  check(
+    "the flown stroke is fully lit by the release point",
+    hudRevealAlpha(at(plan.releaseAt).t, plan.fireAt) === 1,
+  );
+
+  // AND A HELD DECK STAYS DARK. The hold parks the script at t = 0, so a player
+  // who has not yet touched a key sits in front of an unlit display for as long
+  // as they like -- the envelope reads the same clock the hold freezes.
+  const heldRun = flyHeldLaunch({ armAt: 5 });
+  check(
+    "a deck held for audio stays dark while it waits",
+    heldRun.timeline
+      .filter((f) => f.wall < 5)
+      .every((f) => hudRevealAlpha(f.t, plan.fireAt) === 0),
+  );
+}
+
 function testHudScale() {
   // H13.1
   check("hudScale(720) clamps to the lower bound", hudScale(720) === 0.85, String(hudScale(720)));
@@ -5580,6 +5655,7 @@ const SUITES = [
   ["audio intervals and takes", testAudioIntervalsAndTakes],
   ["audio gestures and missing files", testAudioGesturesAndMissingFiles],
   ["ground warnings and the fly-by", testGroundWarningsAndFlyby],
+  ["the HUD reveal envelope", testHudRevealEnvelope],
   ["HUD scale unit", testHudScale],
   ["HUD flank layout", testFlankLayout],
   ["HUD AGL readout", testAglReadout],

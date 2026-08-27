@@ -272,6 +272,36 @@ export function modeSegment({ h, u, mode, lives, modeChangedAgo = 99 }) {
 export const STACK_SLOTS = [0.63, 0.665, 0.695];
 export const stackY = (h) => STACK_SLOTS.map((f) => h * f);
 
+// ── The reveal envelope ────────────────────────────────────────────────────
+//
+// HUD.md never said WHEN the HUD is alive, so it was drawn from frame one. On
+// the deck the player has no authority over throttle, stick or weapons -- the
+// launch script owns all three -- so every number on the display is
+// unactionable, and a full instrument set over a parked jet reads as a menu
+// rather than as a cockpit.
+//
+// THE HUD COMES UP WITH THE AIRCRAFT: dark on the deck, symbology fading in
+// from the catapult, complete before the release point. It is an OPACITY
+// ENVELOPE ON THE EXISTING LAYERS -- not a second HUD, and not a per-symbol
+// schedule, because a schedule is a second display that can disagree with the
+// first about what exists.
+export const HUD_REVEAL_SECONDS = 0.4;
+
+/**
+ * How much of the HUD is up, given the launch script's own clock.
+ *
+ * Driven from `fireAt` rather than from a phase: the catapult firing is the
+ * moment the aircraft starts being an aircraft, and the phase change to LAUNCH
+ * is a consequence of it one frame later. A build with no launch script at all
+ * passes fireAt = null and gets a HUD.
+ */
+export function hudRevealAlpha(elapsed, fireAt, fade = HUD_REVEAL_SECONDS) {
+  if (fireAt === null || fireAt === undefined) return 1;
+  if (!(elapsed > fireAt)) return 0;
+  if (!(fade > 0)) return 1;
+  return clamp((elapsed - fireAt) / fade, 0, 1);
+}
+
 // ── H6 / H9 anchors ────────────────────────────────────────────────────────
 // centerY 0.45 stays: the chase F-15 sits low in frame, and an origin at true
 // centre puts the ladder through the airframe.

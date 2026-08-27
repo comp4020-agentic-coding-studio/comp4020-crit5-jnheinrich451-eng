@@ -67,8 +67,20 @@ export function createCombatHud(host, camera) {
   const world = node("g");
   const attitude = node("g");
   const fixed = node("g");
-  svg.append(world, attitude, fixed);
+  // A FOURTH LAYER, above the other three, holding the phase cue alone.
+  //
+  // The reveal envelope dims the three instrument layers together; the cue is
+  // EXEMPT, because it is the one thing on screen that is about the mission
+  // rather than about the aircraft, and DECK and LAUNCH are phases the player
+  // should be told they are in. Its own 2.7 s fade is unaffected -- one
+  // element, two independent opacities, on different nodes.
+  const cue = node("g");
+  svg.append(world, attitude, fixed, cue);
   host.append(svg);
+
+  // The instrument layers, as a list, so the envelope cannot be applied to two
+  // of three and quietly leave the stores panel lit over a parked jet.
+  const symbology = [world, attitude, fixed];
 
   // Live scale, recomputed on resize only (H3).
   let u = hudScale(host.clientHeight || window.innerHeight || 1080);
@@ -191,7 +203,8 @@ export function createCombatHud(host, camera) {
   // outline to hold an edge than a 15u one does.
   const phaseCue = text("hit", { fill: C.nav, "text-anchor": "middle" });
   phaseCue.setAttribute("data-heavy-casing", "1");
-  fixed.append(threatWord, phaseCue);
+  fixed.append(threatWord);
+  cue.append(phaseCue);
 
   // H8: EXACTLY THREE SLOTS. A fourth line is a redesign of the stack, not an
   // addition to it.
@@ -278,6 +291,22 @@ export function createCombatHud(host, camera) {
       svg.style.display = v ? "" : "none";
     },
     isVisible: () => svg.style.display !== "none",
+
+    /**
+     * The reveal envelope (HUD.md H5, new state). One opacity on the three
+     * instrument layers -- NOT a per-symbol schedule.
+     *
+     * `null` on a layer is not the same as `1`: the gate reads these attributes
+     * off the live nodes, so the value is always written explicitly.
+     */
+    setReveal(alpha) {
+      const a = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
+      for (const layer of symbology) layer.setAttribute("opacity", String(a));
+      // A layer at zero still hit-tests and still costs layout; `display` is
+      // what actually takes it out of the frame.
+      for (const layer of symbology) layer.style.display = a > 0 ? "" : "none";
+    },
+    reveal: () => Number(fixed.getAttribute("opacity") ?? 1),
 
     resize(width, height) {
       u = hudScale(height);

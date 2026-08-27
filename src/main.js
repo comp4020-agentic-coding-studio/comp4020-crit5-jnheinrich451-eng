@@ -16,6 +16,7 @@ import { AIM9, createMissileSystem } from "./missile.js";
 import { createTrails } from "./missile-trail.js";
 import { createGun, leadSolution } from "./gun.js";
 import { createCombatHud } from "./combat-hud.js";
+import { hudRevealAlpha } from "./hud-layout.js";
 import { createCombatFx } from "./combat-fx.js";
 import { HOSTILE_MISSILE, createHostile } from "./hostile.js";
 import {
@@ -487,8 +488,10 @@ function restartSortie() {
   hostile.setActive(false);
   mission?.reset();
   extraction = 0;
-  phaseCue = "";
-  phaseCueAge = 99;
+  // Re-announce the deck rather than clearing: a restart is a fresh sortie and
+  // it opens the same way the first one did.
+  phaseCue = mission ? mission.mission.phase : "";
+  phaseCueAge = 0;
   if (completeEl) completeEl.hidden = true;
   if (fadeEl) fadeEl.style.opacity = "0";
   policies.forEach((p) => p.resetAll?.() ?? p.reset?.());
@@ -532,6 +535,12 @@ function buildMission() {
       onPhaseChange(to, from);
     },
   });
+  // DECK IS ANNOUNCED LIKE ANY OTHER PHASE. The transition callback only fires
+  // on a CHANGE, so the phase the sortie starts in was the one phase never
+  // named -- which, now that the instruments are dark until the catapult,
+  // would leave the opening frames completely blank.
+  phaseCue = mission.mission.phase;
+  phaseCueAge = 0;
   // Two per inland leg, flanking the corridor. A site with nowhere to stand is
   // DROPPED, not floated.
   const inland = route.legs.filter((l) => l.phase === TERRAIN);
@@ -1001,7 +1010,11 @@ function step(now) {
   threat = t.label;
 
   // ── the mission ────────────────────────────────────────────────────────
-  phaseCueAge += dt;
+  // The phase cue's own 2.7 s fade does NOT run while the deck is held for
+  // audio: the sequence has not started, so neither has the cue. Without this
+  // the DECK announcement burns off during a wait that could be any length,
+  // and the opening frames of the sortie are completely blank.
+  if (!(launch && launch.isActive() && launch.elapsed() === 0)) phaseCueAge += dt;
   let navLeg = null;
   if (mission && rules.phases) {
     const result = mission.update(dt, {
@@ -1049,6 +1062,18 @@ function step(now) {
   world.update(dt, state);
 
   if (clock > messageUntil) message = "";
+  // THE HUD COMES UP WITH THE AIRCRAFT. Dark on the deck, fading in from the
+  // catapult, complete before the release point. Driven from the launch
+  // script's own clock rather than from the phase, because the catapult firing
+  // is the moment the aircraft starts being an aircraft.
+  //
+  // `held` is the pre-launch state, before the carrier and the airframe have
+  // both arrived: dark for the same reason the deck is, and stated here rather
+  // than left to fall through to 1, which would light the whole display over a
+  // loading screen and then snap it off when the deck appears.
+  hud.setReveal(
+    held ? 0 : launch ? hudRevealAlpha(launch.elapsed(), launch.plan.fireAt) : 1,
+  );
   if (hud.isVisible()) {
     hud.update(dt, {
       speed: state.speed,
