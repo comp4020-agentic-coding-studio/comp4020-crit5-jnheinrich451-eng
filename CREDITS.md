@@ -17,16 +17,19 @@ Every shipped model's licence text travels with it in
 | NOMADS SAM system | CC-BY-4.0 | yes | no | yes |
 | F16-C Falcon | CC-BY-4.0 | yes | no | yes |
 | `gun.mp3` (M134, Freesound) | CC-BY-NC-4.0 | **no** | no | yes |
+| `flares.mp3` (flare deploy, Freesound) | CC-BY-NC-4.0 | **no** | no | yes |
 
-The audio is listed in full further down; `gun.mp3` appears here because it is
-the one sound file whose licence constrains the project rather than merely
-permitting it. Everything else from Pixabay is unconditional, and seven files
-from a soundboard site carry no licence at all — recorded honestly under
+The audio is listed in full further down; these two appear here because they are
+the only sound files whose licences constrain the project rather than merely
+permitting it. Everything from Pixabay is unconditional, and seven files from a
+soundboard site carry no licence at all — recorded under
 [Still open](#still-open-seven-files-from-voicemod-tuna) rather than left to
 look settled.
 
-The two newest are both plain CC-BY, so neither tightens the constraints below
-— those come entirely from the F-15E and the terrain.
+Of the models, the two newest — the SAM launcher and the F-16C — are both plain
+CC-BY, so neither tightens anything. Every constraint in this project comes from
+three places and no others: the F-15E (`NC` and `SA`), the terrain (`NC`), and
+the two Freesound cues (`NC`, plus an attribution that this file provides).
 
 Two consequences worth stating deliberately rather than discovering at ship
 time:
@@ -141,33 +144,36 @@ cross-checked against `public/assets/audio/` and nothing is uncredited.
 | `engine-start.mp3`, `engine-loop.mp3` | Pixabay — [jet-engine search](https://pixabay.com/sound-effects/film-special-effects-jet-engine-starting-303626/) | yes |
 | `flyby.mp3` | Pixabay — [jet search](https://pixabay.com/sound-effects/film-special-effects-fighter-jet-behind-355465/) | no |
 | `gun.mp3` | Freesound — ["M134 Minigun Firing" by SoundFX.studio](https://freesound.org/people/SoundFX.studio/sounds/474125/), **CC-BY-NC 4.0** | yes — clipped |
-| `flares.mp3` | Pixabay — ["ROAD FLARE" 82168](https://pixabay.com/sound-effects/film-special-effects-road-flare-82168/), by frankelmedico | yes — clipped and sped up |
+| `flares.mp3` | Freesound — ["06647 flare deploy" by Robinhood76](https://freesound.org/people/Robinhood76/sounds/346214/), **CC-BY-NC 4.0** | no |
 
 The three Voicemod takes were edited into the multi-take cues the mix rotates
 through (`LOCK` x3, `MISSILE` x2), and the two engine files were edited into a
 start-up and a seamless loop. `gun.mp3` is an 11.3 s recording clipped to a
-1.5 s loop; `flares.mp3` is a 12 s recording clipped AND sped up to 1.1 s,
-because a road flare igniting is a slower event than a dispenser thump.
+1.5 s loop. `flares.mp3` is used as recorded — it is a purpose-made flare-deploy
+sound and already the right length at 1.2 s.
 
-### One row here has conditions attached
+### Two rows here have conditions attached
 
-**`gun.mp3` is CC-BY-NC 4.0** — the only audio on this page whose licence asks
-for anything. Both conditions are met, and which is which is worth writing down:
+**`gun.mp3` and `flares.mp3` are both CC-BY-NC 4.0** — the only audio on this
+page whose licences ask for anything. Both carry the same two conditions, and
+both are met:
 
 > "You are free to share (to copy, distribute and transmit) and to remix (to
 > adapt and modify) as long as you credit the author of the sound and do not use
 > the sound for commercial purposes."
 
-- **Credit** — SoundFX.studio, named in the table with a link to the original.
-  That naming *is* the attribution, which is why it lives in a file that travels
-  with the repository rather than in a commit message.
+- **Credit** — SoundFX.studio for the minigun, Robinhood76 for the flare, each
+  named in the table with a link to the original. That naming *is* the
+  attribution, which is why it lives in a file that travels with the repository
+  rather than in a commit message.
 - **Non-commercial** — already true of this project independently: the F-15E
-  model is CC-BY-NC-SA, so nothing here was ever releasable commercially.
+  model is CC-BY-NC-SA, so nothing here was ever releasable commercially. These
+  two add no constraint that was not already binding.
 
-Everything sourced from Pixabay carries no such condition. The Pixabay Content
-License requires no attribution and permits modification and use in a game; the
-creators are named above because the course asks for a creator per asset, not
-because the licence compels it.
+Everything sourced from Pixabay carries no such condition: the Pixabay Content
+License requires no attribution and permits modification and use in a game. The
+creators are named above anyway, because a credits file that names some authors
+and not others is a worse document than one that names all of them.
 
 ### Why the gun and the flares were re-sourced
 
@@ -186,6 +192,14 @@ commercial game is a worse position than an undocumented one, not a better one.
 The M134 also suits the aircraft better than the GAU-8 did. The GAU-8 is the
 A-10's gun; an F-15E carries an M61 Vulcan, and a 7.62 mm rotary is far closer
 to that buzzsaw than a 30 mm tank-killer is.
+
+The flare went through one more revision than the gun. Its first replacement was
+a Pixabay road-flare recording — unconditionally licensed, but a road flare
+IGNITING is a slow, hissing event, and turning it into a dispenser thump took
+clipping and a speed-up. The version shipped now is a purpose-made flare-deploy
+sound, 1.2 s and used unedited. It costs an attribution line the Pixabay one did
+not, and is worth it: an effect that needs no surgery to fit is usually the
+right effect.
 
 ### Still open: seven files from Voicemod Tuna
 
