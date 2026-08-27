@@ -59,24 +59,47 @@ image URIs to match. See `scripts/compress-assets.ts`.
 
 ## Audio
 
-**This section is incomplete and needs your confirmation before submission.**
+Fourteen files, eleven cues. All fourteen are accounted for; the mapping was
+cross-checked against `public/assets/audio/` and nothing is uncredited.
 
-The fourteen files in `public/assets/audio/` were sourced and renamed before I
-saw them, so I can record what they are but not who made them. I am not going
-to guess at attributions — a wrong credit is worse than an absent one.
-
-What the working directory suggests, and what still needs checking:
-
-| likely source | evidence | still needed |
+| cue file(s) | source | edited |
 | --- | --- | --- |
-| Sonniss GDC Game Audio Bundle | `Sonniss.com-GDC2026-GameAudioBundle1of5.zip` … `5of5` alongside the extracted clips | which specific files came from it; the bundle's own licence terms |
-| Voicemod | `f-18-lock-on-made-with-Voicemod.mp3`, `f15-missile-warnings-made-with-Voicemod.mp3` | whether these became `lock-*.mp3` / `missile-*.mp3`, and Voicemod's terms for generated audio |
-| a freesound contributor | `freesound_community-distant-explosion-90743.mp3` | the contributor's name and the specific CC licence on that ID |
-| an individual creator | `derrickmckinnon-jet-engine-starting-303626.mp3` | the platform, the full name and the licence |
+| `altitude.mp3`, `pull-up.mp3` | [Voicemod Tuna 99654cf9](https://tuna.voicemod.net/sound/99654cf9-301d-4dc2-be89-9696d190d532) | yes |
+| `lock-1.mp3`, `lock-2.mp3`, `lock-3.mp3` | [Voicemod Tuna 832d4f48](https://tuna.voicemod.net/sound/832d4f48-9e13-4f2a-93e8-051af86d4b9a) | yes |
+| `missile-1.mp3`, `missile-2.mp3` | [Voicemod Tuna bdb78af4](https://tuna.voicemod.net/sound/bdb78af4-7942-4b0a-8357-0649493ba828) | yes |
+| `missile-hit.mp3` | [Pixabay — "distant explosion" 90743](https://pixabay.com/sound-effects/film-special-effects-distant-explosion-90743/) | no |
+| `missile-launch.mp3` | Pixabay — [missile search](https://pixabay.com/sound-effects/search/missile/) | no |
+| `engine-start.mp3`, `engine-loop.mp3` | Pixabay — [jet-engine search](https://pixabay.com/sound-effects/search/jet-engine/) | yes |
+| `flyby.mp3` | Pixabay — [jet search](https://pixabay.com/sound-effects/search/jet/) | no |
+| `gun.mp3` | myinstants — [A-10 search](https://www.myinstants.com/en/search/?name=a10) | no |
+| `flares.mp3` | myinstants — [flares search](https://www.myinstants.com/en/search/?name=flares) | no |
 
-The eleven cues and the fourteen files they map to are listed in `CLAUDE.md`
-§16. Every cue is optional: the game runs silent if `public/assets/audio/` is
-emptied, and the load log reports which cues resolved.
+The three Voicemod takes were edited into the multi-take cues the mix rotates
+through (`LOCK` x3, `MISSILE` x2), and the two engine files were edited into a
+start-up and a seamless loop.
+
+### Two things still open on this table
+
+**Six files point at a SEARCH PAGE rather than a specific asset.** A search URL
+does not identify a work or its creator, and the course asks for title, creator,
+source URL and licence per asset. Still needed:
+
+- from Pixabay: `missile-launch`, `engine-start`, `engine-loop`, `flyby` — the
+  asset URL carries the uploader's name, so these should be quick to recover
+  from browser history
+- from myinstants: `gun`, `flares`
+
+The other eight files — three Voicemod sounds and `missile-hit` — already point
+at a specific work and need nothing further.
+
+**myinstants is the one worth a second look.** Pixabay's Content License is
+permissive and Voicemod Tuna's uploads are intended for reuse, so those rows are
+low risk. myinstants is a user-upload soundboard with no per-clip licensing and
+a lot of its content is ripped from games and films — an A-10 cannon and a flare
+dispenser are exactly the kind of clip that tends to be. This repo goes public
+and gets deployed, so it is worth either finding those two on Pixabay instead or
+deciding deliberately to keep them. Confirm the terms rather than taking this
+paragraph as the finding.
 
 ## Libraries
 
