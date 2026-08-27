@@ -1,378 +1,500 @@
-// Pointer + keyboard -> { x, y, roll, throttle }. CLAUDE.md §7, §17.5, §17.6.
-//
-// The pointer is the PRIMARY control and the reason the no-instructions rule
-// (§"No instructions, anywhere") is satisfiable at all: the aircraft sits at
-// the middle of the viewport and follows the cursor, which a stranger
-// discovers in about a second. WASD alone is not self-teaching.
-//
-// The keyboard is still fully wired and simply undocumented in-game. Every key
-// works; nothing on screen says so.
-
-// ── sign conventions ───────────────────────────────────────────────────────
-// POSITIVE IS LEFT, for both bank and heading, and the two agree on purpose.
-//
-// Course runs toward -Z, forward is (-sin h, -cos h), so d(forward)/dh points
-// at -X: increasing heading turns LEFT. A positive bank angle tilts the
-// up-vector to (-sin b, cos b, 0), i.e. left wing down -- also left. Because
-// they match, the coordinated-turn term in flight.js needs no minus sign.
-//
-// Pitch is positive nose-up before the convention flip below.
-
-const AXIS_KEYS = {
-  KeyW: { axis: "y", value: 1 },
-  KeyS: { axis: "y", value: -1 },
-  KeyA: { axis: "x", value: 1 },
-  KeyD: { axis: "x", value: -1 },
-  KeyQ: { axis: "roll", value: 1 },
-  KeyE: { axis: "roll", value: -1 },
-  ShiftLeft: { axis: "throttle", value: 1 },
-  ControlLeft: { axis: "throttle", value: -1 },
-};
-
-// Discrete presses, latched until something consumes them.
-const LATCH_KEYS = {
-  KeyR: "restart",
-  KeyZ: "flares",
-  KeyX: "weapon",
-  Space: "evade",
-};
-
-// Held (non-latched) actions. The gun reads a held state because it is a loop,
-// not 48 one-shots a second (§16 audio).
-const HOLD_KEYS = {
-  KeyF: "fire",
-};
-
-// Mouse buttons. All of these are DISCRETE -- holding one must do nothing
-// extra, so the weapon switch and the flare dispenser latch on the press edge
-// and never repeat. Fire is the exception by design: it is a held state
-// because the cannon is a sustained loop.
-const MOUSE_BUTTONS = {
-  0: { hold: "fire" },
-  1: { latch: "flares" }, // middle
-  2: { latch: "weapon" }, // right
-};
-
-const RAMP = 6;
-const SNAP = 1e-3;
-const RAMPED = ["x", "y", "roll"];
-
-// ── pointer steering geometry (§7) ─────────────────────────────────────────
-// Deflection is DISTANCE FROM THE SCREEN CENTRE, which is fixed and visible
-// and never synthesised. The dead zone is what gives the control a neutral --
-// hovering over the aircraft holds attitude - and its absence is precisely
-// what made the earlier relative-origin design unfixable.
-export const POINTER_DEAD_ZONE = 0.1;
-export const POINTER_FULL_STICK = 0.52;
-export const POINTER_GAIN = 0.95;
-
-// A wheel notch is an impulse, but flight.js reads throttle as a RATE, so a
-// notch charges a small decaying value instead of jumping the lever. One
-// throttle model regardless of input source.
-const WHEEL_IMPULSE = 0.85;
-const WHEEL_DECAY = 7;
-
-const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+/**
+ * Input abstraction. Flight code reads only { x, y, roll, throttle } in -1..1.
+ * x: -1 left .. +1 right      y: -1 down .. +1 up      roll: -1 left .. +1 right
+ *
+ * ---------------------------------------------------------------------------
+ * Stage 04.0a — MOUSE STEERING IS GONE.
+ *
+ * Not disabled, not defaulted off: removed. Steering is the keyboard, and the
+ * mouse is a trigger.
+ *
+ * The report that killed it arrived four times in three stages, always in the
+ * same words: "when I approach the hostile jet my fighter dodges to the right
+ * and I never control this." Six fixes were shipped against it —
+ *
+ *   03.2b  steering became RELATIVE, measured from a claimed origin
+ *   03.2c  edge drift gated on real movement, not on position
+ *   03.2d  the keyboard REVOKES the mouse's claim instead of yielding back
+ *   03.2e  the claim waits for the pointer to come to rest, in the interior
+ *   03.2e  pointer-lock deltas, so a window edge cannot cap the stick
+ *   03.3a  a spring return, so letting go of the mouse re-centres the stick
+ *
+ * — and every one of them was a correct fix to a real defect. The aircraft still
+ * turned on its own. That is the signal worth acting on: when six correct fixes
+ * do not close a bug, the bug is not in the fixes, it is in the premise.
+ *
+ * The premise was that a POSITION can be a stick. It cannot, on a desktop. A
+ * physical stick has a spring, a detent and a hand that knows where centre is;
+ * a pointer has none of those, and every one of the six fixes above is an
+ * attempt to synthesise one of them from screen coordinates. Each synthetic
+ * property has a failure mode, the failure modes are not independent, and their
+ * union is "the aircraft banks and I did not ask it to". Stage 03.3 made that
+ * fatal rather than annoying, because tracking a manoeuvring enemy with the
+ * mouse is the normal thing to do, and Stage 04.0 made it cost a mission.
+ *
+ * So the whole surface is deleted: MOUSE, mouseAxis, lockAxis, driftOrigin,
+ * springReturn, the claim state machine, the settle timer, the edge drift, the
+ * pointer-lock path, the spring, and the V / B / C keys that existed only to
+ * manage them. What is left cannot command bank without a key being held, which
+ * is a property rather than a mitigation.
+ *
+ * The mouse keeps everything it was actually good at: the left button is the
+ * trigger, and the lead pipper, the target bracket and the weapon cycle are
+ * untouched.
+ */
+import { clamp, damp } from "./flight.js";
 
 /**
- * Pure pointer -> stick mapping. Exported and dependency-free so the suite can
- * assert the geometry headlessly rather than through a screenshot.
+ * Stage 05.0 — POINTER STEERING, reintroduced deliberately.
  *
- * Returns axes in the project's own convention: x positive is LEFT bank, y
- * positive is nose UP (before the pitch-convention flip).
+ * Stage 04.0b deleted mouse steering after six fixes failed to close a
+ * "the aircraft turns on its own" bug, and recorded the reason: a screen position
+ * cannot be a stick because it has no centre, and every fix was trying to
+ * synthesise one out of relative movement (a claimed origin, edge drift, claim
+ * revocation, settle timers, pointer lock, a spring return). Each fixed one
+ * failure mode and left the others.
+ *
+ * This design is not that design. The centre is not synthesised — it is the
+ * aircraft, fixed at the middle of the screen, permanently. There is nothing to
+ * claim, nothing to revoke, no timer and no spring, because the detent is a real
+ * place the player can see. Deflection is simply distance from centre.
+ *
+ * Two properties make it safe where the old one was not:
+ *
+ * 1. **A dead zone over the aircraft.** Hovering on the F-15 commands nothing, so
+ *    the aircraft holds its attitude — there is a way to let go.
+ * 2. **The cursor stays visible.** The player can always see exactly what they are
+ *    commanding. The old bug was invisible by construction; this one cannot be,
+ *    because the input device is drawn on screen.
+ *
+ * A parked off-centre cursor DOES keep turning the aircraft, and that is correct
+ * rather than a defect: it is a stick held over, and it looks like one.
  */
-export function pointerStick(px, py, width, height) {
-  if (!(width > 0) || !(height > 0)) return { x: 0, y: 0 };
-  const halfW = width / 2;
-  const halfH = height / 2;
+export const MOUSE = {
+  /** Fractions of the half-viewport. Dead zone ≈ the aircraft, span ≈ full stick. */
+  deadZone: 0.1,
+  span: 0.52,
+  /** Full deflection is not full authority — the mouse is smoother than a key. */
+  gain: 0.95,
+  /**
+   * Stage 05.1 — the wheel is the throttle.
+   *
+   * A wheel tick is an impulse, but the flight model reads throttle as a RATE, so
+   * each notch charges a small decaying value rather than jumping the lever. That
+   * keeps one throttle model — a persistent lever moved at a rate — regardless of
+   * whether the input came from a key or a notch.
+   */
+  wheelStep: 0.55,
+  wheelDecay: 6,
+};
 
-  // Normalised per axis, so full deflection is the same FRACTION of the
-  // viewport in both directions. That matters because the two marking
-  // viewports have very different aspects: a radial measure in raw pixels
-  // would need a third of the travel vertically on a 390x844 frame.
-  const nx = (px - halfW) / halfW;
-  const ny = (halfH - py) / halfH; // screen y grows downward; flip it
-
-  const r = Math.hypot(nx, ny);
-  if (!(r > POINTER_DEAD_ZONE)) return { x: 0, y: 0 };
-
-  const scale =
-    (clamp(
-      (r - POINTER_DEAD_ZONE) / (POINTER_FULL_STICK - POINTER_DEAD_ZONE),
-      0,
-      1,
-    ) *
-      POINTER_GAIN) /
-    r;
-
-  return {
-    // Cursor right of centre banks RIGHT, which is negative in this project.
-    x: -nx * scale,
-    y: ny * scale,
-  };
+/**
+ * Pure: pointer position to a stick deflection, given the viewport centre.
+ * Returns -1..1 per axis, y positive up.
+ */
+export function pointerStick(px, py, w, h, cfg = MOUSE) {
+  const cx = w * 0.5;
+  const cy = h * 0.5;
+  const half = Math.min(w, h) * 0.5;
+  const dead = cfg.deadZone * half;
+  const span = cfg.span * half;
+  const dx = px - cx;
+  const dy = py - cy;
+  const dist = Math.hypot(dx, dy);
+  if (!(dist > dead) || span <= dead) return { x: 0, y: 0 };
+  const k = Math.min(1, (dist - dead) / (span - dead)) * cfg.gain;
+  return { x: (dx / dist) * k, y: (-dy / dist) * k };
 }
 
-export function createInput(options = {}) {
-  const target = options.target ?? globalThis;
-  const doc = options.doc ?? globalThis.document ?? null;
+/** Whichever source is asking for more. Keyboard therefore always overrides. */
+export function combineAxis(a, b) {
+  return Math.abs(a) >= Math.abs(b) ? a : b;
+}
 
-  const held = new Set();
-  const latches = new Set();
-  const holds = new Set();
-  const axes = { x: 0, y: 0, roll: 0, throttle: 0 };
-  const keyAxes = { x: 0, y: 0, roll: 0 };
-  const listeners = [];
+/**
+ * Axis keys are tracked by `event.code` — the PHYSICAL key — not by `event.key`.
+ *
+ * `event.key` is the character produced, and it can differ between the keydown
+ * and the keyup of the same physical press: modifier state, caps lock, layout
+ * switches, and IMEs all change it. When it differs, the keyup deletes a set
+ * entry that is not there and the keydown's entry is orphaned FOREVER — a stuck
+ * axis at full deflection, unrecoverable, because pressing the opposite key only
+ * cancels it while held.
+ *
+ * `event.code` is the same string on press and release no matter what.
+ *
+ * ---------------------------------------------------------------------------
+ * Stage 04.0b — THE ARROW KEYS ARE NOT FLIGHT AXES.
+ *
+ * This is the actual cause of "my fighter dodges right on its own", and it was
+ * on screen the whole time. The dev rail's held-key readout said `ArrowRight`
+ * while the stick read `in +1.00` and bank sat pinned at -70°: a physical
+ * ArrowRight keydown with no matching keyup, held forever, commanding a full
+ * right turn. Every mouse fix in 03.2 and 03.3 was the wrong device.
+ *
+ * Arrow keys were a secondary binding that nothing advertised — the legend has
+ * only ever said A/D and W/S — and they are precisely the keys that browser
+ * chrome, embedded preview panes and host UI use for their own navigation. So
+ * they are the keys most likely to have their keyup swallowed by something else
+ * taking focus mid-press, and the only ones a player can have "held" without
+ * ever having meant to touch them.
+ *
+ * Removing them means the only keys that can stick are keys the player is
+ * deliberately holding, and a key you are holding is one you can let go of.
+ */
+const RIGHT = ["KeyD"];
+const LEFT = ["KeyA"];
+const UP = ["KeyW"];
+const DOWN = ["KeyS"];
+const ROLL_RIGHT = ["KeyE"];
+const ROLL_LEFT = ["KeyQ"];
+const AXIS_KEYS = [...RIGHT, ...LEFT, ...UP, ...DOWN];
+const WATCHED = [...AXIS_KEYS, ...ROLL_RIGHT, ...ROLL_LEFT];
 
-  // The pointer's position is a PHYSICAL FACT about where the player's hand
-  // is, not a latch. It is never cleared by reset, respawn or a mode change --
-  // pretending the player moved their hand would be a lie, and the aircraft
-  // would snap to an attitude nobody commanded.
-  let pointer = null; // {x, y, w, h}
-  let steeringEnabled = true;
+/** How fast the keyboard axes ramp toward their target, in 1/s. */
+export const KEYBOARD = { ramp: 6 };
 
-  let wheelCharge = 0;
+/**
+ * Stage 04.4 — pitch convention.
+ *
+ * Two real conventions exist and neither is wrong:
+ *
+ *   NOSE_UP    W pitches up      what a game does, and what a first-time
+ *                                player expects from WASD
+ *   NOSE_DOWN  W pitches down    what a control column does — push forward to
+ *                                descend — and what anyone who has flown a sim
+ *                                will reach for without thinking
+ *
+ * The default is NOSE_UP because the first thing this build has to survive is
+ * someone being handed it cold. The toggle exists because the second thing it
+ * has to survive is someone who already knows how to fly, for whom the default
+ * is actively wrong: they will pull to climb and hit the sea.
+ *
+ * It is applied at the input boundary and nowhere else — one sign flip on
+ * `input.y` — so the flight model, both flight modes, the HUD and the vapor FX
+ * all see one consistent axis and none of them know the setting exists. A
+ * convention is not a physics change.
+ */
+export const PitchMode = { NOSE_UP: "NOSE UP", NOSE_DOWN: "NOSE DOWN" };
 
-  // ── the pitch convention (§7) ────────────────────────────────────────────
-  // NOSE UP   W / cursor up = nose up    default
-  // NOSE DOWN W / cursor up = nose down  the control-column convention
-  //
-  // ONE SIGN FLIP at the input boundary, applied to the COMBINED pitch axis so
-  // it governs the pointer and the keyboard alike -- it is a pitch convention,
-  // not a keyboard convention. Nothing downstream knows the setting exists.
-  let pitchSign = 1;
+/** Pure: the pitch axis under a convention. */
+export function applyPitchMode(y, inverted) {
+  return inverted ? -y : y;
+}
 
-  function on(node, type, fn, opts) {
-    if (!node || typeof node.addEventListener !== "function") return;
-    node.addEventListener(type, fn, opts);
-    listeners.push([node, type, fn]);
-  }
+export function createInput(target = window) {
+  const input = { x: 0, y: 0, roll: 0, throttle: 0, source: "keyboard" };
+  const keys = new Set();
+  // Pointer position in client pixels. Seeded at the centre so an untouched mouse
+  // commands nothing before its first move.
+  const pointer = { x: -1, y: -1, seen: false };
+  let pointerEnabled = true;
+  // Physical left-hand modifiers only, tracked by event.code so the right-hand
+  // Shift/Ctrl stay free for browser use. Separate from `keys` because they are
+  // not flight axes and must never gate W/A/S/D.
+  const mods = { shiftLeft: false, controlLeft: false };
+  const kb = { x: 0, y: 0 };
+  const doc = typeof document === "undefined" ? null : document;
+  /**
+   * Whether this document has ever held focus. The stuck-key guard below is only
+   * armed once it has: a page in a background preview or a synthetic test
+   * harness never has focus, and enforcing the rule there would clear keys that
+   * were legitimately dispatched.
+   */
+  let seenFocus = false;
+  const resetHandlers = [];
+  const modeHandlers = [];
+  const weaponHandlers = [];
+  const pitchHandlers = [];
+  /**
+   * A PREFERENCE, not transient state: it survives reset, a mission restart and
+   * a flight-mode change, exactly as the selected weapon does. Nothing about
+   * putting the aircraft back should change which way the controls work.
+   */
+  let pitchInverted = false;
 
-  const kill = (event) => {
-    if (typeof event.preventDefault === "function") event.preventDefault();
+  // Latched one-shot: set on keydown, cleared by takeRoll(). A discrete
+  // maneuver request must not be a held axis.
+  let rollRequest = 0;
+  /**
+   * Stage 05.1 — flares are a latch, not an axis, and they now have two sources:
+   * `Z` and the middle mouse button. Both feed one latch so nothing downstream
+   * learns there are two.
+   */
+  let flareRequest = false;
+  // Wheel-charged throttle, decaying toward zero each frame.
+  let wheelThrottle = 0;
+  // Same pattern for weapon release: a trigger is an event, never an axis, so
+  // holding the button cannot spam the rail.
+  let fireRequest = false;
+  /**
+   * The cannon needs the *held* state as well, because a gun burst is a duration
+   * and the missile release is an instant. Both come off the same physical
+   * trigger — `takeFire()` is the latched one-shot, `input.trigger` the
+   * continuous read.
+   */
+  let triggerDown = false;
+  input.trigger = false;
+
+  const onKey = (event, down) => {
+    if (event.code === "ShiftLeft") mods.shiftLeft = down;
+    if (event.code === "ControlLeft") {
+      mods.controlLeft = down;
+      // Narrow: only the bare lever key, so Ctrl+R / Ctrl+T still reach the browser.
+      if (down) event.preventDefault();
+    }
+
+    const code = event.code || "";
+    if (WATCHED.includes(code)) {
+      event.preventDefault();
+      if (down) keys.add(code);
+      else keys.delete(code);
+    }
+    if (!down) return; // everything below is a press
+    const once = !event.repeat;
+    if (code === "KeyR") resetHandlers.forEach((fn) => fn());
+    if (code === "KeyM" && once) modeHandlers.forEach((fn) => fn());
+    if (code === "KeyX" && once) weaponHandlers.forEach((fn) => fn());
+    if (code === "KeyZ" && once) flareRequest = true;
+    // Pitch convention. Its own key, because it is a setting rather than an
+    // action and must never be reachable by accident mid-manoeuvre.
+    if (code === "KeyI" && once) input.togglePitchMode();
+    // Manual escape hatch for a lost keyup, without restarting the mission.
+    if (code === "KeyC" && once) dropHeld();
+    if (code === "Space") {
+      event.preventDefault();
+      if (!once) return;
+      // Space rolls whichever way the stick is leaning, or whichever way Q/E is
+      // already rolling. All three are +1 = right.
+      const lean = input.roll !== 0 ? input.roll : input.x;
+      rollRequest = lean < -0.05 ? -1 : 1;
+    }
   };
 
-  // ── keyboard ─────────────────────────────────────────────────────────────
-  // §17.5: track by event.code, NEVER event.key. `key` can differ between the
-  // keydown and keyup of the same physical press (modifiers, caps lock, a
-  // layout switch, an IME). When it differs, the keyup deletes a set entry
-  // that is not there and the keydown's entry is orphaned permanently: a stuck
-  // axis at full deflection that no further input can clear.
-  //
-  // Arrow keys are absent from AXIS_KEYS for a related reason: browser and
-  // embed chrome steal them, so their keyup goes missing. Do not add them.
-  function onKeyDown(event) {
-    const code = event.code;
-    if (!code) return;
-    if (code === "KeyC") return clear();
-    if (code === "KeyI") return togglePitchConvention();
-    if (HOLD_KEYS[code]) holds.add(HOLD_KEYS[code]);
-    // Latch on the press EDGE, so holding the key does not repeat the action
-    // once the OS keyboard repeat kicks in.
-    if (LATCH_KEYS[code] && !held.has(code)) latches.add(LATCH_KEYS[code]);
-    if (HOLD_KEYS[code] || LATCH_KEYS[code] || AXIS_KEYS[code]) {
-      held.add(code);
-      kill(event);
-    }
-  }
+  /**
+   * The trigger is a separate handler because it needs the RELEASE too, and
+   * losing that release is the same class of bug: a gun that keeps firing on its
+   * own. Keyed on `code` for the same reason.
+   */
+  const onTriggerKey = (event, down) => {
+    const code = event.code || "";
+    if (code !== "KeyF" && code !== "Enter" && code !== "NumpadEnter") return;
+    if (down && !event.repeat) fireRequest = true;
+    triggerDown = down;
+    input.trigger = down;
+  };
 
-  function onKeyUp(event) {
-    const code = event.code;
-    if (!code) return;
-    held.delete(code);
-    if (HOLD_KEYS[code]) holds.delete(HOLD_KEYS[code]);
-  }
-
-  function clear() {
-    held.clear();
-    holds.clear();
-    axes.x = 0;
-    axes.y = 0;
-    axes.roll = 0;
-    axes.throttle = 0;
-    keyAxes.x = 0;
-    keyAxes.y = 0;
-    keyAxes.roll = 0;
-    wheelCharge = 0;
-    // NOT cleared: `pointer` (a physical position, see above) and `pitchSign`
-    // (a preference that must survive reset, respawn and mode change). Every
-    // other reset in this project clears everything it can reach; these two
-    // are the explicit exceptions.
-  }
-
-  function togglePitchConvention() {
-    pitchSign = -pitchSign;
-    // Flip the live ramped value too, so the axis reverses on the spot rather
-    // than easing across zero over the next second.
-    axes.y = -axes.y;
-    keyAxes.y = -keyAxes.y;
-  }
-
-  // ── pointer ──────────────────────────────────────────────────────────────
-  // §17.6: positional, from a fixed visible centre. NEVER a synthesised or
-  // drifting origin. A previous design steered from a claimed origin derived
-  // from relative movement and took six fixes without closing the bug, because
-  // a synthesised centre has no detent the player can see or feel. If the
-  // steering ever needs changing, change the mapping FROM POSITION; do not
-  // reintroduce an origin that moves.
-  function onPointerMove(event) {
-    const w = event.view?.innerWidth ?? globalThis.innerWidth ?? 0;
-    const h = event.view?.innerHeight ?? globalThis.innerHeight ?? 0;
-    pointer = { x: event.clientX, y: event.clientY, w, h };
-  }
-
-  function onPointerDown(event) {
-    const bind = MOUSE_BUTTONS[event.button];
-    if (!bind) return;
-    if (bind.hold) holds.add(bind.hold);
-    if (bind.latch) latches.add(bind.latch);
-    // Every mouse binding suppresses its default: the middle button otherwise
-    // triggers autoscroll and the right button opens the context menu.
-    kill(event);
-  }
-
-  function onPointerUp(event) {
-    const bind = MOUSE_BUTTONS[event.button];
-    if (bind?.hold) holds.delete(bind.hold);
-  }
-
-  function onWheel(event) {
-    // Normalise the notch: deltaMode 0 is pixels, 1 is lines, 2 is pages, and
-    // a trackpad sends small pixel deltas continuously. Sign is inverted so
-    // wheel-up (negative deltaY) pushes the throttle FORWARD.
-    const notch = event.deltaY > 0 ? -1 : event.deltaY < 0 ? 1 : 0;
-    wheelCharge = clamp(wheelCharge + notch * WHEEL_IMPULSE, -2, 2);
-    kill(event); // otherwise the page scrolls under the game
-  }
-
-  function onContextMenu(event) {
-    // Double duty (§7): suppress the menu AND clear held keys, because a menu
-    // opening swallows the keyup of anything currently held.
-    kill(event);
-    clear();
-  }
-
-  on(target, "keydown", onKeyDown);
-  on(target, "keyup", onKeyUp);
-  on(target, "blur", clear);
-  on(target, "pagehide", clear);
-  on(target, "contextmenu", onContextMenu);
-  on(doc, "visibilitychange", () => {
-    if (doc && doc.visibilityState === "hidden") clear();
+  target.addEventListener("keydown", (e) => {
+    onKey(e, true);
+    onTriggerKey(e, true);
+  });
+  target.addEventListener("keyup", (e) => {
+    onKey(e, false);
+    onTriggerKey(e, false);
   });
 
-  // Leaving the window RELEASES the stick. A parked off-centre cursor keeps
-  // commanding on purpose (it is a stick held over, and it looks like one),
-  // but a cursor that has left the window entirely is a hand that has left
-  // the controls -- and unlike a reset, that is a real change in where the
-  // player's hand is, so forgetting the position is the truthful thing to do.
-  const release = () => {
-    pointer = null;
+  /**
+   * Every way a held key can stop being held without a keyup arriving. Any one
+   * of these leaves a stuck axis at full deflection, so they all clear.
+   */
+  const dropHeld = () => {
+    keys.clear();
+    mods.shiftLeft = mods.controlLeft = false;
+    triggerDown = false;
+    input.trigger = false;
+  };
+  target.addEventListener("blur", dropHeld);
+  if (typeof document !== "undefined") {
+    // Tab switch / minimise: the keyup lands on whatever has focus next.
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) dropHeld();
+    });
+  }
+  target.addEventListener("pagehide", dropHeld);
+  // A context menu swallows the keyup of anything held when it opens — and with
+  // the right button now bound to the weapon switch, the menu must not appear at
+  // all. Both concerns, one listener.
+  target.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    dropHeld();
+  });
+
+  /**
+   * The wheel is the throttle. Up is more power, which matches every other
+   * scroll-to-increase control a player has used.
+   */
+  target.addEventListener(
+    "wheel",
+    (event) => {
+      if (!event.deltaY) return;
+      event.preventDefault();
+      wheelThrottle = clamp(wheelThrottle - Math.sign(event.deltaY) * MOUSE.wheelStep, -1, 1);
+    },
+    { passive: false }
+  );
+
+  /**
+   * The left mouse button is the trigger, and that is the mouse's entire role.
+   * There is deliberately no pointermove listener in this file: the flight axes
+   * cannot be reached from the pointer at all, so no amount of mouse movement,
+   * window-edge pushing, cursor parking or lost pointerleave can produce a bank
+   * command.
+   */
+  target.addEventListener("pointerdown", (event) => {
+    if (event.button === 0) {
+      fireRequest = true;
+      triggerDown = true;
+      input.trigger = true;
+      return;
+    }
+    // Stage 05.1 — the other two buttons. Both are discrete actions, which is why
+    // they are buttons rather than axes: a weapon switch and a flare burst are
+    // events, and holding either should do nothing extra.
+    if (event.button === 1) {
+      // Middle button: flares. preventDefault stops the browser's autoscroll.
+      event.preventDefault();
+      flareRequest = true;
+    } else if (event.button === 2) {
+      event.preventDefault();
+      weaponHandlers.forEach((fn) => fn());
+    }
+  });  // Steering. Position only — no deltas, no origin tracking, no claim state. The
+  // centre is the aircraft and never moves, which is the whole reason this is
+  // safe where the Stage 03.2 design was not.
+  target.addEventListener("pointermove", (event) => {
+    pointer.x = event.clientX;
+    pointer.y = event.clientY;
+    pointer.seen = true;
+  });
+  // Leaving the window is releasing the stick: there is no off-screen deflection.
+  target.addEventListener("pointerleave", () => {
+    pointer.seen = false;
+  });
+
+  const releaseTrigger = () => {
+    triggerDown = false;
+    input.trigger = false;
+  };
+  target.addEventListener("pointerup", releaseTrigger);
+  target.addEventListener("pointercancel", releaseTrigger);
+
+  /** Physical keys currently held, for the dev rail. A stuck axis is visible. */
+  input.heldKeys = () => [...keys];
+  /** Manual escape hatch for a lost keyup, without resetting the flight. */
+  input.clearHeldKeys = dropHeld;
+
+  const axis = (pos, neg) =>
+    (pos.some((k) => keys.has(k)) ? 1 : 0) - (neg.some((k) => keys.has(k)) ? 1 : 0);
+
+  /** Keyboard ramps toward its target so key release eases back to zero. */
+  input.update = (dt) => {
+    input.trigger = triggerDown;
+    /**
+     * A key cannot be held by a player who is not typing at this document. The
+     * `blur` listener above is the event-driven version of this and it is not
+     * enough on its own: a keydown that arrives just as focus moves away leaves
+     * the key latched, its keyup delivered to whatever took focus, and the axis
+     * pinned at full deflection with nothing left to release it. Polling closes
+     * that race, and it can never drop a key the player is actually holding —
+     * holding one requires focus.
+     */
+    if (doc && doc.hasFocus) {
+      if (doc.hasFocus()) seenFocus = true;
+      else if (seenFocus && (keys.size || triggerDown)) dropHeld();
+    }
+    // Undamped: the throttle's own change rate is the inertia here. The wheel
+    // charge decays, so a notch is a nudge rather than a held key.
+    const keyThrottle = (mods.shiftLeft ? 1 : 0) - (mods.controlLeft ? 1 : 0);
+    input.throttle = combineAxis(keyThrottle, wheelThrottle);
+    wheelThrottle = damp(wheelThrottle, 0, MOUSE.wheelDecay, dt);
+    // Also undamped: the flight model integrates this as a rate, and ramping it
+    // here would make the angle you stop on depend on how long you held the key.
+    input.roll = axis(ROLL_RIGHT, ROLL_LEFT);
+
+    kb.x = damp(kb.x, axis(RIGHT, LEFT), KEYBOARD.ramp, dt);
+    kb.y = damp(kb.y, axis(UP, DOWN), KEYBOARD.ramp, dt);
+
+    // Pointer and keyboard both feed the same two axes; whichever is asking for
+    // more wins, so a key press always overrides a resting cursor and neither
+    // needs to know the other exists.
+    const ps =
+      pointerEnabled && pointer.seen
+        ? pointerStick(pointer.x, pointer.y, window.innerWidth, window.innerHeight)
+        : { x: 0, y: 0 };
+    const rawX = combineAxis(clamp(kb.x, -1, 1), ps.x);
+    const rawY = combineAxis(clamp(kb.y, -1, 1), ps.y);
+    input.source = Math.abs(ps.x) > Math.abs(kb.x) || Math.abs(ps.y) > Math.abs(kb.y) ? "pointer" : "keyboard";
+
+    input.x = rawX;
+    // The one place the pitch convention is applied — so it covers the pointer too.
+    input.y = applyPitchMode(rawY, pitchInverted);
+    return input;
   };
 
-  on(target, "pointermove", onPointerMove);
-  on(target, "pointerleave", release);
-  on(target, "mouseleave", release);
-  on(doc, "pointerleave", release);
-  on(doc, "mouseleave", release);
-  on(target, "pointerdown", onPointerDown);
-  on(target, "pointerup", onPointerUp);
-  on(target, "pointercancel", onPointerUp);
-  // Not passive: the wheel handler must be able to preventDefault.
-  on(target, "wheel", onWheel, { passive: false });
-
-  function keyTargetFor(axis) {
-    let v = 0;
-    for (const code of held) {
-      const bind = AXIS_KEYS[code];
-      if (bind && bind.axis === axis) v += bind.value;
-    }
-    return clamp(v, -1, 1);
-  }
-
-  function pointerAxes() {
-    if (!steeringEnabled || !pointer) return { x: 0, y: 0 };
-    return pointerStick(pointer.x, pointer.y, pointer.w, pointer.h);
-  }
-
-  function update(dt) {
-    const k = dt > 0 ? 1 - Math.exp(-RAMP * dt) : 0;
-
-    // The keyboard axes ramp; the pointer is positional and immediate.
-    for (const axis of RAMPED) {
-      const t = keyTargetFor(axis);
-      keyAxes[axis] += (t - keyAxes[axis]) * k;
-      // Snap onto the TARGET in both directions. An exponential approach never
-      // arrives, so a released axis keeps a residual command forever -- e^-6 =
-      // 0.0025 one second after release, a 0.17 deg bank order and about
-      // 0.02 deg/s of heading. Invisible per frame; a minute later it reads as
-      // the aircraft turning on its own.
-      if (Math.abs(t - keyAxes[axis]) < SNAP) keyAxes[axis] = t;
-    }
-
-    const p = pointerAxes();
-
-    // Combine by taking WHICHEVER AXIS IS ASKING FOR MORE (§7). A held key
-    // therefore always overrides a resting cursor, and neither input needs to
-    // know the other exists.
-    axes.x = Math.abs(keyAxes.x) >= Math.abs(p.x) ? keyAxes.x : p.x;
-    axes.y = Math.abs(keyAxes.y) >= Math.abs(p.y) ? keyAxes.y : p.y;
-    axes.roll = keyAxes.roll;
-
-    // The one sign flip, on the combined axis, so it governs both sources.
-    axes.y *= pitchSign;
-
-    // Throttle: the keyboard lever keys are a rate, and a wheel notch charges
-    // a decaying value that reads as the same rate. One model, two sources.
-    axes.throttle = clamp(keyTargetFor("throttle") + wheelCharge, -1, 1);
-    wheelCharge *= Math.exp(-WHEEL_DECAY * dt);
-    if (Math.abs(wheelCharge) < 1e-3) wheelCharge = 0;
-
-    return axes;
-  }
-
-  return {
-    axes,
-    update,
-    clear,
-
-    heldKeys: () => [...held],
-    isHeld: (code) => held.has(code),
-    listenerTypes: () => listeners.map(([, type]) => type),
-
-    // Held actions -- the gun is the only one, because it is a sustained loop.
-    isFiring: () => holds.has("fire"),
-    holdsActive: () => [...holds],
-
-    // Discrete actions. Flares have two sources (Z and the middle button)
-    // feeding ONE latch, polled in the frame loop rather than acted on in a
-    // handler, so both behave identically.
-    consumeLatch(name) {
-      if (!latches.has(name)) return false;
-      latches.delete(name);
-      return true;
-    },
-    dropLatches: () => latches.clear(),
-
-    pitchConvention: () => (pitchSign > 0 ? "W = NOSE UP" : "W = NOSE DOWN"),
-    pitchSign: () => pitchSign,
-    togglePitchConvention,
-
-    // Steering is switched off outright while the launch script or the crash
-    // presentation owns the aircraft, rather than asking each of those
-    // branches to remember to ignore the pointer.
-    setPointerEnabled(on) {
-      steeringEnabled = !!on;
-    },
-    pointerEnabled: () => steeringEnabled,
-    releasePointer: release,
-    pointerPosition: () => (pointer ? { ...pointer } : null),
-    pointerAxes,
-
-    dispose() {
-      for (const [node, type, fn] of listeners) node.removeEventListener(type, fn);
-      listeners.length = 0;
-      clear();
-      pointer = null;
-    },
+  /** The crash and the launch script disable steering without clearing state. */
+  input.setPointerEnabled = (on) => {
+    pointerEnabled = !!on;
+    return pointerEnabled;
   };
+  input.pointerDeflection = () => (pointer.seen ? pointerStick(pointer.x, pointer.y, window.innerWidth, window.innerHeight) : { x: 0, y: 0 });
+
+  input.setPitchInverted = (on) => {
+    pitchInverted = !!on;
+    pitchHandlers.forEach((fn) => fn(pitchInverted, input.pitchMode()));
+    return pitchInverted;
+  };
+  input.togglePitchMode = () => input.setPitchInverted(!pitchInverted);
+  input.pitchInverted = () => pitchInverted;
+  /** The convention's name, for the HUD and the rail. */
+  input.pitchMode = () => (pitchInverted ? PitchMode.NOSE_DOWN : PitchMode.NOSE_UP);
+  input.onPitchModeToggle = (fn) => pitchHandlers.push(fn);
+
+  /** Space only. Returns -1, 1, or 0, consuming the request. */
+  input.takeRoll = () => {
+    const r = rollRequest;
+    rollRequest = 0;
+    return r;
+  };
+
+  /** True once per trigger press, consumed by the caller. */
+  input.takeFire = () => {
+    const f = fireRequest;
+    fireRequest = false;
+    return f;
+  };
+
+  /** True once per flare request, from either source. */
+  input.takeFlare = () => {
+    const f = flareRequest;
+    flareRequest = false;
+    return f;
+  };
+
+  input.onReset = (fn) => resetHandlers.push(fn);
+  input.onModeToggle = (fn) => modeHandlers.push(fn);
+  input.onWeaponCycle = (fn) => weaponHandlers.push(fn);
+
+  /**
+   * Drop every held key and in-flight axis value. Called on reset and mode
+   * change: a key still down would otherwise command the fresh state on frame
+   * one, and the ramped keyboard axes would carry the old attitude in with them.
+   */
+  input.clearTransient = () => {
+    keys.clear();
+    mods.shiftLeft = mods.controlLeft = false;
+    kb.x = kb.y = 0;
+    input.x = input.y = input.roll = input.throttle = 0;
+    rollRequest = 0;
+    fireRequest = false;
+    flareRequest = false;
+    wheelThrottle = 0;
+    triggerDown = false;
+    input.trigger = false;
+    // The pointer is NOT cleared: it is a physical position, not a latch, and
+    // pretending the player moved their hand would be a lie. It re-reads on the
+    // next move; until then a fresh aircraft holds its attitude.
+    pointer.seen = false;
+  };
+
+  return input;
 }

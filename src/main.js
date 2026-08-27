@@ -1,1500 +1,2565 @@
-// The orchestrator: wiring, frame loop, developer rail. CLAUDE.md §3, §17.3.
-
 import * as THREE from "three";
-import {
-  COASTLINE_Z,
-  createPlaceholderAircraft,
-  createWorld,
-  loadCarrier,
-  loadTerrain,
-} from "./world.js";
-import { createLaunch } from "./launch.js";
-import { createWeapons } from "./weapons.js";
-import { createDrone, damageTarget } from "./enemy.js";
-import { createTargeting, LOCK } from "./targeting.js";
-import { AIM9, createMissileSystem } from "./missile.js";
-import { createTrails } from "./missile-trail.js";
-import { createGun, leadSolution } from "./gun.js";
-import { createCombatHud } from "./combat-hud.js";
-import { hudRevealAlpha } from "./hud-layout.js";
-import { createCombatFx } from "./combat-fx.js";
-import { HOSTILE_MISSILE, createHostile } from "./hostile.js";
-import {
-  authorityFor,
-  createEvasion,
-  createThreatMonitor,
-  wouldHaveHit,
-} from "./threat.js";
-import { createDamageResponse, playerDamageEvent } from "./damage.js";
-import {
-  COMPLETE, DECK, DEFENSIVE, EXTRACTION, FINAL, INTERCEPT, LAUNCH, TERRAIN,
-  autopilotStick, blendStick, buildRoute, captureCheckpoint, createMission,
-} from "./mission.js";
-import { applyFlightState } from "./flight.js";
-import {
-  SAM_MISSILE, createSamNetwork, lineOfSight, placeSites,
-} from "./sam.js";
-import { createFlares } from "./flares.js";
-import { createRearm } from "./rearm.js";
-import { MISSION, createSandbox, nextMode, rulesFor } from "./modes.js";
-import { createCrashFx, respawnFrom } from "./crash-fx.js";
-import { CUES, createAudio, groundWarning, isFlyby } from "./audio.js";
-import { quatForward, quatFromEulerYXZ } from "./flight.js";
-import { buildTerrainIndex, createPhysics } from "./physics.js";
-import { benchmarkIndex } from "./physics-benchmark.js";
-import { createDevelopmentRecovery, createMissionCheckpointResponse } from "./collision.js";
-import { createPhysicsDebug } from "./physics-debug.js";
-import { createChaseCamera } from "./chase-camera.js";
+import { FLIGHT, SPEED, THROTTLE, EXPERT, MODE, DEG, createFlightState, resetFlightState, toggleFlightMode, updateFlight, headingDegrees, bankDegrees, attitudeVectors, isExpert, requestRoll, quatForward, quatUp, quatFromEulerYXZ, getTargetSpeed, isAfterburner, captureFlightState, applyFlightState } from "./flight.js";
 import { createInput } from "./input.js";
-import { loadAircraft } from "./aircraft.js";
-import { assetFailures } from "./assets.js";
+import { createAircraftHierarchy, loadF15, setGearVisual } from "./aircraft.js";
+import { createChaseCamera, updateChaseCamera, snapChaseCamera, setChaseView, CHASE } from "./chase-camera.js";
+import { WORLD, createWorldHierarchy, createWorldLighting, loadCarrier, loadTerrain, distanceKm } from "./world.js";
+import { DAY, createWorldClock, environmentFor, phaseName } from "./world-time.js";
+import { OCEAN, createOcean } from "./ocean.js";
+import { LIGHTS, planSettlements, createSettlementLights, createCarrierLights } from "./night-lights.js";
+import { PHYSICS, PROBES, SURFACE, createWorldPhysics, benchmarkTerrainQuery } from "./physics.js";
+import { RECOVERY, NEUTRAL_INPUT, MISSION_FAILURE, createDevelopmentRecoveryResponse, createMissionCheckpointResponse } from "./collision.js";
+import { LAUNCH, LAUNCH_VIEW, LaunchStage, createLaunchSequence } from "./launch.js";
 import {
-  BANK_MAX,
-  createFlightState,
-  setMode,
-  updateFlight,
-  commandedSpeed,
-} from "./flight.js";
+  MISSION,
+  MissionPhase,
+  missionExpired,
+  RECOVERY_VIEW,
+  CRASH_VIEW,
+  createMissionDirector,
+  planRoute,
+  planSamSites,
+  safeSpawnAltitude,
+  surveyTerrainRoute,
+  encounterFor,
+  autopilotStick,
+  blendStick,
+  bearingTo,
+  formatClock,
+  formatShortClock,
+} from "./mission.js";
+import { createPhysicsDebug, createCarrierAnchorDebug } from "./physics-debug.js";
+import { WEAPONS, WeaponMode, cycleWeapon, createWeaponMounts, createMountedMissiles, loadAim9 } from "./weapons.js";
+import { TARGETING, LockState, createTargetingSystem } from "./targeting.js";
+import { MISSILE, createMissileSystem } from "./missile.js";
+import { GUN, createGunSystem } from "./gun.js";
+import { ENEMY, createTargetDrone, updateTargetDrone, resetTargetDrone, markTargetHit, damageTarget, loadHostileFighter, installHostileVisual } from "./enemy.js";
+import { HOSTILE, HOSTILE_MISSILE, HostileState, createHostileAI } from "./hostile.js";
+import { THREAT, ThreatLevel, createThreatMonitor, inDodgePeak, evadeEarned } from "./threat.js";
+import { DamageSource, createPlayerDamageEvent, createDevelopmentHitResponse } from "./damage.js";
+import { createCombatHud, projectToScreen } from "./combat-hud.js";
+import { ENGINE_FX, createEngineFx } from "./engine-fx.js";
+import { REARM, createRearmSystem } from "./rearm.js";
+import { AUDIO, Cue, Priority, engineVoice, groundWarning, secondsToGround, flybyTriggered, createAudioDirector } from "./audio.js";
+import { SAM, SAM_MISSILE, SamState, createSamSite, createSamNetwork, wreckSamSite, lineOfSight, loadSamLauncher, installSamVisual } from "./sam.js";
+import { FLARE, createFlareSystem } from "./flares.js";
+import { CRASH, CrashCause, causeFromReason, createCrashFx } from "./crash-fx.js";
+import { GameMode, MODES, SANDBOX, modeRules, nextMode, isSandbox, createSandbox } from "./modes.js";
+import { VAPOR, createVaporFx } from "./vapor-fx.js";
+import { ATMOS, createAtmosphere } from "./atmosphere.js";
 
-const canvas = document.getElementById("view");
-const loading = document.getElementById("loading");
-const rail = document.getElementById("rail");
+const canvas = document.getElementById("stage");
+// Log depth: near 0.5 with a 120 km far plane has nowhere near enough integer
+// precision for both a 19 m airframe at 24 m and a coastline 25 km out.
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 
-const world = createWorld(canvas);
-const rig = createChaseCamera(world.camera);
-const input = createInput({ target: window, doc: document });
+const scene = new THREE.Scene();
+// Atmospheric perspective is what stops a 30 km island reading as a tabletop
+// model. Exponential-squared so the falloff is gentle up close and total at the
+// horizon, tinted to exactly the sky's horizon band so there is no fog line.
+scene.fog = new THREE.FogExp2(WORLD.haze, WORLD.fogDensity);
 
-// The placeholder flies immediately; the real airframe swaps in when it
-// arrives. Both are 19.4 m, so nothing tuned against one is wrong for the
-// other, and a failed load is a visual downgrade rather than a broken game.
-let aircraft = createPlaceholderAircraft();
-world.scene.add(aircraft);
-let airframe = null;
+const camera = createChaseCamera(window.innerWidth / window.innerHeight);
 
-let state = createFlightState();
-rig.reset(state);
+/* ---- sky ---- */
+const hazeHex = "#" + WORLD.haze.toString(16).padStart(6, "0");
+const skyCanvas = document.createElement("canvas");
+skyCanvas.width = 2;
+skyCanvas.height = 256;
+{
+  const g = skyCanvas.getContext("2d");
+  const grad = g.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0, "#2f5f92");
+  grad.addColorStop(0.6, "#7fa6c8");
+  grad.addColorStop(1, hazeHex);
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 2, 256);
+}
+const skyTex = new THREE.CanvasTexture(skyCanvas);
+skyTex.colorSpace = THREE.SRGBColorSpace;
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(WORLD.skyRadius, 24, 16),
+  new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false })
+);
+sky.name = "Sky";
+scene.add(sky);
 
-// Until the deck is ready the aircraft is HELD, not flown. Otherwise the
-// opening second of every session is a jet cruising at 900 m over open water
-// that then teleports onto a carrier -- which is both a worse first frame and
-// a lie about where the sortie starts.
-let held = true;
+/* ---- world ---- */
+const world = createWorldHierarchy();
+scene.add(world.worldRoot);
 
-// ── terrain, physics, the collision policy ───────────────────────────────
-let physics = createPhysics({});
-let physicsDebug = null;
-let policies = [];
-let policyIndex = 0;
-let terrainReport = null;
-let carrierAnchors = null;
-let launch = null;
-let anchorHelper = null;
-let launchClipSeconds = null;
+const { sun, sky: skyFill } = createWorldLighting();
+/**
+ * Stage 05.4 — the night-side light (§13).
+ *
+ * A second directional light opposite the sun, deliberately far brighter than
+ * real moonlight. It exists so terrain, the carrier and both airframes keep
+ * readable silhouettes at night: a physically honest moon leaves a fighter at
+ * 200 m/s in a black room, which is not a hard night, it is a broken game.
+ */
+const moon = new THREE.DirectionalLight(0x9fb6d8, 0);
+moon.name = "Moon";
+const lighting = new THREE.Object3D();
+lighting.name = "Lighting";
+lighting.add(sun, skyFill, moon);
+scene.add(lighting);
 
-// ── combat (stage 5) ─────────────────────────────────────────────────────
-let weapons = null;
-let weapon = "AIM-9";
-const drone = createDrone({ centre: { x: 700, y: 950, z: -4600 } });
-const targeting = createTargeting();
-const fx = createCombatFx(world.scene);
-const hud = createCombatHud(document.body, world.camera);
-let clock = 0;
+/**
+ * THE ONE WORLD CLOCK (§1/§2).
+ *
+ * Module scope, created once, and NEVER reset by anything: not applyMode(), not
+ * restartMission(), not a checkpoint restore, not respawnFromCrash(). That is
+ * the whole persistence mechanism — there is no per-mode time to copy between
+ * modes and nothing to forget to preserve, because the clock simply is not part
+ * of any of those code paths. Only a page reload starts the day again.
+ */
+const worldClock = createWorldClock();
 
-const gun = createGun({
-  onHit: (target, damage, at) => {
-    if (damageTarget(target, damage, at)) onKill(target);
-  },
-  addShake: (a) => rig.addShake(a),
+/**
+ * The visual ocean replaces the flat lit plane. The OLD mesh stays in the
+ * hierarchy but is hidden rather than deleted: `WORLD.oceanY` and everything
+ * gameplay-facing still describes a flat sea at y = 0, and keeping the original
+ * object makes it obvious that the waves are a skin over that plane and not a
+ * new source of truth (§21).
+ */
+const oceanVisual = createOcean({ fogDensity: WORLD.fogDensity });
+world.ocean.visible = false;
+scene.add(oceanVisual.mesh);
+
+let settlementLights = null;
+let carrierLights = null;
+
+/* ---- aircraft ---- */
+const { aircraftRoot, modelCorrection, cameraTarget } = createAircraftHierarchy();
+scene.add(aircraftRoot);
+cameraTarget.position.set(0, 2, 0);
+
+// Stage 03.0: hardpoints are part of the aircraft hierarchy, so a launch point
+// is a transform lookup and never a world-space constant (§4).
+const mountSet = createWeaponMounts(aircraftRoot);
+
+const flightState = createFlightState();
+aircraftRoot.position.set(flightState.position.x, flightState.position.y, flightState.position.z);
+
+const input = createInput(window);
+
+/* ---- combat ---- */
+const combatRoot = new THREE.Object3D();
+combatRoot.name = "CombatRoot";
+scene.add(combatRoot);
+
+const drone = createTargetDrone();
+combatRoot.add(drone.root);
+
+/**
+ * Stage 03.3 — the player as a target entity.
+ *
+ * The hostile's missile takes the same { position, velocity, alive } contract
+ * the player's AIM-9 takes, so guidance, the proximity fuze and the trail are
+ * literally the same code path (§14). `position` is aliased to the transform and
+ * `velocity` to the frame's measured motion, so nothing has to be copied.
+ */
+const playerEntity = { position: aircraftRoot.position, velocity: new THREE.Vector3(), alive: true, label: "PLAYER" };
+
+// The hostile's brain. It owns the drone's heading/pitch/speed and nothing else
+// — a launch is an event this file interprets, not something the AI performs.
+const hostileAi = createHostileAI({ drone });
+const threat = createThreatMonitor();
+// Guidance context for the evasion hook: rebuilt each frame, read per missile.
+const _evasion = { position: aircraftRoot.position, velocityDir: null, inPeak: false };
+
+// Targeting is a service, not a UI: it is handed an observer and a candidate
+// list. Nothing here knows about the HUD, and nothing about the player is
+// baked in — an enemy launcher can own one of these later (§34).
+const targeting = createTargetingSystem();
+const combatHud = createCombatHud();
+let missiles = null;
+let rounds = null;
+let terrainIndexed = false;
+
+/* ---- Stage 03.2: selected weapon and the internal cannon ---- */
+// One fire input, two weapons (§4): the trigger asks the selected weapon what
+// to do rather than each weapon owning a key.
+let weapon = WeaponMode.AIM9;
+const gun = createGunSystem({ scene, muzzle: mountSet.gunMuzzle });
+// Damage is applied by the owner of the target, not by the gun: gun.js reports
+// a landed round and its range, and the kill response stays in one place.
+gun.on("hit", ({ target, damage }) => {
+  damageTarget(target, damage, performance.now() / 1000);
 });
-
-const hostile = createHostile({
-  onLaunch: (from, forward) => {
-    missiles.fire({
-      config: HOSTILE_MISSILE,
-      owner: "hostile",
-      position: { ...from.position },
-      direction: forward,
-      speed: 205,
-      target: playerTarget,
-    });
-  },
+gun.on("kill", ({ target, at }) => {
+  announceKill(target, at);
 });
-const threatMonitor = createThreatMonitor();
-const evasion = createEvasion();
+gun.on("dry", () => combatHud.flash("GUN DRY"));
 
-// The player, published through the SAME target contract everything else uses,
-// so an enemy round needs no special case to chase it.
-const playerTarget = {
-  label: "PLAYER", alive: true, health: 100, maxHealth: 100, radius: 8,
-  hitAt: -Infinity,
-  position: state.position,
-  velocity: { x: 0, y: 0, z: 0 },
+/* ---- Stage 04.2: ground threats and game modes ---- */
+// Ground height for everything that needs to know where the terrain is: the SAM
+// line-of-sight test, SAM placement, and the missile terrain kill. One closure,
+// so there is exactly one definition of "the ground" in the build.
+const groundAt = (x, z) => {
+  const h = physics.sampleTerrainBelow({ x, y: 0, z });
+  return h.foundTerrain ? h.terrainHeight : WORLD.oceanY;
 };
+const samNet = createSamNetwork({ sampleHeight: groundAt });
+// §Flares — an infrared countermeasure, so it defeats a round in the air and
+// never a radar lock. World-space, like the tracers and the vapor: the point of
+// a flare is that the aircraft leaves it behind.
+const flares = createFlareSystem({ scene });
+// §4 — presentation only. It detects nothing and decides nothing; the failure
+// policy above owns when a crash begins and when the respawn happens.
+const crashFx = createCrashFx({ scene });
+const _crashVel = new THREE.Vector3();
 
-const damage = createDamageResponse({
-  addShake: (a) => rig.addShake(a),
-  onFeedback: () => {
-    message = "HIT";
-    messageUntil = clock + 1.2;
+let mode = GameMode.MISSION;
+const sandbox = createSandbox({
+  spawnHostile: () => deployHostile(MISSION.encounter.defensive),
+  setHostile: (on) => {
+    if (!on) hostileAi.setActive(false);
   },
+  setSams: (on) => samNet.setActive(on),
 });
 
-// The smoke every round leaves behind (§14). Held beside the missile system
-// rather than inside it: the segments OUTLIVE the round that laid them, and
-// missile.js compacts a dead round out of its list on the frame it detonates.
-const trails = createTrails();
-
-const missiles = createMissileSystem({
-  // THE single counter-measure hook (§14). The barrel roll attaches here and
-  // the missile never learns what a barrel roll is. Stage 8 composes terrain
-  // masking and flares onto this same function.
-  // THE COMPOSED HOOK (§13). main.js is the only layer that knows where the
-  // ground is, so terrain masking composes onto stage 6's barrel roll here --
-  // and the missile still knows nothing about terrain, flares or rolls.
-  authorityFor: (m) => {
-    const base = authorityFor(m, evasion);
-    if (m.owner !== "sam") return base;
-    return lineOfSight(m.position, state.position, (x, z) => physics.groundAt(x, z))
-      ? base
-      : Math.min(base, 0.1);
-  },
-  onEvent: (event) => {
-    if (event.kind !== "hit") return;
-    fx.burst(event.round.position, 30);
-    if (event.target === playerTarget) {
-      // An EVENT, not a reset call. The response decides what it means, and
-      // swallows the re-entry a 22 m fuze produces on consecutive frames.
-      damage.handle(
-        playerDamageEvent({
-          source: "missile", at: clock, position: event.round.position,
-          amount: event.round.config.damage, owner: event.round.owner,
-        }),
-      );
-      return;
-    }
-    if (damageTarget(event.target, event.round.config.damage, clock)) {
-      onKill(event.target);
-    }
-  },
+/* ---- Stage 04.2: SAM launches and kills ---- */
+// Same shape as the hostile's launch: an event, interpreted here. The round
+// leaves the launcher's rails, not a coordinate.
+samNet.on("launch", ({ site }) => {
+  if (!missiles) return;
+  missiles.fire({
+    mount: site.hardpoint,
+    target: playerEntity,
+    ownerSpeed: 0,
+    owner: "sam",
+    side: 1,
+    cfg: SAM_MISSILE,
+  });
 });
 
-function onKill(target) {
-  fx.burst(target.position, 46);
-  audio.play("MISSILE_HIT");
-  mission?.noteKill(target.label === "SAM" ? "sam" : "air");
-  // Clearing the lock on a kill is what stops the bracket sitting on a corpse.
+/**
+ * One kill path for every target type. The gun and the AIM-9 both land here, and
+ * a SAM site becomes a wreck rather than vanishing — a destroyed installation
+ * should stay in the world as evidence that the player did something.
+ */
+function announceKill(target, at) {
+  if (target && target.kind === "SAM") {
+    wreckSamSite(target);
+    director.stats.groundKills += 1;
+    combatHud.flash("SAM DESTROYED", "good");
+  } else {
+    // This line was missing for a stage, and it is the whole "I shoot the
+    // hostile and it does not die" report: the kill path was rewritten to handle
+    // SAM wrecks and the ordinary case lost the call that actually kills a
+    // drone. The gun still worked, because damageTarget() kills internally on the
+    // fatal round — so only the AIM-9 was broken, which is exactly the weapon a
+    // player uses on a fighter.
+    markTargetHit(target, performance.now() / 1000);
+    director.stats.kills += 1;
+    combatHud.flash("TARGET DESTROYED", "good");
+  }
+  if (missiles) missiles.burst(at || target.position, target && target.kind === "SAM" ? 34 : 26);
+  audio.play(Cue.MISSILE_HIT);
   targeting.clear();
-  message = `${target.label} DESTROYED`;
-  messageUntil = clock + 2.4;
 }
 
-let message = "";
-let messageUntil = 0;
-let threat = "";
-let mission = null;
-let route = null;
-let phaseCue = "";
-let phaseCueAge = 99;
-let extraction = 0;
-let routeHelper = null;
-const fadeEl = document.getElementById("fade");
-const completeEl = document.getElementById("complete");
-const completeRows = document.getElementById("complete-rows");
-
-// Deploy the stage-6 hostile per phase (§7). One instance, three encounters.
-let mode = MISSION;
-const crash = createCrashFx();
-const audio = createAudio();
-const crashFlashEl = document.getElementById("crash-flash");
-let lives = rulesFor(MISSION).lives;
-let lost = false;
-let flybyRange = Infinity;
-let engineStarted = false;
-let modeChangedAt = -99;
-const sandbox = createSandbox();
-const flares = createFlares();
-const rearm = createRearm({
-  onRefill: (name) => {
-    message = `${name} REARMED`;
-    messageUntil = clock + 1.8;
-  },
-});
-const sams = createSamNetwork({
-  onLaunch: (sam) => {
-    missiles.fire({
-      config: SAM_MISSILE,
-      owner: "sam",
-      position: {
-        x: sam.target.position.x,
-        y: sam.target.position.y + 14,
-        z: sam.target.position.z,
-      },
-      // LAUNCHES UPWARD WITH ZERO INHERITED SPEED, which is what makes the
-      // trail read as a ground launch rather than as a round appearing.
-      direction: { x: 0, y: 1, z: 0 },
-      speed: 0,
-      target: playerTarget,
-    });
-  },
-  onWreck: (sam) => wreckSam(sam),
+flares.on("decoy", () => combatHud.flash("DECOYED", "good"));
+flares.on("dispense", ({ remaining }) => {
+  combatHud.flash(`FLARES ${remaining}`, "info");
+  // Forced: the player pressed a button, and silence reads as a broken control
+  // even when the anti-spam interval is doing its job.
+  audio.play(Cue.FLARES, { force: true });
 });
 
-const ENCOUNTERS = {
-  [INTERCEPT]: { ammo: 0, engageDelay: 3.0 },
-  [DEFENSIVE]: { ammo: 2, engageDelay: 2.0 },
-  [FINAL]: { ammo: 1, engageDelay: 1.5 },
-};
+/* ---- Stage 04.2: game modes ---- */
+function applyMode(next) {
+  mode = next;
+  const rules = modeRules(mode);
+  director.setSandbox(!rules.phases);
+  sandbox.reset();
+  samNet.setActive(false);
+  hostileAi.setActive(false);
+  hideFailed();
+  paintLives();
+  return rules;
+}
 
-loadTerrain(world.scene)
-  .then(({ report, group, triangles }) => {
-    terrainReport = report;
-    if (!report.ok || !triangles) return;
+/* ---- Stage 03.3: taking a hit ---- */
+// §31: the missile does not know what a hit means. It produces a damage event;
+// this policy decides. Stage 04.0 splits that decision in two: this response is
+// now the FEEDBACK half only — the veil, the label, the camera kick, and the
+// single-fire guarantee that stops a 22 m fuze tripping the same hit on three
+// consecutive frames. What a hit *costs* is now a mission failure, handled by
+// the one policy that also handles flying into a mountain (§39).
+const hitResponse = createDevelopmentHitResponse({
+  holdTime: 0.8,
+  cooldown: 1.0,
+  onHit: () => {
+    targeting.clear();
+    audio.play(Cue.MISSILE_HIT, { force: true });
+    missionFailure.trigger("MISSILE HIT");
+  },
+  onRecover: null,
+});
 
-    const index = buildTerrainIndex(triangles);
-    physics = createPhysics({ index });
+/* ================= Stage 04.0 — the mission ================= */
 
-    // Sanity-check known coordinates and LOG them. A query that returns "no
-    // terrain" where terrain is present is the failure that eats a day: it
-    // does not announce itself, everything downstream just quietly treats the
-    // world as ocean, and every symptom points somewhere else.
-    const probes = [
-      ["just inside the coast", 0, COASTLINE_Z - 500],
-      ["4 km inland", 0, COASTLINE_Z - 4000],
-      ["9 km inland", 0, COASTLINE_Z - 9000],
-      ["offshore (should be sea)", 0, COASTLINE_Z + 3000],
-    ];
-    for (const [label, x, z] of probes) {
-      console.log(
-        `terrain sample ${label}: ground ${physics.groundAt(x, z).toFixed(1)} m, ` +
-          `${physics.isLandAt(x, z) ? "land" : "ocean"}`,
-      );
-    }
+// The scripted opening (§6–§14). It owns the aircraft from the first frame until
+// the handoff and uses no flight physics at all.
+const launch = createLaunchSequence();
+let launchAnchors = null;
+// How much of the launch camera composition is still mixed in. 1 through the
+// sequence, easing to 0 afterwards, so the rig is handed back without a cut.
+let viewHold = 0;
+let gearDown = null;
+let f15Visual = null;
+let startCueFired = false;
+/**
+ * Stage 05.3 — an undocumented kill switch for pointer steering (`V`).
+ *
+ * Deliberately absent from every legend and every player-facing document: it is a
+ * developer escape hatch, not a setting. It exists because pointer steering is the
+ * one control that cannot be "not pressed" — a cursor is always somewhere — so if
+ * it ever misbehaves in front of an audience there has to be a way to fall back to
+ * the keyboard without restarting.
+ *
+ * Separate from `input.setPointerEnabled()`, which the frame loop rewrites every
+ * frame to hand the aircraft to the launch script and the crash. This is the
+ * player's preference; that is the system's gating. The two are ANDed, and this one
+ * survives reset, respawn and mode change.
+ */
+let pointerAllowed = true;
+let openingFade = 0;
+let openingFadeAt = -Infinity;
+let openingFadeTimer = 0;
 
-    const meshes = [];
-    group.traverse((n) => n.isMesh && meshes.push(n));
-    // MUST update world matrices first. The terrain is shifted into place
-    // AFTER its triangles are snapshotted, and THREE.Raycaster reads
-    // matrixWorld -- so without this the raycaster tests the mesh at its
-    // pre-shift position, 22.6 km away. That is what made the first
-    // agreement run report 0/15 and "raycaster missed 45": the benchmark was
-    // comparing two different worlds, not two different algorithms.
-    world.scene.updateMatrixWorld(true);
-    benchmarkIndex(index, meshes);
+// §16 — navigation anchors are real (invisible) transforms in the scene, so no
+// mission logic anywhere holds a world coordinate. NavRoot is also what the N
+// key draws when the route needs checking.
+const navRoot = new THREE.Object3D();
+navRoot.name = "NavRoot";
+scene.add(navRoot);
+let navDebug = null;
 
-    installPolicies();
-    physicsDebug = createPhysicsDebug(world.scene, physics);
-    buildMission();
-  })
-  .catch((err) => console.error("terrain load failed", err));
-
-function installPolicies() {
-  policies = [
-    // The SHIPPED policy: a collision fails the run and restores a checkpoint.
-    createMissionCheckpointResponse({
-      onFail: (event) => {
-        // The policy's HOLD is the crash window -- no second state machine.
-        crash.start({
-          reason: event.type === "ocean" ? "ocean" : event.type,
-          position: state.position,
-          velocity: {
-            x: quatForward(state.quat).x * state.speed,
-            y: quatForward(state.quat).y * state.speed,
-            z: quatForward(state.quat).z * state.speed,
-          },
-          quat: state.quat,
-          seed: crash.state.crashes + 1,
-        });
-        rig.addShake(crash.state.kick, 5.5);
-        audio.stopLoop("GUN");
-        audio.stopLoop("ENGINE_LOOP");
-        audio.play("MISSILE_HIT");
-      },
-      onRestore: () => respawnAfterCrash(),
-      onFade: (v) => {
-        if (fadeEl) fadeEl.style.opacity = String(v);
-      },
-    }),
-    // The DEVELOPMENT policy from stage 3, still here and still swappable.
-    createDevelopmentRecovery({
-      physics,
-      getState: () => state,
-      onEvent: (e) => console.log(`collision policy: ${e.kind}`, e.event.type),
-    }),
-  ];
-  physics.setPolicy(policies[policyIndex]);
+/**
+ * §41 — a checkpoint snapshot. Enough to continue cleanly, and nothing about
+ * particles, clouds or plumes: presentation resets, gameplay does not.
+ */
+function captureMissionState() {
+  const flight = captureFlightState(flightState);
+  /**
+   * A checkpoint has to be a state the player can fly OUT of. Recording the
+   * attitude verbatim would allow one to be taken mid-dive at 120 m over a
+   * ridge, and restoring it would re-fly the same impact — which is exactly the
+   * trap Stage 02.3 found one layer down, where the newest safe state sat one
+   * query before the collision. So a checkpoint is levelled onto the heading it
+   * was travelling and lifted to real air.
+   */
+  const ground = terrainIndexed ? physics.sampleTerrainBelow(flightState.position) : null;
+  const floor = (ground && ground.foundTerrain ? ground.terrainHeight : WORLD.oceanY) + MISSION.route.terrainClearance;
+  flight.position.y = Math.max(flight.position.y, floor);
+  quatFromEulerYXZ(0, flightState.heading, 0, flight.quat);
+  return {
+    flight,
+    // Recorded so the restore can tell a real checkpoint from the deck.
+    heading: flightState.heading,
+    weapon,
+    aim9: rounds ? rounds.count : 2,
+    gunAmmo: gun.state.ammo,
+    // Checkpoint 0 is the deck, and restoring it means re-running the catapult
+    // rather than dropping the player into the air above a carrier.
+    onDeck: director.state.phase === MissionPhase.DECK || director.state.phase === MissionPhase.LAUNCH,
+  };
 }
 
 /**
- * The respawn, computed from WHERE THE PLAYER DIED rather than from a stored
+ * Guarantee a respawn is in flyable air — enforced at RESTORE time, against the
+ * terrain that is actually there.
+ *
+ * The capture-time lift is not sufficient and could not be. It samples the ground
+ * directly below the capture point, which says nothing about whether that point
+ * sits inside a hillside, nor about what the aircraft is POINTED AT. Restoring a
+ * levelled attitude 320 m over a valley floor with a 600 m ridge 400 m ahead puts
+ * the player back into contact within two seconds, the policy fails them again,
+ * and the crash repeats forever — which is the reported bug.
+ *
+ * So the corridor ahead of the restored heading is sampled and the aircraft is
+ * lifted above the HIGHEST ground in it. A respawn that begins a second from a
+ * mountain is not a respawn.
+ */
+/**
+ * Stage 04.7b — the respawn is computed from the CRASH, not from a stored
  * checkpoint.
  *
- * AN AIRBORNE DEATH MUST NOT GO THROUGH A CHECKPOINT REWIND (§15). A rewind
- * restores a checkpoint's position AND PHASE, and if the phase checkpoint was
- * never captured it falls back to the deck one -- flipping the phase to DECK
- * and handing the aircraft to the launch script. Progression (stores, stats)
- * is restored; position and phase are not touched.
- */
-function respawnAfterCrash() {
-  // A PILOT IS SPENT AT THE RESTORE, not at the impact: the number is what the
-  // player has left to FLY, so it drops when the replacement is dispatched.
-  const rules = rulesFor(mode);
-  if (rules.lives !== null) {
-    lives = Math.max(0, lives - 1);
-    if (lives === 0) {
-      lost = true;
-      showComplete(true);
-      crash.finish();
-      return;
-    }
-    message = "A NEW PILOT IS NOW DEPLOYED TO YOUR LOCATION";
-    messageUntil = clock + 3.2;
-  }
-
-  const spawn = respawnFrom(
-    crash.state.position,
-    state.heading,
-    (x, z) => physics.groundAt(x, z),
-  );
-  state.position.x = spawn.position.x;
-  state.position.y = spawn.position.y;
-  state.position.z = spawn.position.z;
-  state.pitch = 0;
-  state.bank = 0;
-  state.sink = 0;
-  state.speed = spawn.speed;
-  state.quat = quatFromEulerYXZ(state.heading, 0, 0);
-
-  // VERIFY THE RESPAWN AS A POST-CONDITION. The altitude is a floor on
-  // ABSOLUTE altitude, so ending up in the sea should be impossible -- it was
-  // reported anyway at a lower floor, which means another writer can touch the
-  // transform afterwards. Raising the floor would hide that; this names it.
-  const clearanceNow =
-    state.position.y - physics.groundAt(state.position.x, state.position.z);
-  if (clearanceNow < 200) {
-    console.error(
-      `respawn post-condition FAILED: only ${clearanceNow.toFixed(0)} m of ` +
-        `clearance at (${state.position.x.toFixed(0)}, ${state.position.z.toFixed(0)}) ` +
-        `-- something wrote the transform after the respawn`,
-    );
-  }
-
-  // Progression only. Stores and stats, never position or phase.
-  const cp = mission?.latestCheckpoint();
-  if (cp) {
-    weapon = cp.weapon;
-    weapons?.setCount(cp.missiles);
-    gun.setRounds(cp.gunRounds);
-  }
-  missiles.expireOwner("hostile");
-  missiles.expireOwner("sam");
-  gun.clearFx();
-  trails.clearFx();
-  threatMonitor.reset();
-  damage.reset();
-  evasion.reset();
-  flares.reset();
-  physics.reset(state, { keepPolicy: true });
-  rig.reset(state);
-  crash.finish();
-}
-
-/**
- * Restore the latest checkpoint. Note the SURGICAL cleanup: expireOwner and
- * clearFx, never missiles.clear() or gun.reset() -- the first would delete the
- * player's in-flight shot and the second would refill the magazine, making a
- * crash the cheapest way to rearm.
- */
-function restoreCheckpoint() {
-  const cp = mission?.latestCheckpoint();
-  if (cp) {
-    applyFlightState(state, cp.snapshot);
-    weapon = cp.weapon;
-    // setCount(n), NOT reload() -- a checkpoint restores the loadout it
-    // RECORDED (§7).
-    weapons?.setCount(cp.missiles);
-    gun.setRounds(cp.gunRounds);
-  }
-  missiles.expireOwner("hostile");
-  gun.clearFx();
-  trails.clearFx();
-  threatMonitor.reset();
-  damage.reset();
-  evasion.reset();
-  physics.reset(state, { keepPolicy: true });
-  rig.reset(state);
-}
-installPolicies();
-
-// The carrier and the catapult. Every mode flies the launch (§11), so it is
-// started as soon as both the deck and the airframe are known.
-Promise.all([loadCarrier(world.scene), measureClip("./assets/audio/engine-start.mp3")])
-  .then(([{ anchors, report }, clipSeconds]) => {
-    carrierAnchors = anchors;
-    console.log(
-      `engine start-up measured ${clipSeconds.toFixed(2)} s -> deck dwell ` +
-        `${(clipSeconds / 2).toFixed(2)} s at double speed`,
-    );
-    launchClipSeconds = clipSeconds;
-    anchorHelper = createAnchorHelper(anchors);
-    world.scene.add(anchorHelper);
-    startLaunch(clipSeconds);
-  })
-  .catch((err) => console.error("carrier load failed", err));
-
-/**
- * The deck dwell is the start-up recording's own length, not an authored
- * number: the catapult fires on its last note, which makes the wait read as a
- * countdown rather than a delay. Measuring it here keeps the two coupled
- * values (§9) derived from one source.
- */
-function measureClip(url) {
-  return new Promise((resolve) => {
-    const audio = new Audio();
-    audio.preload = "metadata";
-    const done = (v) => resolve(v);
-    audio.addEventListener("loadedmetadata", () => done(audio.duration || 22));
-    // Missing audio is a NORMAL state (§16). Fall back rather than hanging the
-    // whole launch on a file that may not be there.
-    audio.addEventListener("error", () => done(22));
-    setTimeout(() => done(audio.duration || 22), 4000);
-    audio.src = url;
-  });
-}
-
-/**
- * R restarts the SORTIE, not just the flight state.
+ * The corridor lift below was the right rule applied to the wrong position. A
+ * checkpoint records where the player was when a phase BEGAN — possibly
+ * kilometres away and inside anything — so two rounds of fixing the altitude
+ * could not fix the fact that the horizontal position was never checked at all.
  *
- * An earlier version rebuilt the flight state alone, which dropped the player
- * into mid-air at the spawn altitude with the launch already spent -- the
- * strongest moment in the build, unreachable for the rest of the session.
- * Every mode flies the catapult (§11), and that has to include a restart.
+ * The spawn is now local to the thing that killed you: back off along your own
+ * direction of travel from the point of impact, level, at an altitude that clears
+ * the ground ahead. That is the player's own suggestion, generalised — `z + value`
+ * is only correct while heading is -Z, and keeping `y` is precisely what traps
+ * you, because `y` is the altitude you died at.
+ *
+ * It is better play, too: you get another run at the ridge that beat you rather
+ * than being teleported back to the start of the leg.
  */
-function restartSortie() {
-  state = createFlightState();
-  physics.reset(state);
-  // reset() reloads; clearFx() cleans up. They are separate for exactly this
-  // reason -- a restart wants both, a phase change wants only one.
-  gun.reset();
-  gun.clearFx();
-  trails.clearFx();
-  missiles.clear();
-  fx.clear();
-  targeting.clear();
-  weapons?.reload();
-  drone.reset();
-  threatMonitor.reset();
-  evasion.reset();
-  damage.resetAll();
-  hostile.setActive(false);
-  mission?.reset();
-  extraction = 0;
-  // Re-announce the deck rather than clearing: a restart is a fresh sortie and
-  // it opens the same way the first one did.
-  phaseCue = mission ? mission.mission.phase : "";
-  phaseCueAge = 0;
-  if (completeEl) completeEl.hidden = true;
-  if (fadeEl) fadeEl.style.opacity = "0";
-  policies.forEach((p) => p.resetAll?.() ?? p.reset?.());
-  crash.reset();
-  audio.reset();
-  engineStarted = false;
-  flybyRange = Infinity;
-  lives = rulesFor(mode).lives;
-  lost = false;
-  if (crashFlashEl) crashFlashEl.style.opacity = "0";
-  flares.resetAll();
-  rearm.reset();
-  sandbox.resetAll();
-  // A full restart resets the sites. They do NOT respawn mid-sortie: six is a
-  // finite thing to clear, and a player who spent four minutes clearing the
-  // valley has earned an empty valley.
-  sams.reset();
-  for (const [sam, mesh] of samMeshes) restoreSamMesh(sam, mesh);
-  if (launchClipSeconds !== null && carrierAnchors) startLaunch(launchClipSeconds);
-  else rig.reset(state);
-}
+const RESPAWN = { retreat: 1800, clearance: 460 };
 
-function buildMission() {
-  if (!carrierAnchors) return;
-  route = buildRoute({
-    carrierZ: carrierAnchors.deck.z,
-    coastZ: terrainReport?.ok ? terrainReport.nearEdgeZ : COASTLINE_Z,
-    // The survey is handed the height field as a FUNCTION, which is why it is
-    // testable against a synthetic one with no scene (§4).
-    sampleHeight: terrainReport?.ok ? (x, z) => physics.groundAt(x, z) : null,
-  });
-  console.log(
-    `route: ${route.surveyed ? "surveyed" : "AUTHORED FALLBACK"}, ` +
-      route.legs.map((l) => `${l.name}@${l.z.toFixed(0)}`).join(" -> "),
-  );
-  mission = createMission({
-    route,
-    onPhase: (to, from) => {
-      phaseCue = to;
-      phaseCueAge = 0;
-      onPhaseChange(to, from);
-    },
-  });
-  // DECK IS ANNOUNCED LIKE ANY OTHER PHASE. The transition callback only fires
-  // on a CHANGE, so the phase the sortie starts in was the one phase never
-  // named -- which, now that the instruments are dark until the catapult,
-  // would leave the opening frames completely blank.
-  phaseCue = mission.mission.phase;
-  phaseCueAge = 0;
-  // Two per inland leg, flanking the corridor. A site with nowhere to stand is
-  // DROPPED, not floated.
-  const inland = route.legs.filter((l) => l.phase === TERRAIN);
-  const placed = placeSites(inland, (x, z) => physics.groundAt(x, z));
-  sams.deploy(placed.map((p) => ({ x: p.x, y: p.y + 6, z: p.z })));
-  console.log(
-    `SAM sites: ${placed.length} of ${inland.length * 2} stood on land ` +
-      `(${placed.map((p) => `${p.leg}${p.side > 0 ? "R" : "L"}@${p.ground.toFixed(0)}m`).join(", ")})`,
-  );
-  buildSamMeshes();
-
-  routeHelper = createRouteHelper(route);
-  world.scene.add(routeHelper);
-}
-
-function onPhaseChange(to, from) {
-  // At EVERY phase transition: the surgical cleanup, for the same reason as
-  // the restore above.
-  missiles.expireOwner("hostile");
-  gun.clearFx();
-  trails.clearFx();
-  threatMonitor.reset();
-  damage.reset();
-
-  const encounter = ENCOUNTERS[to];
-  if (encounter) {
-    // Deploy ~2400 m ahead, ~900 m to an ALTERNATING side, ~140 m above,
-    // facing back down the player's course -- a head-on pass announces an
-    // intercept and puts it on screen without a hunt.
-    const side = hostile.ai.encounters % 2 === 0 ? 1 : -1;
-    const f = quatForward(state.quat);
-    hostile.deploy({
-      at: {
-        x: state.position.x + f.x * 2400 + side * 900,
-        y: Math.max(400, state.position.y + 140),
-        z: state.position.z + f.z * 2400,
-      },
-      heading: Math.atan2(-(-f.x), -(-f.z)),
-      ammo: encounter.ammo,
-      engageDelay: encounter.engageDelay,
+function respawnFromCrash() {
+  const h = crashFx.state.heading;
+  // Forward is (-sin h, -cos h), so backing off is the positive of that.
+  const x = crashFx.state.origin.x + Math.sin(h) * RESPAWN.retreat;
+  const z = crashFx.state.origin.z + Math.cos(h) * RESPAWN.retreat;
+  /**
+   * Stage 05.0 — a fixed generous altitude, not an escalating one.
+   *
+   * The escalation existed to climb its way out of terrain over repeated deaths.
+   * With five aircraft that is no longer an acceptable way to converge, because
+   * each attempt costs a pilot. Take the higher of the corridor clearance and the
+   * flat floor.
+   *
+   * 05.2 raised it back to 4000 m: at 2000 m the aircraft was reported ending up
+   * in the ocean again. Geometrically that should be impossible — the value is a
+   * lower bound on absolute altitude and the island peaks at 643 m — so 4000 m is
+   * masking something rather than fixing it. The post-condition check below exists
+   * to catch the real cause the next time it happens instead of hiding it.
+   */
+  const y = Math.max(LIVES.respawnAltitude, safeSpawnAltitude({ x, z }, h, terrainIndexed ? groundAt : null, MISSION, RESPAWN.clearance));
+  flightState.position.x = x;
+  flightState.position.y = y;
+  flightState.position.z = z;
+  flightState.heading = h;
+  flightState.pitch = 0;
+  flightState.bank = 0;
+  flightState.sink = 0;
+  flightState.rollHold = false;
+  flightState.maneuver = null;
+  flightState.speed = SPEED.cruise;
+  flightState.targetSpeed = SPEED.cruise;
+  quatFromEulerYXZ(0, h, 0, flightState.quat);
+  syncAircraft();
+  setGear(false);
+  setAircraftOpacity(1);
+  // keepPolicy: the policy performing this restore must not reset itself.
+  physics.reset(flightState, { keepPolicy: true });
+  snapChaseCamera();
+  viewHold = 0;
+  input.clearTransient();
+  prevPitchDeg = flightState.pitch / DEG;
+  pitchRateDeg = 0;
+  /**
+   * 05.2 — post-condition, not a belt-and-braces lift.
+   *
+   * The respawn altitude is a floor on ABSOLUTE altitude, so ending up in the sea
+   * should be impossible. It was reported anyway at 2000 m, which means some other
+   * writer is touching the transform after this runs. Verify the invariant here and
+   * log loudly when it does not hold: the numbers in that log name the culprit,
+   * whereas raising the floor only hides it.
+   */
+  const below = terrainIndexed ? groundAt(flightState.position.x, flightState.position.z) : WORLD.oceanY;
+  if (flightState.position.y < below + RESPAWN.clearance) {
+    console.warn("[respawn] post-condition failed — something moved the aircraft after the respawn", {
+      wanted: Math.round(y),
+      actual: Math.round(flightState.position.y),
+      groundBelow: Math.round(below),
     });
+    flightState.position.y = below + RESPAWN.clearance;
+    syncAircraft();
+  }
+  console.log("[respawn]", { impact: [Math.round(crashFx.state.origin.x), Math.round(crashFx.state.origin.z)], spawn: [Math.round(x), Math.round(y), Math.round(z)], headingDeg: Math.round((h * 180) / Math.PI), lives });
+  // Diegetic, and deliberately a little cold: the aircraft you were flying is
+  // gone, and so is whoever was in it.
+  combatHud.flash("A NEW PILOT IS NOW DEPLOYED TO YOUR LOCATION", "info");
+  return { x, y, z };
+}
+
+function ensureSafeSpawn(flight, heading) {
+  flight.position.y = Math.max(flight.position.y, safeSpawnAltitude(flight.position, heading, terrainIndexed ? groundAt : null));
+  return flight;
+}
+
+function restoreMissionState(snapshot) {
+  if (!snapshot) return;
+  clearEncounterFx();
+  if (snapshot.onDeck) {
+    placeOnDeck();
   } else {
-    // Outside those phases it is switched off ENTIRELY and handed no
-    // candidates -- not simulated, not drawn, not targetable.
-    hostile.setActive(false);
+    // Clearance is enforced HERE, not at capture: the terrain is what it is now,
+    // and a snapshot cannot know what it will be restored into.
+    ensureSafeSpawn(snapshot.flight, snapshot.heading || 0);
+    applyFlightState(flightState, snapshot.flight);
+    // A respawn is level and at cruise. Restoring a dive — or the crash's own
+    // terminal speed — hands the player an aircraft already in trouble.
+    flightState.speed = Math.max(flightState.speed, SPEED.cruise);
+    flightState.targetSpeed = flightState.speed;
+    flightState.sink = 0;
+    syncAircraft();
+    // keepPolicy: the policy performing this restore must not reset itself.
+    physics.reset(flightState, { keepPolicy: true });
+    setGear(false);
+    snapChaseCamera();
+    viewHold = 0;
   }
-
-  // Four checkpoints, at phase boundaries: deck, open sea, terrain entry,
-  // final approach.
-  const CHECKPOINT_AT = [LAUNCH, INTERCEPT, TERRAIN, FINAL];
-  if (CHECKPOINT_AT.includes(to)) {
-    const f = quatForward(state.quat);
-    // Lifted above the ground AHEAD, not the ground below: a levelled attitude
-    // over a valley floor with a ridge 1.5 km ahead is not a flyable state.
-    let ground = 0;
-    for (let d = 0; d <= 4000; d += 400) {
-      ground = Math.max(
-        ground,
-        physics.groundAt(state.position.x + f.x * d, state.position.z + f.z * d),
-      );
-    }
-    mission.addCheckpoint(
-      captureCheckpoint(state, {
-        groundAhead: ground,
-        weapon,
-        missiles: weapons ? weapons.count : 2,
-        gunRounds: gun.rounds,
-        phase: to,
-      }),
-    );
-  }
-
-  if (to === EXTRACTION) extraction = 0;
-  if (to === COMPLETE) showComplete();
+  if (rounds) rounds.setCount(snapshot.aim9);
+  gun.state.ammo = snapshot.gunAmmo;
+  gun.state.dry = false;
+  weapon = snapshot.weapon;
+  input.clearTransient();
+  combatHud.reset();
+  engineFx.reset();
+  vaporFx.reset();
+  atmosphere.reset();
+  prevPitchDeg = flightState.pitch / DEG;
+  pitchRateDeg = 0;
 }
 
-function showComplete(failed = false) {
-  if (!completeEl || !completeRows) return;
-  const s = mission.mission.stats;
-  const rows = [
-    ["TIME", `${mission.elapsed().toFixed(1)} s`],
-    ["AIR KILLS", String(s.airKills)],
-    ["SAM SITES", String(s.samKills)],
-    ["AIM-9", `${s.missilesFired} / ${(weapons?.capacity ?? 2)}`],
-    ["GUN ROUNDS", String(s.gunFired)],
-  ];
-  completeRows.replaceChildren();
-  for (const [k, v] of rows) {
-    const dt = document.createElement("dt");
-    dt.textContent = k;
-    const dd = document.createElement("dd");
-    dd.textContent = v;
-    completeRows.append(dt, dd);
-  }
-  const title = document.getElementById("complete-title");
-  if (title) {
-    // THE LOSS SCREEN MIRRORS THE WIN SCREEN -- same furniture, salmon instead
-    // of green -- so a win and a loss read as the same KIND of event.
-    title.textContent = failed ? "MISSION FAILED" : "SORTIE COMPLETE";
-    title.style.color = failed ? "var(--salmon)" : "var(--green)";
-  }
-  completeEl.hidden = false;
-}
-
-function startLaunch(clipSeconds) {
-  if (!carrierAnchors) return;
-  launch = createLaunch({
-    anchors: carrierAnchors,
-    clipSeconds,
-    rig,
-    setGear: (down) => airframe?.setGearVisual(down),
-    groundOffset: airframe?.groundOffset() ?? 2.95,
-    onEvent: (name, plan) => console.log(`launch: ${name} at t=${plan[name + "At"] ?? "-"}`),
-  });
-  console.log("launch plan:", JSON.stringify(launch.plan));
-  launch.start(state);
-  held = false;
-  // Steering is disabled outright while the script owns the aircraft, rather
-  // than asking the frame loop to remember to ignore the pointer (§7).
-  input.setPointerEnabled(false);
-}
-
-loadAircraft()
-  .then((loaded) => {
-    world.scene.remove(aircraft);
-    aircraft = loaded.group;
-    airframe = loaded;
-    world.scene.add(aircraft);
-    createWeapons(aircraft).then((w) => {
-      weapons = w;
-    });
-    // The airframe may arrive after the carrier; re-seat the launch so the
-    // parked pose uses the MEASURED wheel offset rather than the fallback.
-    if (launchClipSeconds !== null) startLaunch(launchClipSeconds);
-  })
-  .catch((err) => console.error("aircraft load failed", err));
-
-// The VECTOR panel, top left. VISIBLE BY DEFAULT and NOT bound to `H`, per
-// instruction -- this deliberately reverses PATCH-02's clarification 1, which
-// asked for hidden-by-default and for `H` to keep the toggle.
-let railVisible = true;
-let railClock = 0;
-
-window.addEventListener("keydown", (event) => {
-  // `H` is deliberately unbound: the panel is always on.
-  if (event.code === "KeyM") {
-    setMode(state, state.mode === "ASSISTED" ? "EXPERT" : "ASSISTED");
-    modeChangedAt = clock;
-    // Clear transient input on a mode change: a held key would otherwise
-    // command the fresh model on frame one, and the ramped axes would carry
-    // the old attitude in with them. input.clear() deliberately leaves the
-    // pitch convention alone -- it is a preference, not transient state.
-    input.clear();
-    rig.reset(state);
-  }
-  if (event.code === "KeyP" && physicsDebug) physicsDebug.toggle();
-  audio.arm(); // NOTHING PLAYS BEFORE A USER GESTURE
-  if (event.code === "KeyK") audio.setMuted(!audio.isMuted());
-  if (event.code === "KeyJ") hud.setVisible(!hud.isVisible());
-  if (event.code === "KeyT") {
-    // T cycles AND restarts: every mode starts on the deck, and half a mission
-    // in the wrong ruleset is not a state worth supporting.
-    mode = nextMode(mode);
-    console.log(`mode -> ${mode}`);
-    restartSortie();
-  }
-  if (event.code === "KeyN" && routeHelper) {
-    routeHelper.visible = !routeHelper.visible;
-  }
-  // Enter restarts ONLY from the completion screen -- it is a fire key in
-  // flight, and a player pulling the trigger should never restart the sortie.
-  if (event.code === "Enter" && completeEl && !completeEl.hidden) restartSortie();
-  if (event.code === "KeyO" && anchorHelper) {
-    anchorHelper.visible = !anchorHelper.visible;
-  }
-  if (event.code === "KeyG") {
-    // Swap the collision policy live. DETECTION is byte-identical under both;
-    // only the response differs, which is the whole point of §4's split.
-    policyIndex = (policyIndex + 1) % policies.length;
-    physics.setPolicy(policies[policyIndex]);
-    console.log(`collision policy -> ${policies[policyIndex].name}`);
-  }
-  // `O` draws the carrier anchors (stage 4), with the system it belongs to.
+const director = createMissionDirector({
+  captureCheckpoint: captureMissionState,
+  restoreCheckpoint: restoreMissionState,
 });
 
-// The frame loop. §17.3 and stage 1's rule 1: schedule the NEXT frame FIRST,
-// then run the body inside a guard. If rAF were the last statement, a single
-// thrown frame would permanently end the session and leave the last rendered
-// image on screen -- which reads exactly like a feature being broken, and
-// costs hours before anyone suspects the loop is simply dead.
-let errorCount = 0;
-let last = 0;
-
-function frame(now) {
-  requestAnimationFrame(frame); // FIRST -- before anything can throw
-  try {
-    step(now);
-  } catch (err) {
-    // Log the first few and keep flying. Failing safe toward playable is the
-    // rule; a silent freeze is the failure this guard exists to prevent.
-    if (errorCount++ < 5) console.error("frame error", err);
-  }
-}
-
-function step(now) {
-  const dt = last ? Math.min((now - last) / 1000, 0.1) : 1 / 60;
-  last = now;
-
-  const axes = input.update(dt);
-
-  if (input.consumeLatch("restart")) restartSortie();
-
-  // A policy can neutralise the stick -- the input that flew into the
-  // mountain must not be reapplied on the restore frame. The policy is asked;
-  // it never reaches into input.js itself.
-  if (held) {
-    // Nothing to simulate yet, but the policy must still be ticked (§17.4) --
-    // a branch that skips physics and forgets this freezes the game.
-    physics.getPolicy()?.tick(dt);
-  }
-  // ── the crash: a THIRD OWNER of the aircraft transform ─────────────────
+/**
+ * §39/§40 — the mission response policy. Terrain collision detection is
+ * unchanged; only what happens about it is different. It also serves missile
+ * hits through trigger(), so one failure model covers both.
+ */
+const missionFailure = createMissionCheckpointResponse({
+  onFail: (reason) => {
+    combatHud.flash(reason);
+    director.fail(reason);
+    /**
+     * §2/§4 — the crash presentation starts here and nowhere else: after
+     * gameplay has already decided the player is destroyed. It is handed the
+     * aircraft's live transform and velocity, so the theatre begins from exactly
+     * the attitude and momentum the player had — including inverted (§45).
+     */
+    _crashVel.copy(_fwdV).multiplyScalar(flightState.speed);
+    crashFx.start({
+      cause: causeFromReason(reason),
+      position: aircraftRoot.position,
+      quat: aircraftRoot.quaternion,
+      velocity: _crashVel,
+      heading: flightState.heading,
+      impactNormal: physics.state.contactNormal || null,
+    });
+    // §34 — silence what is no longer true. The cannon loop and the warnings
+    // belong to an aircraft that is now falling.
+    audio.loop(Cue.GUN, false);
+    audio.play(Cue.MISSILE_HIT, { force: true });
+  },
+  // §25 in MISSION: back to the last checkpoint. In FREE and PEACE there are no
+  // checkpoints, and the answer the brief asked for is the obvious one — you
+  // respawn on the carrier and fly off it again. That is the same call R makes,
+  // which is why the sandbox modes needed no respawn code of their own.
   //
-  // physics.update() is SKIPPED during a crash -- a destroyed aircraft runs no
-  // collision queries -- so the failure policy must be ticked explicitly here,
-  // or it sits in `hold` forever, the fade never starts and the respawn never
-  // comes.
-  //
-  // And the flag is RE-READ AFTER the tick. The tick is what fires the
-  // restore, which ends the crash and repositions the aircraft; a flag
-  // captured before it is stale, and the crash branch then copies the wreck's
-  // transform straight back over the fresh respawn -- putting the player back
-  // inside the terrain they were just lifted out of.
-  if (crash.state.active) {
-    crash.update(dt);
-    physics.getPolicy()?.tick(dt);
-    // Consume and DROP the discrete latches, so a trigger pull mid-explosion
-    // does not fire on the respawn frame.
-    input.dropLatches();
-    if (crash.state.active) {
-      state.position.x = crash.state.position.x;
-      state.position.y = crash.state.position.y;
-      state.position.z = crash.state.position.z;
-      state.quat = { ...crash.state.quat };
-      rig.blend("crash", CRASH_VIEW, Math.min(1, crash.state.t / 0.35));
-    } else {
-      rig.blend("crash", CRASH_VIEW, 0);
+  // §31/§32 — this fires at full black, so the crash is cleaned and the aircraft
+  // repositioned inside the same invisible frame. The respawn DESTINATION logic is
+  // untouched; the presentation only delayed the call.
+  onRestore: () => {
+    crashFx.reset();
+    if (modeRules(mode).respawn === "CARRIER") {
+      restartMission();
+      return;
     }
-    if (crashFlashEl) {
-      const flash = crash.state.t < 0.15 ? 0.5 * (1 - crash.state.t / 0.15) : 0;
-      crashFlashEl.style.opacity = String(flash);
+    /**
+     * An airborne death does NOT go through `director.rewind()`.
+     *
+     * Three attempts at this failed for the same reason: rewind restores a
+     * checkpoint's POSITION and PHASE, and both fought the fix. If the checkpoint
+     * for the current phase was never captured it falls back to the deck one,
+     * which flips the phase to DECK — handing the aircraft to the launch script
+     * and undoing any repositioning. The player ended up exactly where they died,
+     * inside the terrain, killed again on a loop.
+     *
+     * So progression is restored WITHOUT touching position or phase: you keep the
+     * phase you died in, you get your stores back, and you respawn behind the
+     * thing that killed you. There is no checkpoint table in this path at all,
+     * which is why it cannot depend on one being present.
+     */
+    if (director.playerFlies) {
+      /**
+       * Stage 05.0 — a pilot is spent HERE, at the restore, not at the impact.
+       * The number is what the player has left to fly, so it drops when the
+       * replacement is dispatched rather than when the old aircraft is hit.
+       */
+      if (modeRules(mode).lives !== false) {
+        lives -= 1;
+        paintLives();
+        if (lives <= 0) {
+          missionFailed();
+          return;
+        }
+      }
+      director.stats.checkpointsUsed += 1;
+      const cp = director.checkpoints[director.state.checkpoint];
+      if (cp && cp.snapshot) {
+        if (rounds) rounds.setCount(cp.snapshot.aim9);
+        gun.state.ammo = cp.snapshot.gunAmmo;
+        weapon = cp.snapshot.weapon;
+      } else {
+        if (rounds) rounds.reload();
+        gun.state.ammo = gun.cfg.ammo;
+      }
+      gun.state.dry = false;
+      clearEncounterFx();
+      combatHud.reset();
+      engineFx.reset();
+      vaporFx.reset();
+      atmosphere.reset();
+      if (rearm) rearm.reset();
+      respawnFromCrash();
+      return;
     }
-    fx.renderCrash(crash);
-    // A destroyed aircraft has no exhaust: the plume is cleared rather than
-    // left running behind a tumbling wreck.
-    airframe?.clearEngineFx();
-    rig.update(dt, state);
-    world.update(dt, state);
-    world.render();
-    return;
-  }
-  fx.renderCrash(crash);
-
-  // THE DECK IS HELD UNTIL AUDIO IS ARMED (§9). A browser will not start audio
-  // before a user gesture and the launch begins on the first frame of a fresh
-  // load, so an unheld deck fires the engine start-up into a blocked context,
-  // marks it played, and runs the whole opening silent. The hold applies only
-  // at t = 0 -- it can delay a launch, never pause one in progress.
-  const scripted = held
-    ? true
-    : (launch?.update(dt, state, !audio.isArmed()) ?? false);
-  if (scripted) {
-    // §9: no flight physics runs during the launch, and §17.4 -- a branch that
-    // skips physics.update() must tick the response policy ITSELF, or the game
-    // freezes for the whole eleven seconds on the deck.
-    physics.getPolicy()?.tick(dt);
-  } else {
-    if (launch?.hasHandedOff() && !input.pointerEnabled()) {
-      input.setPointerEnabled(true);
-      // Drop any latch accumulated on the deck, so a key pressed during the
-      // script does not fire on the handoff frame.
-      input.dropLatches();
-      // Stage 7's mission director will own this. Until then, one encounter
-      // deploys on handoff so the dogfight is reachable.
-      hostile.deploy({
-        at: { x: state.position.x + 900, y: state.position.y + 140, z: state.position.z - 2400 },
-        heading: 0,
-        ammo: 2,
-        engageDelay: 6,
-      });
-    }
-    let gated = physics.getPolicy()?.overridesInput?.() ? NEUTRAL_STICK : axes;
-
-    // EXTRACTION is a VIRTUAL STICK, not a transform override: it flies
-    // through the ordinary flight model and obeys the same envelope, bank sink
-    // and camera rig the player was just using, and control is handed AWAY
-    // over 1.3 s rather than switched off.
-    if (mission && mission.mission.phase === EXTRACTION && carrierAnchors) {
-      const home = carrierAnchors.approach;
-      const dx = home.x - state.position.x;
-      const dz = home.z - state.position.z;
-      const auto = autopilotStick(
-        {
-          heading: state.heading, pitch: state.pitch,
-          altitude: state.position.y, speed: state.speed,
-        },
-        { heading: Math.atan2(-dx, -dz), altitude: 620, speed: 190 },
-      );
-      gated = blendStick(gated, auto, Math.min(1, extraction / 1.3), {});
-      rig.blend("recovery", RECOVERY_VIEW, Math.min(1, extraction / 1.3));
-    }
-
-    updateFlight(state, gated, dt);
-
-    // §8: physics.update() also ticks the installed policy. Any branch that
-    // skips physics has to tick the policy itself, or the game freezes
-    // whenever physics is bypassed.
-    physics.update(dt, state);
-  }
-  physicsDebug?.update(state);
-
-  aircraft.position.copy(state.position);
-  aircraft.quaternion.set(
-    state.quat.x,
-    state.quat.y,
-    state.quat.z,
-    state.quat.w,
-  );
-
-  // ── audio ──────────────────────────────────────────────────────────────
-  audio.tick(dt);
-
-  // ── combat ─────────────────────────────────────────────────────────────
-  clock += dt;
-  drone.update(dt);
-
-  const forward = quatForward(state.quat);
-  const observer = { position: state.position, forward };
-  // An empty candidate list is how targeting is switched OFF (§5) -- there is
-  // deliberately no enabled flag, so the launch script simply offers nothing.
-  const candidates = [];
-  if (!scripted) {
-    if (drone.target.alive) candidates.push(drone.target);
-    // An INACTIVE hostile is not offered to targeting at all (§12).
-    if (hostile.isActive() && hostile.target.alive) candidates.push(hostile.target);
-  }
-  const track = targeting.update(dt, candidates, observer);
-
-  if (!scripted && input.consumeLatch("weapon")) {
-    weapon = weapon === "AIM-9" ? "GUN" : "AIM-9";
-  }
-
-  const firing = !scripted && input.isFiring();
-  const lead =
-    track.currentTarget && weapon === "GUN"
-      ? leadSolution(state.position, track.currentTarget).point
-      : null;
-
-  if (weapon === "GUN") {
-    gun.update(dt, {
-      firing,
-      origin: state.position,
-      forward,
-      candidates,
-      now: clock,
-    });
-  } else if (firing && track.lockState === LOCK && weapons && weapons.count > 0) {
-    const released = weapons.release();
-    if (released) {
-      missiles.fire({
-        config: AIM9,
-        owner: "player",
-        position: released.position,
-        direction: forward,
-        speed: state.speed,
-        target: track.currentTarget,
-      });
-      audio.play("MISSILE_LAUNCH");
-      mission?.mission && mission.mission.stats.missilesFired++;
-      message = "MISSILE AWAY";
-      messageUntil = clock + 1.6;
-    }
-  }
-
-  // ── the hostile, the threat monitor, evasion ───────────────────────────
-  playerTarget.velocity.x = forward.x * state.speed;
-  playerTarget.velocity.y = forward.y * state.speed;
-  playerTarget.velocity.z = forward.z * state.speed;
-
-  // The sandbox driver: one hostile at a time, and nothing at all in PEACE.
-  if (
-    sandbox.update(dt, {
-      mode,
-      handedOff: launch ? launch.hasHandedOff() : false,
-      hostileAlive: hostile.isActive() && hostile.target.alive,
-    })
-  ) {
-    const side = hostile.ai.encounters % 2 === 0 ? 1 : -1;
-    hostile.deploy({
-      at: {
-        x: state.position.x + forward.x * 2400 + side * 900,
-        y: Math.max(400, state.position.y + 140),
-        z: state.position.z + forward.z * 2400,
-      },
-      heading: 0,
-      ammo: 2,
-      engageDelay: 2,
-    });
-  }
-
-  if (!scripted && input.consumeLatch("evade")) evasion.request(state.mode);
-  evasion.update(dt);
-  damage.tick(dt);
-
-  hostile.update(dt, {
-    playerState: state,
-    playerAlive: true,
-    playerLockedOnMe:
-      track.lockState === LOCK && track.currentTarget === hostile.target,
-  });
-
-  // What the hostile is doing TO the player, published for the monitor.
-  const acquisitions = [];
-  if (hostile.isActive() && hostile.target.alive) {
-    const s = hostile.ai.state;
-    const level = s === "ACQUIRE" ? "TRACK" : s === "ATTACK" ? "LOCK" : "NONE";
-    if (level !== "NONE") {
-      acquisitions.push({
-        level, position: hostile.target.position, label: "HOSTILE",
-        progress: Math.min(1, hostile.ai.lockTimer / 1.25),
-      });
-    }
-  }
-  // ── ground threats ─────────────────────────────────────────────────────
-  const rules = rulesFor(mode);
-  if (rules.sams && !scripted) {
-    sams.update(dt, {
-      playerState: state,
-      sampleHeight: (x, z) => physics.groundAt(x, z),
-    });
-    for (const a of sams.acquisitions()) acquisitions.push(a);
-    for (const sam of sams.liveSites()) candidates.push(sam.target);
-  }
-  updateSamMeshes();
-
-  // ── flares ─────────────────────────────────────────────────────────────
-  if (!scripted && input.consumeLatch("flares")) {
-    if (flares.dispense(state, forward, clock) > 0) {
-      audio.play("FLARES", { force: true });
-      message = "FLARES";
-      messageUntil = clock + 1.1;
-    }
-  }
-  flares.update(dt, clock);
-  // Offered to every hostile round: the round's TARGET is swapped, never a
-  // flag set. missile.js needs no changes at all.
-  flares.offerTo(missiles.rounds, state.position);
-
-  // ── rearm ──────────────────────────────────────────────────────────────
-  rearm.update(dt, {
-    "AIM-9": weapons
-      ? { isEmpty: () => weapons.count === 0, refill: () => weapons.reload() }
-      : null,
-    GUN: { isEmpty: () => gun.isEmpty(), refill: () => gun.reset() },
-  });
-
-  const t = threatMonitor.update(dt, state, acquisitions, missiles.rounds);
-  threat = t.label;
-
-  // ── the mission ────────────────────────────────────────────────────────
-  // The phase cue's own 2.7 s fade does NOT run while the deck is held for
-  // audio: the sequence has not started, so neither has the cue. Without this
-  // the DECK announcement burns off during a wait that could be any length,
-  // and the opening frames of the sortie are completely blank.
-  if (!(launch && launch.isActive() && launch.elapsed() === 0)) phaseCueAge += dt;
-  let navLeg = null;
-  if (mission && rules.phases) {
-    const result = mission.update(dt, {
-      position: state.position,
-      fired: launch ? launch.elapsed() >= launch.plan.fireAt : false,
-      handedOff: launch ? launch.hasHandedOff() : false,
-      magazineSpent: hostile.spent(missiles.countFor("hostile")),
-      cinematicDone: extraction >= EXTRACTION_SECONDS,
-    });
-    navLeg = result.leg;
-    if (mission.mission.phase === EXTRACTION) extraction += dt;
-  }
-
-  // EVADE is announced only for a miss that WAS going to be a hit -- otherwise
-  // the word teaches the player nothing about whether the roll worked.
-  const wereGoingToHit = evasion.isRolling()
-    ? missiles.rounds.filter((r) => r.owner !== "player" && wouldHaveHit(r, state.position))
-    : [];
-
-  missiles.update(dt, clock);
-
-  if (wereGoingToHit.length && !wereGoingToHit.some((r) => r.detonated)) {
-    if (wereGoingToHit.some((r) => !missiles.rounds.includes(r) || !wouldHaveHit(r, state.position))) {
-      evasion.noteDefeated();
-      message = "EVADE";
-      messageUntil = clock + 1.4;
-    }
-  }
-  // The trail is stepped AFTER the rounds have moved, so a segment is laid at
-  // the position the round actually reached this frame. Stepping it first lays
-  // the smoke one frame ahead of the missile.
-  trails.update(dt, missiles.rounds);
-  fx.syncTrails(trails, world.camera);
-  fx.syncMissiles(missiles.rounds);
-  fx.syncTracers(gun.tracers);
-  fx.update(dt);
-  // The engine reads the SAME throttle and afterburner the HUD and the sound
-  // read, so the plume, the amber THR readout and the burner cue cannot
-  // disagree about what the aircraft is doing.
-  airframe?.updateEngineFx(dt, state, world.camera);
-  updateDroneMesh();
-  updateHostileMesh();
-
-  rig.update(dt, state);
-  world.update(dt, state);
-
-  if (clock > messageUntil) message = "";
-  // THE HUD COMES UP WITH THE AIRCRAFT. Dark on the deck, fading in from the
-  // catapult, complete before the release point. Driven from the launch
-  // script's own clock rather than from the phase, because the catapult firing
-  // is the moment the aircraft starts being an aircraft.
-  //
-  // `held` is the pre-launch state, before the carrier and the airframe have
-  // both arrived: dark for the same reason the deck is, and stated here rather
-  // than left to fall through to 1, which would light the whole display over a
-  // loading screen and then snap it off when the deck appears.
-  hud.setReveal(
-    held ? 0 : launch ? hudRevealAlpha(launch.elapsed(), launch.plan.fireAt) : 1,
-  );
-  if (hud.isVisible()) {
-    hud.update(dt, {
-      speed: state.speed,
-      altitude: state.position.y,
-      agl: physics.telemetry.agl,
-      afterburner: state.afterburner,
-      bank: state.bank,
-      pitch: state.pitch,
-      throttle: state.throttle,
-      overWater: physics.telemetry.surface === "ocean",
-      missiles: weapons ? weapons.count : 0,
-      missileCapacity: weapons ? weapons.capacity : 4,
-      flares: flares.remaining,
-      // H10: MISSION only -- the segment is absent entirely in FREE and PEACE.
-      lives: rulesFor(mode).lives === null ? null : lives,
-      modeChangedAgo: clock - modeChangedAt,
-      // H7: the rearm line exists ONLY while a timer runs, and names which
-      // magazine, because the two timers are independent.
-      rearm: (() => {
-        const active = rearm.active();
-        if (!active.length) return null;
-        return { name: active[0], seconds: rearm.remaining(active[0]) };
-      })(),
-      // H8: the stack has exactly three slots.
-      stackTop: message,
-      stackMid: track.currentTarget
-        ? `${track.currentTarget.label} ${(track.range / 1000).toFixed(1)}k`
-        : "",
-      stackLow: missiles.rounds.length ? `${missiles.rounds.length} live` : "",
-      // The developer rail can only RAISE the left floor, never push the
-      // column back across it (H5.1).
-      safeLeft: railVisible ? rail.getBoundingClientRect().right + 18 : 0,
-      gunRounds: gun.rounds,
-      weapon,
-      mode: state.mode,
-      target: track.currentTarget,
-      lockState: track.lockState,
-      lockProgress: track.lockProgress,
-      range: track.range,
-      lead,
-      threat,
-      threatLevel: t.level,
-      message,
-      position: state.position,
-      heading: state.heading,
-      // GROUND CONTACTS APPEAR ONLY WHILE A SITE IS ACTUALLY EMITTING.
-      // Showing every SAM the moment the player is in range would hand them
-      // the whole threat map and quietly undo the terrain-masking mechanic --
-      // flying the valley keeps the radar clean, and a square lighting up
-      // means the same thing as the warning in the player's ear.
-      contacts: radarContacts(),
-      nav: rules.nav ? navLeg : null,
-      phaseCue,
-      phaseCueAge,
-    });
-  }
-
-  driveAudio(dt, t, scripted);
-
-  world.render();
-
-  railClock += dt;
-  if (railClock > 0.1) {
-    railClock = 0;
-    paintRail(axes);
-  }
-}
-
-const NEUTRAL_STICK = { x: 0, y: 0, roll: 0, throttle: 0 };
-// A fourth blended composition (§7). Never a second camera.
-const RECOVERY_VIEW = { standoff: 44, height: 13, framingY: -0.1, lagScale: 1.5 };
-// Looser, so the rig TRAILS the tumbling aircraft and the fire, smoke and
-// debris are watchable rather than pressed against the lens.
-const CRASH_VIEW = { standoff: 34, height: 9, framingY: -0.12, lagScale: 0.34 };
-// Level out, turn home, settle, hold 4.4 s, fade 1.5 s. No touchdown is shown:
-// the player has already demonstrated skill and landing must not become
-// another test.
-const EXTRACTION_SECONDS = 1.3 + 4.4 + 1.5;
-
-const deg = (r) => ((r * 180) / Math.PI).toFixed(1);
-const m = (v) => (Number.isFinite(v) ? v.toFixed(0) + " m" : "--");
+    // Died before the handoff — the launch script owns this, so re-run it.
+    director.rewind();
+  },
+});
 
 /**
- * The VECTOR panel.
+ * §44/§45 — what an encounter leaves behind. Called at every phase transition
+ * and every checkpoint restore: no missile from a fight that ended ninety
+ * seconds ago, no tracers from a burst nobody remembers, no target marker for a
+ * hostile that is no longer part of the mission.
+ */
+function clearEncounterFx() {
+  if (missiles) {
+    missiles.expireOwner("hostile");
+    missiles.expireOwner("sam");
+  }
+  gun.clearFx();
+  threat.reset();
+  hitResponse.reset();
+}
+/**
+ * §42/§43 — one hostile instance, three encounters. It is repositioned in front
+ * of the player and given the ammunition the encounter calls for; INTERCEPT's
+ * zero rounds is what makes that phase one-way pressure without a new state.
+ */
+function deployHostile(enc) {
+  const e = MISSION.encounter;
+  quatForward(flightState.quat, _fwd);
+  const side = hostileAi.state.encounters % 2 === 0 ? 1 : -1;
+  const at = {
+    x: aircraftRoot.position.x + _fwd.x * e.ahead - _fwd.z * side * e.lateral,
+    y: Math.max(HOSTILE.minAltitude + 60, aircraftRoot.position.y + e.above),
+    z: aircraftRoot.position.z + _fwd.z * e.ahead + _fwd.x * side * e.lateral,
+  };
+  // Facing back down the player's course: a head-on pass is how an intercept
+  // announces itself, and it puts the hostile on screen without a hunt.
+  hostileAi.deploy({ at, heading: Math.atan2(-_fwd.x, -_fwd.z) + Math.PI, ammo: enc.ammo, engageDelay: enc.engageDelay });
+}
+
+director.on("phase", ({ phase }) => {
+  clearEncounterFx();
+  if (phase === MissionPhase.LAUNCH) director.startTimer();
+  const rules = modeRules(mode);
+  // §SAM — the ground threat belongs to TERRAIN, which is the phase that used to
+  // be the breather. That is the trade the brief asked for.
+  samNet.setActive(rules.sams && phase === MissionPhase.TERRAIN);
+  const enc = rules.hostiles ? encounterFor(phase) : null;
+  if (enc) {
+    deployHostile(enc);
+  } else {
+    // §5 — do not simulate what the player cannot interact with.
+    hostileAi.setActive(false);
+    targeting.clear();
+  }
+  if (phase === MissionPhase.COMPLETE) showComplete();
+  else hideComplete();
+  // A sandbox mode has flown the launch and the director has parked: the sandbox
+  // driver takes over from here.
+  if (phase === MissionPhase.EGRESS && isSandbox(mode)) sandbox.begin(mode);
+});
+
+director.on("leg", ({ leg }) => combatHud.flash(`NAV ${leg.name} REACHED`, "good"));
+
+/**
+ * Stage 05.0 — lives.
  *
- * Label column is a fixed width so the monospace grid aligns values without
- * measuring anything, and a changing digit never reflows the row. Fields with
- * no system behind them yet render an em dash rather than a plausible zero --
- * a fabricated reading is worse than an absent one.
+ * The sortie could not previously be lost: every phase had a time fallback and
+ * every crash respawned, so COMPLETE was the only ending. A game that cannot be
+ * lost has no stakes, and the spec asks for an ending that can be a loss.
+ *
+ * Five pilots. The fallbacks stay — nothing soft-locks, and you still cannot lose
+ * on the clock — but you can run out of aircraft.
+ *
+ * MISSION only. FREE and PEACE are practice; counting deaths there would turn a
+ * sandbox into a test.
  */
-const RAIL_VERSION = "04.3";
-const LABEL_W = 6;
-
-function railRow(label, value) {
-  return `${label.padEnd(LABEL_W)}${value}`;
-}
-
-const mmss = (seconds) => {
-  const s = Math.max(0, Math.floor(seconds));
-  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
-};
-const bar10 = (v) => {
-  const lit = Math.round(Math.max(0, Math.min(1, v)) * 10);
-  return "\u25ae".repeat(lit) + "\u25af".repeat(10 - lit);
+const LIVES = {
+  start: 5,
+  /**
+   * A fixed, generous respawn altitude, replacing the escalating one.
+   *
+   * The escalation existed because respawns kept landing in terrain and needed to
+   * climb their way out over repeated deaths. With only five aircraft that is no
+   * longer an acceptable way to converge — each attempt costs a pilot. So the
+   * first attempt is simply high enough that terrain cannot be a factor: the
+   * island peaks at 643 m.
+   */
+  respawnAltitude: 4000,
 };
 
-function paintRail(axes) {
-  const deg = (r) => ((r * 180) / Math.PI).toFixed(1);
-  const dash = "\u2014";
-  const m = mission?.mission;
-  const tel = physics.telemetry;
-  const track = targeting.state();
+let lives = LIVES.start;
+const livesEl = document.getElementById("lives");
+const livesCountEl = document.getElementById("lives-count");
+const failedEl = document.getElementById("failed");
+const failedStatsEl = document.getElementById("failed-stats");
+const failedLineEl = document.getElementById("failed-line");
 
-  const heading = ((state.heading * 180) / Math.PI + 360) % 360;
-  const carrierRange = carrierAnchors
-    ? Math.hypot(
-        state.position.x - carrierAnchors.deck.x,
-        state.position.z - carrierAnchors.deck.z,
-      ) / 1000
-    : null;
-  const coastRange = terrainReport?.ok
-    ? Math.abs(state.position.z - terrainReport.nearEdgeZ) / 1000
-    : null;
-
-  const emitting = sams.emitting();
-  const lines = [
-    `VECTOR \u00b7 ${RAIL_VERSION}`,
-    "",
-    railRow("MSN", m
-      ? `${m.phase} ${mmss(m.phaseTime)} \u00b7 t ${mmss(mission.elapsed())} \u00b7 cp${m.checkpoints.length}`
-      : held ? "WAITING FOR THE DECK" : dash),
-    railRow("NAV", mission?.currentLeg()
-      ? `${mission.currentLeg().name} \u00b7 ${(Math.hypot(mission.currentLeg().x - state.position.x, mission.currentLeg().z - state.position.z) / 1000).toFixed(1)} km`
-      : dash),
-    "",
-    railRow("SPD", `${state.speed.toFixed(0)} \u2192 ${commandedSpeed(state.throttle).toFixed(0)} m/s`),
-    railRow("THR", `${bar10(state.throttle)} ${(state.throttle * 100).toFixed(0)}%${state.afterburner ? "  AB" : ""}`),
-    railRow("ALT", `${state.position.y.toFixed(0)} m \u00b7 agl ${tel.surface === "ocean" ? dash : tel.agl.toFixed(0)} \u00b7 sink ${state.sink.toFixed(1)}`),
-    "",
-    railRow("AMMO", `${weapon === "AIM-9" ? "\u203a" : " "}AIM-9 ${weapons ? weapons.count : "-"} \u00b7 ${weapon === "GUN" ? "\u203a" : " "}GUN ${gun.rounds} \u00b7 FLR ${flares.remaining}`),
-    railRow("TGT", track.currentTarget
-      ? `${track.currentTarget.label} \u00b7 ${(track.range / 1000).toFixed(2)} km \u00b7 ${track.lockState} ${(track.lockProgress * 100).toFixed(0)}%`
-      : "NO TARGET"),
-    railRow("HOST", hostile.isActive() && hostile.target.alive
-      ? `${hostile.ai.state} \u00b7 ${Math.hypot(hostile.target.position.x - state.position.x, hostile.target.position.z - state.position.z).toFixed(0)} m \u00b7 ammo ${hostile.ai.ammo}`
-      : dash),
-    railRow("SAM", sams.sites.length
-      ? `${sams.liveSites().length}/${sams.sites.length} live \u00b7 ${emitting.length ? emitting.length + " emitting" : "quiet"}`
-      : dash),
-    railRow("THRT", threat || dash),
-    "",
-    railRow("P B H", `${state.pitch >= 0 ? "+" : ""}${deg(state.pitch)}\u00b0 \u00b7 ${state.bank >= 0 ? "+" : ""}${deg(state.bank)}\u00b0 \u00b7 ${heading.toFixed(0).padStart(3, "0")}\u00b0 ${state.mode === "ASSISTED" ? "STABILISED" : "DIRECT"}`),
-    railRow("MNVR", `${evasion.isRolling() ? "EVADE" : dash} \u00b7 in ${axes.x >= 0 ? "+" : ""}${axes.x.toFixed(2)}/${axes.y >= 0 ? "+" : ""}${axes.y.toFixed(2)}`),
-    railRow("CTC", tel.contact ? "CONTACT" : tel.forwardImminent ? "IMMINENT" : "CLEAR"),
-    railRow("PHYS", `60 Hz \u00b7 safe ${Number.isFinite(tel.clearance) ? tel.clearance.toFixed(0) : "-"} m \u00b7 ${physics.getPolicy()?.name === "MissionCheckpointResponse" ? "FAIL" : "REWIND"}`),
-    "",
-    railRow("FX", `live ${missiles.rounds.length} \u00b7 carr ${carrierRange === null ? dash : carrierRange.toFixed(1)} \u00b7 coast ${coastRange === null ? dash : coastRange.toFixed(1)} km`),
-    railRow("SYS", `err ${errorCount} \u00b7 keys ${input.heldKeys().length ? input.heldKeys().join(" ") : dash} \u00b7 ${assetFailures().length ? assetFailures().map((f) => f.name).join(", ") : "assets ok"}`),
-  ];
-  rail.textContent = lines.join("\n");
+function paintLives() {
+  const counted = modeRules(mode).lives !== false;
+  livesEl.hidden = !counted;
+  if (!counted) return;
+  livesCountEl.textContent = String(Math.max(0, lives));
+  livesEl.classList.toggle("low", lives === 2);
+  livesEl.classList.toggle("critical", lives <= 1);
 }
 
-/** The four measured anchors, drawn on `O`. */
-function createAnchorHelper(anchors) {
-  const group = new THREE.Group();
-  group.visible = false;
-  const colours = { deck: 0x9fd7ff, launchStart: 0x8ef0c8, launchEnd: 0xffd400, approach: 0xff9b7a };
-  for (const [name, colour] of Object.entries(colours)) {
-    const a = anchors[name];
-    if (!a) continue;
-    const mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(4, 10, 8),
-      new THREE.MeshBasicMaterial({ color: colour }),
-    );
-    mesh.position.set(a.x, a.y, a.z);
-    group.add(mesh);
-  }
-  // The run itself, so "launched through the deck instead of along it" is
-  // visible rather than inferred.
-  const line = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(anchors.launchStart.x, anchors.launchStart.y, anchors.launchStart.z),
-    new THREE.Vector3(anchors.launchEnd.x, anchors.launchEnd.y, anchors.launchEnd.z),
-  ]);
-  group.add(new THREE.Line(line, new THREE.LineBasicMaterial({ color: 0xffd400 })));
-  return group;
+/**
+ * The loss screen. `reason` picks the line under the title — the only difference
+ * between the two ways to lose, because they are the same KIND of event and
+ * should read that way (§36).
+ */
+function showFailed(reason) {
+  failedLineEl.textContent =
+    reason === "TIME"
+      ? "Enemy reinforcements have arrived. The recovery window is closed."
+      : "The squadron has no one left to send.";
+  failedStatsEl.innerHTML = director.summary.map((row) => `<dt>${row.label}</dt><dd>${row.value}</dd>`).join("");
+  failedEl.hidden = false;
+}
+function hideFailed() {
+  failedEl.hidden = true;
 }
 
-// A visible drone: the target contract carries no mesh, on purpose, because
-// stage 8's SAM sites publish the same shape from a completely different body.
-let droneMesh = null;
-function updateDroneMesh() {
-  if (!droneMesh) {
-    droneMesh = new THREE.Mesh(
-      new THREE.ConeGeometry(3.2, 13, 6),
-      new THREE.MeshStandardMaterial({ color: 0x8d99a6, roughness: 0.5, metalness: 0.4 }),
-    );
-    droneMesh.rotation.x = -Math.PI / 2;
-    world.scene.add(droneMesh);
-  }
-  droneMesh.visible = drone.target.alive;
-  if (!drone.target.alive) return;
-  droneMesh.position.set(
-    drone.target.position.x, drone.target.position.y, drone.target.position.z,
-  );
-  // Flash on a hit: feedback that is not a number.
-  const flash = Math.max(0, 1 - (clock - drone.target.hitAt) / 0.18);
-  droneMesh.material.emissive.setRGB(flash, flash * 0.4, 0);
-}
+/** §16 — build the anchors, then hand the director the route that reads them. */
+function buildRoute() {
+  const coastZ = terrainReport ? terrainReport.nearEdgeZ : WORLD.carrier.position.z - WORLD.terrain.coastOffsetFromCarrier;
+  // §27 — the inland legs are chosen from the geometry that is actually there:
+  // the corridor is sampled and the deepest pass in each band wins. No terrain
+  // was modified to fit a theoretical route.
+  const features = terrainIndexed
+    ? surveyTerrainRoute((x, z) => {
+        const h = physics.sampleTerrainBelow({ x, y: 0, z });
+        return h.foundTerrain ? h.terrainHeight : WORLD.oceanY;
+      }, coastZ)
+    : [];
+  const route = planRoute({ coastZ, features });
 
-/** Every trigger volume, drawn on `N`. */
-function createRouteHelper(route) {
-  const group = new THREE.Group();
-  group.visible = false;
-  for (const leg of route.legs) {
+  navRoot.clear();
+  const debugGroup = new THREE.Object3D();
+  debugGroup.name = "NavDebug";
+  debugGroup.visible = false;
+  for (const leg of route) {
+    const anchor = new THREE.Object3D();
+    anchor.name = `Nav${leg.name}`;
+    anchor.position.set(leg.position.x, leg.position.y, leg.position.z);
+    navRoot.add(anchor);
     const ring = new THREE.Mesh(
-      new THREE.RingGeometry(leg.radius - 24, leg.radius, 48),
-      new THREE.MeshBasicMaterial({
-        color: 0xffd400, side: THREE.DoubleSide, transparent: true, opacity: 0.45,
-      }),
+      new THREE.SphereGeometry(leg.radius, 12, 8),
+      new THREE.MeshBasicMaterial({ color: 0x9fd7ff, wireframe: true, transparent: true, opacity: 0.16, depthWrite: false, fog: false })
     );
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.set(leg.x, (leg.ground ?? 0) + 60, leg.z);
-    group.add(ring);
+    ring.position.copy(anchor.position);
+    debugGroup.add(ring);
   }
-  return group;
+  navRoot.add(debugGroup);
+  navDebug = { toggle: () => (debugGroup.visible = !debugGroup.visible) };
+
+  director.setRoute(route);
+  console.log("[mission] route", { coastZ, features, legs: route.map((l) => `${l.phase}/${l.name} @ ${Math.round(l.position.x)},${Math.round(l.position.z)} r${l.radius}`) });
+  return route;
 }
 
-// ── SAM meshes and wrecks ────────────────────────────────────────────────
-const samMeshes = new Map();
-const contactList = [];
-
-function buildSamMeshes() {
-  for (const sam of sams.sites) {
-    const group = new THREE.Group();
-    const base = new THREE.Mesh(
-      new THREE.CylinderGeometry(7, 9, 5, 8),
-      new THREE.MeshStandardMaterial({ color: 0x4a5148, roughness: 0.8 }),
-    );
-    base.position.y = 2.5;
-    const turret = new THREE.Mesh(
-      new THREE.BoxGeometry(3.2, 2.2, 9),
-      new THREE.MeshStandardMaterial({ color: 0x5d6659, roughness: 0.7 }),
-    );
-    turret.position.y = 6.5;
-    turret.rotation.x = -0.5;
-    group.add(base, turret);
-    group.position.set(
-      sam.target.position.x, sam.target.position.y - 6, sam.target.position.z,
-    );
-    world.scene.add(group);
-    samMeshes.set(sam, { group, base, turret });
-  }
-}
-
-function updateSamMeshes() {
-  for (const [sam, mesh] of samMeshes) {
-    if (sam.wrecked) continue;
-    const flash = Math.max(0, 1 - (clock - sam.target.hitAt) / 0.18);
-    mesh.base.material.emissive.setRGB(flash, flash * 0.4, 0);
-  }
+function setGear(down) {
+  // Seeded null, not true: loadF15() leaves the model gear-UP, so a cache primed
+  // with the deck value made the first setGear(true) a no-op and the gear-down
+  // configuration unreachable for the whole mission. The first call must always
+  // paint, whatever the asset happened to load as.
+  if (down === gearDown) return;
+  gearDown = down;
+  setGearVisual(f15Visual, down);
 }
 
 /**
- * A wreck STAYS IN THE WORLD: tinted, tilted, turret hidden. Not a deletion --
- * a destroyed installation should be visible evidence that the player did
- * something. Visibility is set EXPLICITLY, because the generic kill path hides
- * dead targets.
+ * §6 — fade the intact aircraft out behind its own smoke, rather than hiding it
+ * on the frame it dies. Cached, so a normal frame costs one comparison: the
+ * traversal writes to every material in the model and must not run at 60 Hz.
  */
-function wreckSam(sam) {
-  const mesh = samMeshes.get(sam);
-  if (!mesh) return;
-  mesh.group.visible = true;
-  mesh.turret.visible = false;
-  mesh.base.material.color.setHex(0x2a2622);
-  mesh.base.material.emissive.setRGB(0, 0, 0);
-  mesh.group.rotation.z = 0.32;
-  fx.burst(sam.target.position, 40);
-}
-
-function restoreSamMesh(sam, mesh) {
-  mesh.group.visible = true;
-  mesh.turret.visible = true;
-  mesh.base.material.color.setHex(0x4a5148);
-  mesh.group.rotation.z = 0;
-}
-
-function radarContacts() {
-  contactList.length = 0;
-  if (hostile.isActive() && hostile.target.alive) {
-    contactList.push({ position: hostile.target.position, ground: false });
-  }
-  if (drone.target.alive) {
-    contactList.push({ position: drone.target.position, ground: false });
-  }
-  for (const sam of sams.emitting()) {
-    contactList.push({ position: sam.target.position, ground: true });
-  }
-  return contactList;
-}
-
-let hostileMesh = null;
-function updateHostileMesh() {
-  if (!hostileMesh) {
-    hostileMesh = new THREE.Mesh(
-      new THREE.ConeGeometry(4, 16, 6),
-      new THREE.MeshStandardMaterial({ color: 0x6b5a4e, roughness: 0.55, metalness: 0.35 }),
-    );
-    hostileMesh.rotation.x = -Math.PI / 2;
-    world.scene.add(hostileMesh);
-  }
-  // Inactive means NOT DRAWN, as well as not simulated and not targetable.
-  hostileMesh.visible = hostile.isActive() && hostile.target.alive;
-  if (!hostileMesh.visible) return;
-  const p = hostile.target.position;
-  hostileMesh.position.set(p.x, p.y, p.z);
-  const f = hostile.forward();
-  hostileMesh.quaternion.setFromUnitVectors(
-    new THREE.Vector3(0, 0, -1), new THREE.Vector3(f.x, f.y, f.z).normalize(),
-  );
-  const flash = Math.max(0, 1 - (clock - hostile.target.hitAt) / 0.18);
-  hostileMesh.material.emissive.setRGB(flash, flash * 0.4, 0);
-}
-
-/**
- * Warnings are driven from THE THREAT MONITOR'S OWN ESCALATION, not a second
- * set of conditions, so the sound and the HUD cannot disagree.
- */
-function driveAudio(dt, threatState, scripted) {
-  if (!audio.isArmed()) return;
-
-  // THE ENGINE LOOP MUST NOT RUN DURING THE DECK PHASE. The start-up plays
-  // alone while the aircraft shakes in place, and is fired ONCE FROM A FLAG,
-  // not every frame governed by its minInterval -- an interval floor is a rate
-  // limiter, and a clip meant to run to its end once will retrigger mid-play
-  // as soon as the dwell exceeds the interval.
-  if (launch && !launch.hasHandedOff()) {
-    if (!engineStarted) {
-      engineStarted = true;
-      audio.play("ENGINE_START", { force: true });
+let aircraftOpacity = 1;
+function setAircraftOpacity(v) {
+  const next = Math.max(0, Math.min(1, v));
+  if (Math.abs(next - aircraftOpacity) < 0.01) return;
+  aircraftOpacity = next;
+  if (!f15Visual) return;
+  f15Visual.visible = next > 0.01;
+  f15Visual.traverse((o) => {
+    if (!o.isMesh || !o.material) return;
+    for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+      m.transparent = next < 0.999;
+      m.opacity = next;
+      m.depthWrite = next > 0.5;
     }
-    if (launch.elapsed() >= launch.plan.fireAt) {
-      audio.stop("ENGINE_START");
-      audio.startLoop("ENGINE_LOOP", 0.6);
+  });
+}
+
+/** §6 — parked on the deck, attached to the launch frame. No wheel physics. */
+function placeOnDeck() {
+  // The start-up cue is fired once per launch; arm it here rather than in the
+  // frame loop, so every path onto the deck resets it.
+  startCueFired = false;
+  audio.stop(Cue.ENGINE_START);
+  if (launchAnchors) launch.arm(launchAnchors.start, launchAnchors.end);
+  else launch.reset();
+  const p = launch.pose;
+  flightState.position.x = p.x;
+  flightState.position.y = p.y;
+  flightState.position.z = p.z;
+  flightState.heading = p.heading;
+  flightState.pitch = 0;
+  flightState.bank = 0;
+  flightState.speed = 0;
+  flightState.targetSpeed = 0;
+  flightState.throttle = p.throttle;
+  flightState.afterburner = false;
+  flightState.sink = 0;
+  flightState.rollHold = false;
+  flightState.maneuver = null;
+  quatFromEulerYXZ(0, p.heading, 0, flightState.quat);
+  syncAircraft();
+  setGear(true);
+  viewHold = 1;
+  snapChaseCamera();
+}
+
+/** §14 — scripted motion off, flight controller on, nothing visibly snapping. */
+function handoff() {
+  flightState.speed = LAUNCH.handoffSpeed;
+  flightState.throttle = LAUNCH.handoffThrottle;
+  flightState.targetSpeed = getTargetSpeed(flightState.throttle);
+  flightState.afterburner = isAfterburner(flightState.throttle);
+  flightState.sink = 0;
+  syncAircraft();
+  // Safe-state history starts here: nothing before the handoff is a state the
+  // player could be recovered to.
+  physics.reset(flightState);
+  setGear(false);
+  viewHold = 1;
+  input.clearTransient();
+}
+
+/**
+ * Stage 05.0 — the loss ending.
+ *
+ * Freezes the sortie the way COMPLETE does, so a win and a loss are the same kind
+ * of event rather than two different mechanisms. The mission clock stops, the
+ * aircraft is left where it fell, and R restarts.
+ */
+function missionFailed(reason = "OUT OF PILOTS") {
+  missionFailure.reset();
+  crashFx.reset();
+  setAircraftOpacity(1);
+  hostileAi.setActive(false);
+  samNet.setActive(false);
+  targeting.clear();
+  clearEncounterFx();
+  director.state.timerRunning = false;
+  director.stats.time = director.state.missionTime;
+  lives = 0;
+  paintLives();
+  fadeEl.style.opacity = "0";
+  showFailed(reason);
+}
+
+/** R, and the complete screen's R/Enter. §36 — one call resets everything. */
+function restartMission() {
+  hideComplete();
+  hideFailed();
+  lives = LIVES.start;
+  paintLives();
+  missionFailure.reset();
+  placeOnDeck();
+  applyReset();
+  director.reset();
+  hostileAi.setActive(false);
+  samNet.setActive(false);
+  sandbox.reset();
+  targeting.clear();
+  audio.reset();
+  beginOpeningFade();
+}
+
+/**
+ * The opening fade is driven by the WALL CLOCK and backed by a timeout, not by
+ * accumulated frame time.
+ *
+ * A page that loads in a background tab or an unfocused preview never runs a
+ * single animation frame, so a fade that only decays inside the loop leaves the
+ * whole viewport black — canvas, HUD and diagnostics — with no way to tell that
+ * anything loaded at all. The timeout clears it regardless of whether the loop
+ * ever ran; the loop's own read is the smooth version of the same value.
+ */
+function beginOpeningFade() {
+  openingFade = MISSION.fadeIn;
+  openingFadeAt = performance.now();
+  fadeEl.style.opacity = "1";
+  clearTimeout(openingFadeTimer);
+  openingFadeTimer = setTimeout(() => {
+    openingFade = 0;
+    applyFade();
+  }, MISSION.fadeIn * 1000);
+}
+
+/** One fade layer, three sources: whichever is darkest wins. */
+function applyFade() {
+  const fade = Math.max(missionFailure.state.fade, director.state.fade, openingFade / MISSION.fadeIn);
+  fadeEl.style.opacity = fade.toFixed(3);
+  return fade;
+}
+
+const _autoGoal = { heading: 0, altitude: MISSION.recovery.altitude, speed: MISSION.recovery.speed };
+const _stick = { x: 0, y: 0, roll: 0, throttle: 0 };
+
+/** §34 — level out, turn toward the ship, hold cruise. That is the whole trick. */
+function recoveryGoal() {
+  const home = carrierReport ? carrierReport.center : { x: 0, y: 0, z: WORLD.carrier.position.z };
+  _autoGoal.heading = bearingTo(aircraftRoot.position, home);
+  return _autoGoal;
+}
+
+// Reused object: the HUD reads the nav cue every frame and must not allocate.
+const _navCtx = { valid: false, position: null, name: null, range: 0 };
+function navCtx() {
+  const m = director.state;
+  _navCtx.valid = m.navValid;
+  _navCtx.position = m.navPosition;
+  _navCtx.name = m.navName;
+  _navCtx.range = m.navRange;
+  return _navCtx;
+}
+
+// §16: the round leaves a wing hardpoint, never the aircraft's centre.
+hostileAi.on("launch", () => {
+  if (!missiles) return;
+  // The drone moved this frame; its hardpoint's world transform has to be
+  // current or the round leaves from where the enemy was, not where it is.
+  drone.root.updateMatrixWorld(true);
+  missiles.fire({
+    mount: drone.hardpoint,
+    target: playerEntity,
+    ownerSpeed: drone.speed,
+    owner: "hostile",
+    side: 1,
+    cfg: HOSTILE_MISSILE,
+  });
+});
+
+/* ---- Stage 04.1/04.5: rearm and audio ---- */
+// §13 — built after `rounds` exists, so it is created in the load block. The
+// binding lives here because the frame loop and the reset both reach for it.
+let rearm = null;
+/**
+ * §04.5 — NO MUSIC. Every sound in the build is diegetic and almost every one is
+ * information: the engine, the cannon, and a voice telling you what has locked
+ * you. Created now so the first user gesture arms it during the load screen.
+ */
+const audio = createAudioDirector({ gestureTarget: window });
+
+/* ---- Stage 03.15 atmospheric FX ---- */
+// Three independent systems, each additive and each reading published state
+// only. Nothing here writes to flightState or to physics.
+const engineFx = createEngineFx(aircraftRoot);
+const vaporFx = createVaporFx(aircraftRoot, scene);
+const atmosphere = createAtmosphere({ scene });
+// Pitch rate is the one load proxy that has to be differentiated here: the
+// flight model publishes attitude, not rates, and this stage may not add a
+// field to it. Tracked in degrees per second across the frame.
+let prevPitchDeg = flightState.pitch / DEG;
+let pitchRateDeg = 0;
+
+const _fwd = { x: 0, y: 0, z: -1 };
+// HUD-only attitude inputs. Derived from the aircraft quaternion every frame so
+// the display works through knife-edge, inverted flight and loops without any
+// Euler state feeding back into the flight model (§12).
+const _up = { x: 0, y: 1, z: 0 };
+// Gun dispersion needs a third axis. right = forward × up holds through
+// inverted flight, which an assumed world-up reference would not.
+const _right = new THREE.Vector3();
+const _fwdV = new THREE.Vector3();
+const _upV = new THREE.Vector3();
+const _ownVel = new THREE.Vector3();
+const _velDir = new THREE.Vector3(0, 0, -1);
+// Camera jitter while the cannon fires, removed before the rig runs so it never
+// accumulates into the chase camera's own damping (§23).
+const _gunShake = new THREE.Vector3();
+const _prevPos = new THREE.Vector3().copy(aircraftRoot.position);
+const _screen = {};
+// Reused candidate list for targeting: the drone plus every live SAM site. A
+// fresh array per frame would allocate 60 times a second for no reason.
+const _candidates = [];
+// Previous hostile range, so the fly-by fires once per pass.
+let _prevHostileRange = Infinity;
+// Seconds until the current trajectory reaches the ground, published for the
+// developer rail: the PULL UP rule is now a time, so the time has to be visible
+// or the only way to check it is to crash.
+let _tti = Infinity;
+// How long the player has actually been flying. Ground warnings are silent below
+// AUDIO.warnGraceSeconds, so the launch and every respawn are never talked over.
+let playerFliesFor = 0;
+// Reused radar contact list: the drone plus every SAM currently emitting. A fresh
+// array per frame would allocate 60 times a second for no reason.
+const _contacts = [];
+/**
+ * Stage 04.9 — what the radar knows.
+ *
+ * Detection only. Air contact appears whenever the hostile is active and alive;
+ * ground contacts appear only while a site is actually EMITTING at the player
+ * (TRACK / LOCK / LAUNCH), which is deliberate. Showing every site the moment the
+ * player is in range would hand them the whole threat map and quietly undo the
+ * terrain-masking mechanic — whereas this way flying the valley keeps the radar
+ * clean, and a site lighting up on it means the same thing as the warning in the
+ * player's ear. The display reinforces the rule instead of bypassing it.
+ */
+function radarContacts() {
+  _contacts.length = 0;
+  if (hostileAi.state.active && drone.alive) _contacts.push({ x: drone.position.x, z: drone.position.z, kind: "AIR" });
+  for (const s of samNet.sites) {
+    if (!s.alive) continue;
+    if (s.phase !== SamState.TRACK && s.phase !== SamState.LOCK && s.phase !== SamState.LAUNCH) continue;
+    _contacts.push({ x: s.position.x, z: s.position.z, kind: "SAM" });
+  }
+  return _contacts;
+}
+
+const _radar = { position: null, heading: 0, contacts: _contacts };
+function radarCtx() {
+  _radar.position = aircraftRoot.position;
+  _radar.heading = flightState.heading;
+  _radar.contacts = radarContacts();
+  return _radar;
+}
+
+const observer = { position: aircraftRoot.position, forward: _fwd };
+
+// NDC radius of a target, or null when it is behind the camera — the "near the
+// centre of screen" half of the acquisition rule (§15).
+const screenOffsetOf = (t) => {
+  projectToScreen(camera, t.position, window.innerWidth, window.innerHeight, _screen);
+  return _screen.behind ? null : _screen.offset;
+};
+
+function tryFire() {
+  if (!missiles || !rounds) return;
+  if (!targeting.canFire()) {
+    combatHud.flash(targeting.state.currentTarget ? "NO LOCK" : "NO TARGET");
+    return;
+  }
+  const round = rounds.next();
+  if (!round) {
+    combatHud.flash("AIM-9 EMPTY");
+    return;
+  }
+  // The visible round leaves the wing and a live entity takes its place at the
+  // same world transform — that continuity is the whole launch read (§19).
+  const mount = rounds.release(round);
+  missiles.fire({
+    mount,
+    target: targeting.state.currentTarget,
+    ownerSpeed: flightState.speed,
+    side: mount.userData.side,
+    owner: "player",
+  });
+  combatHud.flash("MISSILE AWAY", "info");
+  audio.play(Cue.MISSILE_LAUNCH);
+  director.stats.aim9Fired += 1;
+}
+
+/** One trigger, two weapons (§4). The selected weapon decides what it means. */
+function handleFireInput() {
+  const pressed = input.takeFire();
+  // §33 — weapons go cold once the recovery sequence begins. The latch is still
+  // consumed, so nothing fires on the frame control comes back.
+  if (!director.weaponsHot) return;
+  // The latch is consumed either way — a press made in GUN mode must not fire a
+  // missile the moment the player switches back.
+  if (weapon === WeaponMode.AIM9 && pressed) tryFire();
+}
+
+/* ---- physics ---- */
+// Layered under the flight model, not into it: the contact service reads
+// AircraftRoot and only ever writes back through a whole-state restore.
+const physics = createWorldPhysics({ oceanY: WORLD.oceanY });
+const physicsDebug = createPhysicsDebug(scene, PROBES);
+let anchorDebug = null;
+
+function syncAircraft() {
+  aircraftRoot.quaternion.set(flightState.quat.x, flightState.quat.y, flightState.quat.z, flightState.quat.w);
+  aircraftRoot.position.set(flightState.position.x, flightState.position.y, flightState.position.z);
+}
+
+/**
+ * Stage 02.3: the response policy is injected, not built in. Detection hands it
+ * a CollisionEvent and knows nothing else — replacing this object with a crash
+ * sequence later touches no terrain code and no flight code.
+ */
+const recovery = createDevelopmentRecoveryResponse({
+  history: physics.history,
+  flightState,
+  clearInput: () => input.clearTransient(),
+  onRestore: () => syncAircraft(),
+  // Empty history (a collision inside the first second) falls back to the
+  // Stage 02 airborne reset rather than inventing a position.
+  fallbackReset: () => {
+    resetFlightState(flightState);
+    syncAircraft();
+    snapChaseCamera();
+  },
+});
+physics.setResponse(recovery);
+
+/**
+ * §40 — the active response POLICY, swappable at runtime (G). Detection is
+ * identical either way; this is the only thing that differs between "rewind me
+ * 0.65 s so I can keep testing terrain" and "that was a failure, go back to the
+ * checkpoint". Keeping both live is the point of having separated them.
+ */
+let physicsPolicy = recovery;
+function setResponsePolicy(next) {
+  physicsPolicy = next;
+  physics.setResponse(next);
+  next.reset();
+  return next.name;
+}
+
+function applyReset() {
+  syncAircraft();
+  input.clearTransient();
+  physics.reset(flightState);
+  snapChaseCamera();
+  resetCombat();
+}
+
+/**
+ * R restores one combat test state, not two: flight reset and combat reset are
+ * the same key, so there is no way to end up with a fresh aircraft and a stale
+ * battle (§31). Live missiles, bursts, lock and ammo all go with it.
+ */
+function resetCombat() {
+  // The crash presentation goes first: it is the one system that OWNS the aircraft
+  // transform, so leaving it active would have the theatre keep driving a freshly
+  // respawned aircraft. This also makes R an unconditional escape hatch — the key
+  // handler runs outside the render loop, so R recovers the game even if a crash
+  // somehow leaves the loop wedged.
+  crashFx.reset();
+  setAircraftOpacity(1);
+  if (missiles) missiles.reset();
+  if (rounds) rounds.reload();
+  // Ammo resets; the *selected* weapon does not. R restores the battle, not the
+  // player's choice of how to fight it.
+  gun.reset();
+  resetTargetDrone(drone);
+  // §38: the enemy, its AI, its ammunition and every threat display go back with
+  // everything else. No stale hostile missile survives a reset — missiles.reset()
+  // above clears both owners' rounds.
+  hostileAi.reset();
+  threat.reset();
+  hitResponse.reset();
+  if (rearm) rearm.reset();
+  samNet.reset();
+  flares.reset();
+  audio.reset();
+  playerEntity.velocity.set(0, 0, 0);
+  playerEntity.alive = true;
+  targeting.clear();
+  // Drop HUD smoothing history too, or the ladder and target bracket sweep in
+  // from wherever they were before the reset.
+  combatHud.reset();
+  _prevPos.copy(aircraftRoot.position);
+  // FX carry visible history — a plume mid-spool, ribbons in the air, fog part
+  // way into a cloud — so they reset with everything else.
+  engineFx.reset();
+  vaporFx.reset();
+  atmosphere.reset();
+  prevPitchDeg = flightState.pitch / DEG;
+  pitchRateDeg = 0;
+}
+
+input.onReset(() => {
+  // §36 — R is now the mission restart, not a combat reset: phase, player,
+  // hostiles, missiles, gun ammo, launch state, navigation and damage state all
+  // go back together. There is no key that leaves half a mission behind.
+  restartMission();
+});
+
+input.onModeToggle(() => {
+  // Seamless: position, speed and attitude all carry over, so nothing is
+  // re-placed and the camera is left to damp across the up-vector change.
+  toggleFlightMode(flightState);
+  input.clearTransient();
+  updateHud(1);
+});
+
+input.onWeaponCycle(() => {
+  weapon = cycleWeapon(weapon);
+  combatHud.flash(weapon === WeaponMode.GUN ? "GUN SELECTED" : "AIM-9 SELECTED", "info");
+});
+
+// §04.4 — the pitch convention. Announced in the words that say what the key
+// does, not as "INVERT ON": a player who has just pressed it needs to know which
+// way W now goes, and "ON" does not tell them.
+input.onPitchModeToggle((inverted, name) => combatHud.flash(`PITCH \u00b7 W = ${name}`, "info"));
+
+// Steering is the keyboard (04.0a). The mouse keeps the trigger, the weapon
+// cycle and the lead pipper — the three things it was actually good at.
+
+/* ---- overlay ----
+ * 18 rows, not 23: Stage 03.15 folded related readings onto shared lines so the
+ * rail fits its box at 540 px instead of silently cropping its last five rows.
+ * Every fold keeps every value — nothing was dropped to make room.
+ */
+const keysEl = document.getElementById("keys");
+const hud = {
+  root: document.getElementById("hud"),
+  mode: document.getElementById("v-mode"),
+  spd: document.getElementById("v-spd"),  thr: document.getElementById("v-thr"),
+  pbh: document.getElementById("v-pbh"),
+  alt: document.getElementById("v-alt"),
+  mnvr: document.getElementById("v-mnvr"),
+  fov: document.getElementById("v-fov"),
+  ref: document.getElementById("v-ref"),
+  clr: document.getElementById("v-clr"),
+  ctc: document.getElementById("v-ctc"),  fwd: document.getElementById("v-fwd"),
+  phys: document.getElementById("v-phys"),
+  recv: document.getElementById("v-recv"),
+  qry: document.getElementById("v-qry"),
+  tgt: document.getElementById("v-tgt"),
+  host: document.getElementById("v-host"),
+  sam: document.getElementById("v-sam"),
+  thrt: document.getElementById("v-thrt"),
+  ammo: document.getElementById("v-ammo"),
+  eng: document.getElementById("v-eng"),
+  atm: document.getElementById("v-atm"),
+  msn: document.getElementById("v-msn"),
+  nav: document.getElementById("v-nav"),
+};
+
+/* ---- Stage 04.0 presentation shells ---- */
+const fadeEl = document.getElementById("fade");
+const completeEl = document.getElementById("complete");
+const completeStatsEl = document.getElementById("complete-stats");
+const completeTitleEl = document.getElementById("complete-title");
+
+/** §35 — compact run information. Time and a few combat stats, nothing more. */function showComplete() {
+  completeTitleEl.textContent = `${MISSION.title} Complete`;
+  completeStatsEl.innerHTML = director.summary.map((row) => `<dt>${row.label}</dt><dd>${row.value}</dd>`).join("");
+  completeEl.hidden = false;
+}
+function hideComplete() {
+  completeEl.hidden = true;
+}
+
+/**
+ * How much of the left edge the developer rail is occupying, in px, so the
+ * combat HUD can keep its instruments out from under it. Measured rather than
+ * assumed: the rail's width comes from its own content and changes with the
+ * longest row. Hidden rail means no gutter at all.
+ */
+let hudSafeLeft = 0;
+function measureRail() {
+  hudSafeLeft = hud.root.hidden ? 0 : Math.round(hud.root.getBoundingClientRect().right) + 24;
+  return hudSafeLeft;
+}
+window.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  /**
+   * Stage 05.5 — ESC pauses and resumes. One key, both directions.
+   *
+   * Handled before every other binding and returns immediately: while paused the
+   * only key that does anything is the one that unpauses, so a stray H or T
+   * cannot toggle overlays or restart the mission behind the pause screen.
+   */
+  if (e.key === "Escape") {
+    setPaused(!paused);
+    e.preventDefault();
+    return;
+  }
+  if (paused) {
+    /**
+     * K WHILE PAUSED IS ALLOWED, and it is the one exception to the rule below.
+     *
+     * Muting is a comfort control, not a game action: it cannot advance the
+     * mission, spend a pilot or move the aircraft, so there is no reason to
+     * refuse it. Refusing it made the mute key look broken -- a paused player
+     * pressing K got silence either way and no feedback, and reasonably
+     * concluded the binding was dead.
+     *
+     * It edits the player's REMEMBERED preference, because the pause is already
+     * forcing silence; `mutedBeforePause` is what gets restored on resume, so
+     * that is the value the keypress has to change. Feedback goes on the pause
+     * overlay, since the HUD is not being updated while paused.
+     */
+    if (k === "k") {
+      mutedBeforePause = !mutedBeforePause;
+      if (pauseHintEl) pauseHintEl.textContent = mutedBeforePause ? "Esc to resume \u00b7 audio off" : "Esc to resume";
+      e.preventDefault();
     }
     return;
   }
-
-  if (state.throttle > 0.02) audio.startLoop("ENGINE_LOOP", 0.5 + state.throttle * 0.5);
-  else audio.stopLoop("ENGINE_LOOP");
-
-  if (!scripted && weapon === "GUN" && input.isFiring() && !gun.isEmpty()) {
-    audio.startLoop("GUN");
-  } else {
-    audio.stopLoop("GUN");
+  // H owns the whole developer overlay — stats panel and key legend together —
+  // so what is left on screen is the combat interface alone (§35).
+  if (k === "h") {
+    hud.root.hidden = !hud.root.hidden;
+    if (keysEl) keysEl.hidden = hud.root.hidden;
+    measureRail();
   }
-
-  if (threatState.level === "LOCK") audio.play("LOCK");
-  else if (threatState.level === "MISSILE") audio.play("MISSILE");
-
-  const warn = groundWarning({
-    agl: physics.telemetry.agl,
-    forwardHazard: physics.telemetry.forwardHazard,
-    sink: state.sink,
-    speed: state.speed,
-  });
-  if (warn) audio.play(warn);
-
-  // The FLY-BY fires once per pass: a range that crossed the threshold THIS
-  // FRAME plus real closure, so a slow drift past is not a fly-by and a
-  // circling hostile does not retrigger.
-  if (hostile.isActive() && hostile.target.alive) {
-    const p = hostile.target.position;
-    const range = Math.hypot(
-      p.x - state.position.x, p.y - state.position.y, p.z - state.position.z,
-    );
-    const closing = (flybyRange - range) / Math.max(dt, 1e-6);
-    if (isFlyby(flybyRange, range, closing)) audio.play("FLYBY");
-    flybyRange = range;
-  } else {
-    flybyRange = Infinity;
+  if (k === "j") combatHud.toggle();
+  // §Flares — handled in the frame loop now, because there are two sources (Z and
+  // the middle mouse button) feeding one latch in input.js.
+  if (k === "k") combatHud.flash(audio.toggleMute() ? "AUDIO OFF" : "AUDIO ON", "info");
+  // Stage 05.3 — the pointer-steering kill switch. Undocumented on purpose; see
+  // the note on `pointerAllowed`.
+  if (k === "v") {
+    pointerAllowed = !pointerAllowed;
+    combatHud.flash(pointerAllowed ? "MOUSE STEERING ON" : "MOUSE STEERING OFF", "info");
   }
-}
+  if (k === "p") physicsDebug.toggle();
+  /**
+   * Stage 05.4 — the only two time controls there are (§7/§8/§10).
+   *
+   * A preset MOVES the clock and then lets it run: neither key freezes time, and
+   * there is deliberately no slider, no pause, no noon/midnight button and no
+   * time acceleration. They work identically in all three modes because they set
+   * the one global clock, and the result survives a mode switch for the same
+   * reason — nothing resets it.
+   */
+  if (k === "[") {
+    worldClock.setTau(DAY.sunriseTau);
+    combatHud.flash("SUNRISE", "info");
+  }
+  if (k === "]") {
+    worldClock.setTau(DAY.sunsetTau);
+    combatHud.flash("SUNSET", "info");
+  }
+  if (k === "o" && anchorDebug) anchorDebug.toggle();
+  // §16/§19 — draw the route: every nav anchor and its trigger volume.
+  if (k === "n" && navDebug) navDebug.toggle();
+  // Stage 04.2 — cycle mode. A mode change restarts, because every mode starts
+  // on the deck and half a mission in the wrong ruleset is not a state.
+  if (k === "t") {
+    const rules = applyMode(nextMode(mode));
+    restartMission();
+    combatHud.flash(rules.label, "info");
+  }
+  // §40 — A/B the two response policies without touching detection.
+  if (k === "g") {
+    const name = setResponsePolicy(physicsPolicy === recovery ? missionFailure : recovery);
+    combatHud.flash(name === "MissionCheckpointResponse" ? "MISSION FAILURE ON" : "DEV RECOVERY ON", "info");
+  }
+  // §36 — Enter restarts, but only from an ending screen: Enter is the secondary
+  // trigger during flight and must not double as a reset key.
+  if (k === "enter" && (director.state.phase === MissionPhase.COMPLETE || !failedEl.hidden)) restartMission();
+  // A/B the experimental camera roll without touching the rig.
+  if (k === "1") CHASE.rollInfluence = 0.0;
+  if (k === "2") CHASE.rollInfluence = 0.1;
+  if (k === "3") CHASE.rollInfluence = 0.15;
+});
 
-function onResize() {
-  world.resize();
-  // H3: `u` is recomputed on RESIZE ONLY, never per frame.
-  hud.resize(window.innerWidth, window.innerHeight);
-}
-window.addEventListener("pointerdown", () => audio.arm());
-window.addEventListener("resize", onResize);
-onResize();
-
-if (loading) loading.hidden = true;
-requestAnimationFrame(frame);
-
-// §18: `?test=1` runs the assertion suite alongside the game, so the checks
-// can be exercised against the same build the player is flying rather than a
-// separate page that could drift from it.
-if (new URLSearchParams(location.search).has("test")) {
-  import("./flight.test.js").then((suite) => {
-    const result = suite.run();
-    console.log(`flight.test.js: ${result.passed} passed, ${result.failed} failed`);
-    for (const f of result.failures) console.error("FAIL", f.name, f.detail ?? "");
-  });
-}
-
-// Expose a handle for the developer rail and for driving the page from a
-// headless browser. Not used by gameplay.
-globalThis.__vector = {
-  get state() { return state; },
-  get missiles() { return missiles; },
-  get trails() { return trails; },
-  get sams() { return sams; },
-  get weapons() { return weapons; },
-  get hud() { return hud; },
-  get airframe() { return airframe; },
-  get launch() { return launch; },
-  get anchors() { return carrierAnchors; },
-  get physics() { return physics; },
-  get audio() { return audio; },
-  get mission() { return mission; },
-  get crash() { return crash; },
-  world, rig, input, THREE,
+const signed = (v, digits = 1) => (v >= 0 ? "+" : "") + v.toFixed(digits);
+const BAR_CELLS = 10;
+// Drawn as cells rather than █/░ glyphs: the shade glyph renders shorter than
+// the full block in most monospace faces, so the empty half of the bar sat low.
+const throttleBar = (t) => {
+  const filled = Math.round(t * BAR_CELLS);
+  let html = "";
+  for (let i = 0; i < BAR_CELLS; i++) {
+    html += `<i class="cell${i < filled ? " on" : ""}"></i>`;
+  }
+  return html;
 };
+let fps = 0;
+let hudClock = 0;
+
+// Static after load: 30 km of geometry is never re-measured per frame.
+let carrierReport = null;
+let terrainReport = null;
+
+function updateHud(dt) {
+  hudClock += dt;
+  fps += (1 / Math.max(dt, 1 / 240) - fps) * 0.12;
+  if (hudClock < 0.1 || hud.root.hidden) return;
+  hudClock = 0;
+  // Re-measured on the HUD's own 10 Hz tick, not just on load and resize. The
+  // rail's width is content-driven, so it changes when a row's TEXT changes —
+  // which no layout event reports. A load-time-only sample was frozen at the
+  // narrowest the panel ever is.
+  measureRail();
+  const expert = isExpert(flightState);
+  if (hud.mode) {
+    hud.mode.textContent = flightState.mode;
+    hud.mode.style.color = expert ? "#9fe6b0" : "#e8f0f6";
+  }
+  hud.spd.textContent = `${Math.round(flightState.speed)} \u2192 ${Math.round(flightState.targetSpeed)} m/s`;
+  hud.thr.innerHTML = `<span class="bar">${throttleBar(flightState.throttle)}</span> ${Math.round(flightState.throttle * 100)}%${flightState.afterburner ? " AB" : ""}`;
+  hud.thr.style.color = flightState.afterburner ? "#ffb45a" : "#e8f0f6";
+  // Expert Euler values are derived from the quaternion and drive nothing, so
+  // they are marked with ~ rather than shown as if they were authoritative.
+  const mark = expert ? "~" : "";
+  // P B H carries the attitude mode too: FREE with the derived vectors in
+  // Expert, STABILISED in Assisted (was its own ATT row).
+  const a = expert ? attitudeVectors(flightState) : null;
+  hud.pbh.innerHTML =
+    `${mark}${signed(flightState.pitch / DEG)}\u00b0 \u00b7 ${mark}${signed(bankDegrees(flightState))}\u00b0 \u00b7 ${mark}${String(Math.round(headingDegrees(flightState))).padStart(3, "0")}\u00b0` +
+    (expert
+      ? ` <span style="color:${a.inverted ? "#ffd79a" : "rgba(232,240,246,0.55)"}">FREE ${signed(a.forwardY, 2)}/${signed(a.upY, 2)}${a.inverted ? " INV" : ""}</span>`
+      : ` <span style="color:rgba(232,240,246,0.4)">STABILISED</span>`);
+  // ALT carries AGL and the closest probe with it: everything about "how near
+  // the ground am I" on one line (was ALT + CLR).
+  const p0 = physics.state;
+  hud.alt.innerHTML =
+    `${Math.round(aircraftRoot.position.y)} m \u00b7 agl ${p0.queries ? metres(p0.agl) : "\u2014"} \u00b7 sink ${flightState.sink.toFixed(1)}` +
+    (p0.queries ? ` \u00b7 <span style="color:${p0.minClearance <= p0.safeClearance ? "#ffd79a" : "#e8f0f6"}">clr ${metres(p0.minClearance)} ${p0.surface}</span>` : "");
+  const mv = flightState.maneuver;
+  // MNVR carries the camera/input line with it (was MNVR + FOV).
+  const tail = ` <span style="color:rgba(232,240,246,0.55)">${camera.fov.toFixed(0)}\u00b0 \u00b7 in ${signed(input.x, 1)}/${signed(input.y, 1)}${input.roll ? ` r${signed(input.roll, 0)}` : ""}${input.pitchInverted() ? " \u00b7 INV" : ""}${input.heldKeys().length ? " \u00b7 " + input.heldKeys().join(" ") : ""}</span>`;
+  if (mv) {
+    hud.mnvr.innerHTML = `<span style="color:#ffd79a">BARREL ${mv.dir < 0 ? "L" : "R"} ${Math.round(mv.t * 100)}%</span>` + tail;
+  } else if (flightState.rollHold) {
+    hud.mnvr.innerHTML = `<span style="color:#9fd7ff">ROLL HOLD ${signed(bankDegrees(flightState), 0)}\u00b0</span>` + tail;
+  } else {
+    hud.mnvr.innerHTML = `<span style="color:rgba(232,240,246,0.45)">\u2014</span>` + tail;
+  }
+
+  // REF folds onto the FX row now, so this block only prepares the text.
+  let refText = "";
+  if (carrierReport || terrainReport) {
+    const parts = [];
+    if (carrierReport) parts.push(`carr ${distanceKm(aircraftRoot.position, carrierReport.center).toFixed(1)}`);
+    if (terrainReport) {
+      const toCoast = (aircraftRoot.position.z - terrainReport.nearEdgeZ) / 1000;
+      parts.push(toCoast > 0 ? `coast ${toCoast.toFixed(1)}` : `inland ${(-toCoast).toFixed(1)}`);
+    }
+    refText = parts.join(" \u00b7 ") + " km";
+  }
+  hud.refText = refText;
+
+  updatePhysicsHud();
+  updateCombatRows();
+  updateMissionRows();
+}
+
+const PHASE_COLOR = {
+  DECK: "rgba(232, 240, 246, 0.6)",
+  LAUNCH: "#ffb45a",
+  EGRESS: "#e8f0f6",
+  INTERCEPT: "#ffd79a",
+  DEFENSIVE: "#ff9b7a",
+  TERRAIN: "#e8d9a8",
+  FINAL: "#ffd79a",
+  EXTRACTION: "#9fd7ff",
+  COMPLETE: "#9fe6b0",
+};
+
+/** §48 — the mission overlay. Developer rail only; the player sees none of it. */
+function updateMissionRows() {
+  const m = director.state;
+  const rules = modeRules(mode);
+  // In a sandbox mode the phase machine is parked, so the row reports the mode
+  // and what the sandbox driver is doing instead of a phase that never changes.
+  if (m.parked) {
+    hud.msn.textContent = `${rules.label} \u00b7 ${formatShortClock(sandbox.state.elapsed)}` + (rules.hostiles ? ` \u00b7 ${sandbox.state.spawns} spwn` : "") + (m.failures ? ` \u00b7 ${m.failures} dn` : "");
+    hud.msn.style.color = mode === GameMode.PEACE ? "#9fe6b0" : "#9fd7ff";
+  } else {
+    hud.msn.textContent =
+      `${m.phase} ${formatShortClock(m.phaseTime)} \u00b7 t ${formatShortClock(m.missionTime)} \u00b7 cp${m.checkpoint}` +
+      (m.failures ? ` \u00b7 ${m.failures}f` : "") +
+      (m.recovering ? ` \u00b7 AUTO ${Math.round(m.autopilot * 100)}%` : "");
+    hud.msn.style.color = PHASE_COLOR[m.phase] || "#e8f0f6";
+  }
+
+  const legs = director.legs;
+  hud.nav.textContent = m.navValid
+    ? `${m.navName} \u00b7 ${metres(m.navRange)} \u00b7 leg ${Math.min(m.legIndex + 1, legs.length)}/${legs.length}`
+    : m.parked
+      ? `\u2014 \u00b7 ${rules.blurb}`
+      : legs.length
+        ? `\u2014 \u00b7 leg ${legs.length}/${legs.length} met`
+        : "\u2014";
+  hud.nav.style.color = m.navValid ? "#d6e8f0" : "rgba(232, 240, 246, 0.45)";
+
+  // Stage 04.2 — the ground picture. Line of sight is the mechanic, so whether a
+  // site can currently SEE the player is the one thing that has to be visible
+  // when the behaviour needs explaining.
+  const s = samNet.state;
+  if (!s.active) {
+    hud.sam.textContent = "\u2014";
+    hud.sam.style.color = "rgba(232, 240, 246, 0.45)";
+  } else {
+    const src = samNet.threatSource();
+    const seen = samNet.sites.filter((k) => k.alive && k.visible).length;
+    hud.sam.textContent =
+      `${s.alive}/${samNet.sites.length} \u00b7 ${seen} seen` +
+      (src ? ` \u00b7 ${src.phase} ${metres(src.range)} \u00b7 r${src.rounds}` : "") +
+      (s.launches ? ` \u00b7 ${s.launches} shot` : "");
+    hud.sam.style.color = s.locked ? "#ff9b7a" : s.tracking ? "#ffd79a" : seen ? "#e8d9a8" : "rgba(232, 240, 246, 0.6)";
+  }
+}
+
+const LOCK_COLOR = { NONE: "rgba(232, 240, 246, 0.45)", ACQUIRING: "#ffd79a", LOCKED: "#9fe6b0" };
+// §39 — AI state terminology stays in the diagnostic rail. The player sees
+// TRACK / LOCK / MISSILE and nothing else.
+const HOSTILE_COLOR = {
+  PATROL: "rgba(232, 240, 246, 0.5)",
+  PURSUIT: "#e8f0f6",
+  ACQUIRE: "#ffd79a",
+  ATTACK: "#ff9b7a",
+  DEFEND: "#ffd79a",
+  COOLDOWN: "#9fd7ff",
+  REPOSITION: "#9fd7ff",
+  DESTROYED: "rgba(159, 230, 176, 0.7)",
+};const THREAT_COLOR = { NONE: "rgba(232, 240, 246, 0.45)", TRACK: "#ffd79a", LOCK: "#ffb45a", MISSILE: "#ff9b7a" };
+
+/** Dev-rail mirror of the combat state — the floating HUD is the player's. */
+function updateCombatRows() {
+  const t = targeting.state;
+  const label = t.lockState === LockState.LOCKED ? "LOCK" : t.lockState === LockState.ACQUIRING ? `ACQ ${Math.round(t.lockProgress * 100)}%` : t.reason || "NO TARGET";
+  const hp = drone.alive && drone.health < drone.maxHealth ? ` \u00b7 hp ${Math.round(drone.health)}` : "";
+  hud.tgt.textContent = (t.currentTarget ? `${label} \u00b7 ${metres(t.targetRange)} \u00b7 ${t.offBoresightDeg.toFixed(0)}\u00b0` : label) + hp;
+  hud.tgt.style.color = LOCK_COLOR[t.lockState];
+
+  const h = hostileAi.state;
+  hud.host.textContent =
+    h.phase === HostileState.DESTROYED
+      ? "DESTROYED"
+      : `${h.phase} \u00b7 ${metres(h.range)} \u00b7 ${h.angleDeg.toFixed(0)}\u00b0` +
+        (h.phase === HostileState.ACQUIRE ? ` \u00b7 lock ${Math.round(h.lockProgress * 100)}%` : "") +
+        ` \u00b7 ammo ${h.ammo}` +
+        (h.cooldown > 0 ? ` \u00b7 cd ${h.cooldown.toFixed(1)}s` : "") +
+        // §15 — the reaction cue, so "why did it break" is answerable.
+        (h.lockedOn && h.defendCue > 0 && h.phase !== HostileState.DEFEND ? ` \u00b7 REACT ${h.defendCue.toFixed(1)}s` : "") +
+        (h.defends ? ` \u00b7 ${h.defends} brk` : "");
+  hud.host.style.color = HOSTILE_COLOR[h.phase] || "#e8f0f6";
+
+  const th = threat.state;
+  hud.thrt.textContent =
+    th.level === ThreatLevel.NONE
+      ? "\u2014"
+      : th.level === ThreatLevel.MISSILE
+        ? `MISSILE \u00b7 ${metres(th.distance)} ${th.arrow}${th.behind ? " ASTERN" : ""} \u00b7 ${th.tier}` +
+          ` \u00b7 cls ${Math.round(th.closing)}` +
+          (th.dodgeActive ? ` \u00b7 DODGE auth ${th.authority.toFixed(2)}` : "")
+        : th.level;
+  hud.thrt.style.color = THREAT_COLOR[th.level] || "#e8f0f6";
+
+  // AMMO carries both magazines and which one is selected, rather than taking a
+  // 19th row: Stage 03.15 already found the rail's ceiling.
+  const count = rounds ? rounds.count : 0;
+  const flying = missiles ? missiles.inFlight : 0;
+  const on = "#e8f0f6";
+  const off = "rgba(232, 240, 246, 0.4)";
+  const gunSel = weapon === WeaponMode.GUN;
+  // §13 — a magazine that is coming back says so, with the count of seconds. An
+  // empty weapon and an empty weapon with 4 s left on it are different states.
+  const pending = rearm ? rearm.pending : null;
+  const rearmText = pending ? ` \u00b7 ${pending.label} ${Math.ceil(pending.remaining)}s` : "";
+  hud.ammo.innerHTML =
+    `<span style="color:${gunSel ? off : count ? on : "#ffd79a"}">${gunSel ? "" : "\u203a"}AIM-9 ${count}</span> \u00b7 ` +
+    `<span style="color:${!gunSel ? off : gun.state.ammo ? on : "#ffd79a"}">${gunSel ? "\u203a" : ""}GUN ${gun.state.ammo}</span> \u00b7 ` +
+    `<span style="color:${flares.state.remaining ? on : "#ffd79a"}">FLR ${flares.state.remaining}</span>` +
+    `${flying ? ` \u00b7 ${flying} live` : ""}` +
+    (rearmText ? `<span style="color:#9fd7ff">${rearmText}</span>` : "");
+
+  const e = engineFx.state;
+  const a = atmosphere.state;
+  const v = vaporFx.state;
+  // FX folded onto one row: engine, cloud, load and vapor. Stage 04.2 needed the
+  // physics rows back and this is the block that could afford to give.
+  hud.atm.textContent =
+    `${Math.round(e.intensity * 100)}%${e.afterburner ? " AB" : ""}` +
+    ` \u00b7 cld ${a.density.toFixed(2)} \u00b7 vap ${v.vortex.toFixed(2)}` +
+    // Stage 05.4 — the clock, stated in words and in tau. Without this the only
+    // way to answer "is the day/night cycle actually running?" is to stare at
+    // the sky and guess, which is not a check.
+    ` \u00b7 ${phaseName(worldClock.tau)} ${worldClock.tau.toFixed(3)}` +
+    // The engine loop's own playback clock. It has now been reported silent
+    // twice while measurably playing, so the element's state goes on the rail:
+    // a number that is advancing means audio is running and the problem is
+    // downstream (tab muted, output device, autoplay warm-up), while a number
+    // frozen at 0 is the pause/restart fault this row exists to catch.
+    ` \u00b7 eng ${engineAudioLabel()}` +
+    // A non-zero stall count means the watchdog is repairing a loop that stopped
+    // on its own. Amber, because the audio is being fixed rather than working.
+    (audio.channels.ENGINE_LOOP.stalls
+      ? ` \u00b7 <span style="color:#ffd79a">stall ${audio.channels.ENGINE_LOOP.stalls}</span>`
+      : "") +
+    (a.advisory ? ` \u00b7 ${a.advisory}` : "") +
+    (hud.refText ? ` \u00b7 ${hud.refText}` : "");
+  hud.atm.style.color = a.advisory ? "#9fd7ff" : e.afterburner ? "#ffb45a" : "rgba(232, 240, 246, 0.45)";
+}
+
+const SURFACE_COLOR = { TERRAIN: "#e8d9a8", OCEAN: "#9fd7ff", NONE: "rgba(232, 240, 246, 0.45)" };
+const CONTACT_COLOR = { CLEAR: "#9fe6b0", TERRAIN: "#ff9b7a", OCEAN: "#9fd7ff", FORWARD: "#ffd79a" };
+const metres = (v) => (Math.abs(v) >= 1000 ? `${(v / 1000).toFixed(2)} km` : `${Math.round(v)} m`);
+
+function updatePhysicsHud() {
+  const p = physics.state;
+  if (!p.queries) return;
+
+  // CTC carries what we are touching, what we are about to touch, AND the
+  // recovery feedback: everything the collision-response policy does, on the one
+  // line the G key exists to let you observe.
+  const fb = physicsPolicy.feedback;
+  const last = physicsPolicy.last;
+  const tail = fb
+    ? ` \u00b7 <span style="color:#ffd79a">${fb}${physicsPolicy === recovery && last.rewind ? ` -${last.rewind.toFixed(2)}s` : ""}</span>`
+    : physicsPolicy.recoveries
+      ? ` \u00b7 <span style="color:rgba(232,240,246,0.5)">${physicsPolicy.recoveries} rec</span>`
+      : "";
+  hud.ctc.innerHTML =
+    `<span style="color:${CONTACT_COLOR[p.contactKind] || "#e8f0f6"}">${p.contactKind}</span>` +
+    ` \u00b7 <span style="color:${p.forwardImminent ? "#ff9b7a" : p.forwardHazard ? "#ffd79a" : "rgba(232,240,246,0.45)"}">` +
+    (p.forwardHazard ? `fwd ${p.forwardDistance.toFixed(0)} m${p.forwardImminent ? " !" : ""}` : `fwd ${p.lookAhead.toFixed(0)} m`) +
+    "</span>" +
+    // The trajectory clock the PULL UP cue reads. Amber inside the warning
+    // window, so a warning that should have fired and did not is visible.
+    (Number.isFinite(_tti)
+      ? ` \u00b7 <span style="color:${_tti <= AUDIO.pullUpSeconds ? "#ff9b7a" : "rgba(232,240,246,0.45)"}">gnd ${_tti.toFixed(1)} s</span>`
+      : "") +
+    tail;
+
+  // PHYS carries the clearance, the query cost and the frame rate: one physics
+  // row instead of five.
+  hud.phys.innerHTML =
+    `${p.physicsHz} Hz \u00b7 <span style="color:${p.minClearance <= p.safeClearance ? "#ffd79a" : "#e8f0f6"}">${p.minProbeName || "\u2014"} ${metres(p.minClearance)}</span>` +
+    ` \u00b7 ${p.safeStates} st \u00b7 ${p.avgQueryMs.toFixed(2)} ms \u00b7 ${Math.round(fps)} fps`;
+}
+
+/**
+ * Push one instant of world time into every visual that depends on it.
+ *
+ * Everything here is derived from the single `env` record, so no two systems can
+ * disagree about what time it is — the sky, the fog, the clouds, the ocean, the
+ * settlement lights and the carrier lights are all reading the same numbers.
+ */
+function applyEnvironment(env, dt) {
+  sun.color.setHex(env.sunColor);
+  sun.intensity = env.sunIntensity;
+  // Directional lights are positioned, not aimed: three.js takes the direction
+  // from position toward the target (the origin here). Pushed far out so the
+  // light stays parallel across a 30 km island.
+  sun.position.set(env.sunDirection.x * 8000, env.sunDirection.y * 8000, env.sunDirection.z * 8000);
+
+  moon.color.setHex(env.moonColor);
+  moon.intensity = env.moonIntensity;
+  moon.position.set(env.moonDirection.x * 8000, env.moonDirection.y * 8000, env.moonDirection.z * 8000);
+
+  skyFill.color.setHex(env.hemiSky);
+  skyFill.groundColor.setHex(env.hemiGround);
+  skyFill.intensity = env.hemiIntensity;
+
+  // The dome keeps its painted gradient and is TINTED: a MeshBasicMaterial's
+  // colour multiplies its map, so one colour write re-times the whole sky
+  // without rebuilding the texture every frame.
+  sky.material.color.setHex(env.skyColor);
+
+  /**
+   * Fog is owned by atmosphere.js, which lerps from its own captured base colour
+   * toward the cloud colour every frame. Writing scene.fog.color here would be
+   * overwritten a few lines later, so the BASE is handed over instead and the
+   * cloud system keeps its authority over the blend.
+   */
+  atmosphere.setBaseFog(env.hazeColor);
+  atmosphere.setCloudTint(env.cloudColor, env.cloudOpacityScale);
+
+  oceanVisual.follow(aircraftRoot.position);
+  oceanVisual.apply(env, dt);
+
+  if (settlementLights) settlementLights.apply(env);
+  if (carrierLights) carrierLights.apply(env);
+}
+
+/**
+ * The engine's audio state, in words, for the developer rail.
+ *
+ * "No engine sound" has been reported several times and has had a different
+ * cause each time, so the rail now distinguishes the three possibilities instead
+ * of showing one ambiguous number:
+ *
+ *   CLICK PAGE  the browser has refused to start audio and is waiting for a real
+ *               user gesture in this document. Not a bug — click the canvas.
+ *   MUTE        the player pressed K, or the game is paused.
+ *   OFF         the engine is legitimately not running (on the deck, crashed).
+ *   12.3s       the loop's own clock, advancing. Audio is working; if nothing is
+ *               audible the fault is the output device or the tab's volume.
+ */
+function engineAudioLabel() {
+  const ch = audio.channels.ENGINE_LOOP;
+  const el = ch.voices[0][0];
+  if (!el) return "\u2014";
+  if (audio.state.muted) return "MUTE";
+  if (!ch.playing) return "OFF";
+  if (!ch.everPlayed) return `<span style="color:#ffd79a">CLICK PAGE</span>`;
+  return `${el.currentTime.toFixed(1)}s`;
+}
+
+/* ---- loop ---- */
+let lastTime = performance.now();
+/**
+ * A monotonic frame stamp, handed to every caller that advances the failure
+ * policy. The policy ignores a repeated stamp, so the double-tick above is
+ * structurally impossible rather than merely commented against: physics.update()
+ * and the crash branch can both call tick() in the same frame and only the first
+ * one counts.
+ */
+let frameId = 0;
+
+/**
+ * Stage 05.5 — pause state.
+ *
+ * Module scope beside the frame loop, because pausing is a property of the LOOP,
+ * not of the mission, the mode or the flight model. None of those learn about
+ * it: the loop simply stops advancing them, which is why pausing cannot corrupt
+ * a launch, a crash sequence or a checkpoint the way a per-system pause flag
+ * could.
+ */
+let paused = false;
+const pauseEl = document.getElementById("pause");
+const pauseHintEl = pauseEl ? pauseEl.querySelector(".hint") : null;
+
+function setPaused(on) {
+  if (paused === on) return paused;
+  paused = on;
+  if (pauseEl) pauseEl.hidden = !paused;
+  /**
+   * Silence while paused, and restore what the player had. The engine loop is a
+   * continuous sound: leaving it running behind a pause screen is the single most
+   * obvious way to make a pause feel broken. `setMuted` pauses the looping
+   * channels outright, so this also stops the gun mid-burst.
+   *
+   * The player's own mute (K) is remembered and re-applied, so pausing never
+   * silently turns their audio back on.
+   */
+  if (paused) {
+    mutedBeforePause = audio.isMuted ? audio.isMuted() : audio.state.muted;
+    audio.setMuted(true);
+  } else {
+    audio.setMuted(mutedBeforePause);
+  }
+  // Steering is a stick; a paused game must not be flown by a moving cursor.
+  //
+  // RESTORE it on resume rather than leaving it off. This line used to pass a
+  // flat `false`, so the first pause of a session permanently disabled pointer
+  // steering -- the game kept flying, the cursor did nothing, and the cause was
+  // three systems away from the symptom.
+  input.setPointerEnabled(!paused && pointerAllowed);
+  if (pauseHintEl) pauseHintEl.textContent = mutedBeforePause ? "Esc to resume \u00b7 audio off" : "Esc to resume";
+  return paused;
+}
+let mutedBeforePause = false;
+
+function step() {
+  const now = performance.now();
+  frameId++;
+  const dt = Math.min((now - lastTime) / 1000, 1 / 30);
+  lastTime = now;
+
+  /**
+   * Stage 05.5 — PAUSE.
+   *
+   * A single early return, placed after `lastTime` is updated so the frame the
+   * player unpauses on has a normal dt rather than the whole paused duration
+   * (which the 1/30 clamp would swallow anyway, but relying on a clamp to hide a
+   * bug is not a design). Nothing is simulated, nothing is ticked, no policy
+   * advances, no audio is driven — but the scene is still RENDERED, so the paused
+   * world sits there and looks like the world instead of a black screen.
+   */
+  if (paused) {
+    renderer.render(scene, camera);
+    return;
+  }
+
+  input.update(dt);
+  // Last frame's cannon jitter comes off before anything reads the camera.
+  camera.position.sub(_gunShake);
+
+  const phase = director.state.phase;
+  const scripted = !director.playerFlies;
+  /**
+   * THE FAILURE POLICY IS TICKED EXACTLY ONCE PER FRAME, HERE, BEFORE ANYTHING
+   * READS CRASH STATE.
+   *
+   * Two rules collided and produced the worst bug in the build:
+   *
+   *   1. Tick the policy BEFORE reading `crashing`, so a restore that happens
+   *      this frame is respected and the crash branch does not copy the wreck's
+   *      transform over the fresh respawn.
+   *   2. Tick the policy even when physics is skipped (crash or scripted
+   *      flight), because physics.update() is normally what advances it.
+   *
+   * Each was implemented as its own guarded call, with equivalent conditions --
+   * so whenever a crash was active the policy was advanced TWICE per frame. The
+   * whole 2.32 s sequence ran at double speed, and worse, `crashing` was
+   * captured BETWEEN the two calls: when the second one fired `onRestore`, the
+   * `if (crashing)` branch below still ran and wrote the wreck pose straight
+   * over the aircraft that had just been respawned at 4000 m. Whether it
+   * happened at all depended on which of the two ticks crossed the fade
+   * threshold, which is exactly why it presented as "sometimes" -- and once it
+   * happened the aircraft was back at the impact point, so it crashed again
+   * immediately and spent another pilot, until the sortie ran out of aircraft.
+   *
+   * ONE call, ONE condition, and `crashing` read after it. Do not add a second
+   * tick for a new branch: widen this condition instead.
+   */
+  if (crashFx.state.active || scripted || physicsPolicy !== missionFailure) missionFailure.tick(dt, frameId);
+  const crashing = crashFx.state.active;
+  // The pointer is a stick, so it must not fight an owner that is not the player.
+  // Disabled outright during the launch script and the crash, rather than having
+  // those branches remember to ignore it.
+  input.setPointerEnabled(pointerAllowed && !crashing && !scripted && director.state.autopilot < 0.5);
+
+  if (crashing) {
+    /* ---- §6–§9: destruction theatre ----
+     * No flight model, no physics query, no input. The aircraft carries its
+     * pre-impact momentum, tumbles, and sinks; nothing here can fail the mission
+     * again (§33) because the policy that started this refuses re-entry.
+     */
+    crashFx.update(dt);
+    // Discrete requests made during the crash are consumed and dropped, so a
+    // trigger pull mid-explosion does not fire on the respawn frame (§2/§47).
+    input.takeRoll();
+    input.takeFire();
+    const p = crashFx.pose;
+    flightState.position.x = p.position.x;
+    flightState.position.y = p.position.y;
+    flightState.position.z = p.position.z;
+    // flightState.quat is a plain {x,y,z,w} record, NOT a THREE.Quaternion — the
+    // flight model is deliberately THREE-free. Calling .copy() on it threw on the
+    // first crash frame and killed the render loop, which is why the whole game
+    // froze at the moment of impact instead of exploding.
+    flightState.quat.x = p.quat.x;
+    flightState.quat.y = p.quat.y;
+    flightState.quat.z = p.quat.z;
+    flightState.quat.w = p.quat.w;
+    flightState.speed = crashFx.velocity.length();
+    flightState.maneuver = null;
+    aircraftRoot.position.copy(p.position);
+    aircraftRoot.quaternion.copy(p.quat);
+    // §6 — the intact aircraft stays visible, then fades behind its own smoke.
+    setAircraftOpacity(p.opacity);
+    // §34 — the engine fails with the aircraft rather than droning on.
+    audio.loop(Cue.GUN, false);
+  } else if (scripted && phase !== MissionPhase.COMPLETE) {
+    /* ---- §6/§9: the aircraft is attached to the launch frame ----
+     * No flight physics, no wheel physics, no throttle input. The script writes
+     * the whole flight state and the renderer reads it, so the handoff has
+     * nothing to reconcile.
+     */
+    launch.update(dt, !audio.state.armed);
+    /**
+     * 04.6 — the deck is the ENGINE START and nothing else. The loop used to run
+     * from the first frame (the throttle is above idle immediately), so the two
+     * sounds overlapped for the whole dwell and the start-up was inaudible under
+     * a running engine. Now the start plays alone while the aircraft shakes in
+     * place, and it is CUT the instant the catapult fires — which is where the
+     * loop takes over, because that is the moment there is something to sustain.
+     */
+    /**
+     * 05.2 — the start-up is fired ONCE per launch, not every frame.
+     *
+     * It was called unconditionally while the stage was DECK and left to the cue's
+     * own `minInterval` to suppress repeats. That works for a warning that fires
+     * occasionally and fails completely here: the interval is 4 s and the dwell is
+     * now 11 s, so the clip retriggered twice mid-play and three copies overlapped.
+     * A cue whose whole purpose is to run to its end exactly once cannot be
+     * governed by a rate limiter.
+     */
+    if (launch.state.stage === LaunchStage.DECK) {
+      if (!startCueFired && launch.state.t >= LAUNCH.spoolAt) {
+        startCueFired = true;
+        audio.play(Cue.ENGINE_START, { force: true });
+      }
+    } else {
+      audio.stop(Cue.ENGINE_START);
+    }
+    // Discrete requests made while the script is flying are consumed and
+    // dropped, so a barrel roll pressed on the deck does not fire the instant
+    // the player receives control.
+    input.takeRoll();
+    input.takeFire();
+    const p = launch.pose;
+    flightState.position.x = p.x;
+    flightState.position.y = p.y;
+    flightState.position.z = p.z;
+    flightState.heading = p.heading;
+    flightState.pitch = p.pitch;
+    flightState.bank = 0;
+    flightState.speed = p.speed;
+    flightState.targetSpeed = p.speed;
+    flightState.throttle = p.throttle;
+    flightState.afterburner = p.afterburner;
+    flightState.sink = 0;
+    flightState.maneuver = null;
+    quatFromEulerYXZ(p.pitch, p.heading, 0, flightState.quat);
+    syncAircraft();
+    setGear(launch.state.gearDown);
+    if (launch.state.handoff) handoff();
+  } else if (phase === MissionPhase.COMPLETE) {
+    // Frozen frame behind the complete screen. Nothing integrates, nothing
+    // spawns, and the world is still there if the player wants to look at it.
+    syncAircraft();
+    audio.loop(Cue.GUN, false);
+  } else {
+    // Post-recovery grace: the stick that flew into the mountain is not handed
+    // back for 0.3 s, so a rewind reads as a reset instead of a re-impact.
+    const graced = physicsPolicy.graceRemaining > 0;
+    const roll = input.takeRoll();
+    const auto = director.state.autopilot;
+    // §33 — the closing sequence flies through the ordinary flight model with a
+    // synthesised stick, blended in over a second, so control is handed away
+    // rather than switched off.
+    let stick = graced ? NEUTRAL_INPUT : input;
+    if (auto > 0) {
+      stick = blendStick(
+        graced ? NEUTRAL_INPUT : input,
+        autopilotStick(
+          { heading: flightState.heading, pitch: flightState.pitch, altitude: aircraftRoot.position.y, speed: flightState.speed },
+          recoveryGoal()
+        ),
+        auto,
+        _stick
+      );
+    }
+    if (roll !== 0 && !graced && auto < 0.4) requestRoll(flightState, roll);
+
+    updateFlight(flightState, stick, dt);
+
+    // One orientation path for both modes: the flight model owns the quaternion.
+    syncAircraft();
+
+    // World contact runs on the transform that was just written. It produces a
+    // CollisionEvent; the response policy is the only thing that moves the
+    // aircraft outside the flight model.
+    physics.update(aircraftRoot, flightState, dt, undefined, frameId);
+  }
+
+  /* ---- §3/§19: the director. Reads published state, decides the mission. ---- */
+  director.update(
+    {
+      position: aircraftRoot.position,
+      strokeStarted: launch.state.stage !== LaunchStage.DECK && launch.state.stage !== LaunchStage.IDLE,
+      launchDone: launch.state.done,
+      hostileAlive: drone.alive,
+      hostileSpent: hostileAi.spent && (!missiles || missiles.ownedBy("hostile").length === 0),
+    },
+    dt
+  );
+
+  /**
+   * THE FIVE-MINUTE DEADLINE (§10).
+   *
+   * A policy in the orchestrator, not a phase in the transition table: the table
+   * promotes phases and nothing else, and "the run is over" is a decision about
+   * the run rather than a tenth phase (§4). One call site, reading one pure rule.
+   *
+   * MISSION only, gated on the mode's own timer rule — the sandbox modes are
+   * practice, and a deadline would turn them into a test (§11). Guarded on the
+   * loss screen being hidden so it fires once rather than on every frame after.
+   *
+   * `modeRules(mode)` is resolved here rather than reaching for a `rules` binding:
+   * an earlier version of this line referenced one that does not exist in this
+   * scope, and the §17.3 frame guard absorbed the ReferenceError sixty times a
+   * second — the game kept flying, the deadline never fired, and the only trace
+   * was "recovered from a thrown frame" in the log.
+   */
+  if (modeRules(mode).timer && failedEl.hidden && missionExpired(director.state.missionTime, phase)) {
+    combatHud.flash("REINFORCEMENTS INBOUND", "danger");
+    missionFailed("TIME");
+    return;
+  }
+
+  /* ---- §11/§12: the launch composition, blended out rather than cut ---- */
+  if (scripted && phase !== MissionPhase.COMPLETE) {
+    setChaseView(1, LAUNCH_VIEW, launch.state.fov);
+  } else if (viewHold > 0) {
+    viewHold = Math.max(0, viewHold - dt / LAUNCH.viewBlendOut);
+    setChaseView(viewHold, LAUNCH_VIEW, LAUNCH.fovExit);
+  } else if (director.state.autopilot > 0) {
+    setChaseView(director.state.autopilot, RECOVERY_VIEW, null);
+  } else if (crashFx.followBlend > 0) {
+    // §27 — the rig loosens rather than detaching: further out, higher, and with
+    // its forward damping cut so it lags behind the tumbling aircraft. That lag
+    // is what lets the player actually see the fire, smoke and debris before the
+    // fade, and it reuses the launch composition channel rather than adding a
+    // second camera.
+    setChaseView(crashFx.followBlend, CRASH_VIEW, null);
+  } else {
+    setChaseView(0, null, null);
+  }
+
+  // The opening fade and the closing fade share one layer, and a failure can
+  // overlay either — whichever is darkest wins. Read from the wall clock so a
+  // page that spent time hidden does not owe itself a fade.
+  openingFade = Math.max(0, MISSION.fadeIn - (performance.now() - openingFadeAt) / 1000);
+  applyFade();
+
+  updateChaseCamera(camera, aircraftRoot, flightState, dt);
+  // Gun jitter is applied to the camera *after* the rig has run and removed
+  // before it runs again, so the chase damping never chases the vibration. It
+  // uses last frame's fire state, which at 145 fps is not a perceivable lag.
+  // Stage 03.3 §32 folds the missile-impact kick into the same offset rather
+  // than adding a second one the rig could fight.
+  const impact = hitResponse.state.impact;
+  const crashShake = crashFx.state.shake;
+  if (gun.state.firing || impact > 0.01 || launch.state.shake > 0.001 || crashShake > 0.001) {
+    // §13 — the deck shimmer and the catapult vibration reuse the existing
+    // camera-offset channel rather than adding a second one the rig could fight.
+    // §26 adds the crash kick to the same channel, for the same reason: one
+    // strong impulse with fast decay, never sustained shake (§28).
+    const amp = (gun.state.firing ? GUN.shake : 0) + impact * 0.55 + launch.state.shake + crashShake;
+    _gunShake.set((Math.random() * 2 - 1) * amp, (Math.random() * 2 - 1) * amp, 0).applyQuaternion(camera.quaternion);
+  } else {
+    _gunShake.set(0, 0, 0);
+  }
+  camera.position.add(_gunShake);
+  // Projection for the HUD happens before render, so the camera's inverse has
+  // to be current or the target box trails a frame behind the world.
+  camera.updateMatrixWorld(true);
+  physicsDebug.update(physics.state, aircraftRoot);
+
+  /* ---- combat, layered on top of an untouched flight/physics step ---- */
+  quatForward(flightState.quat, _fwd);
+  quatUp(flightState.quat, _up);
+  // Actual trajectory from the frame's world displacement, so the flight-path
+  // marker reflects bank sink and the altitude floor rather than just where the
+  // nose points. Falls back to boresight when standing still.
+  _velDir.subVectors(aircraftRoot.position, _prevPos);
+  if (_velDir.lengthSq() > 1e-6) _velDir.normalize();
+  else _velDir.set(_fwd.x, _fwd.y, _fwd.z);
+  _prevPos.copy(aircraftRoot.position);
+
+  _fwdV.set(_fwd.x, _fwd.y, _fwd.z);
+  _upV.set(_up.x, _up.y, _up.z);
+  _right.crossVectors(_fwdV, _upV).normalize();
+  _ownVel.copy(_velDir).multiplyScalar(flightState.speed);
+  // The player's published velocity: what the hostile leads and what its
+  // missile leads. Measured, not assumed from the nose vector.
+  playerEntity.velocity.copy(_ownVel);
+
+  // The hostile flies itself: patrol path, pursuit curve, break and reposition
+  // all live behind one state machine (§3). It is handed published player state
+  // and never reads the flight model.
+  // §15 — including whether the player has a completed lock on it. Published
+  // state, exactly like position and velocity: the AI reads the same fact the
+  // player's HUD is showing, not the HUD itself.
+  playerEntity.locked = targeting.state.lockState === LockState.LOCKED && targeting.state.currentTarget === drone;
+  hostileAi.update(playerEntity, dt);
+  // Ground threats. Static, so there is no integration step — only acquisition,
+  // line of sight and a launch.
+  samNet.update(playerEntity, dt);
+  if (isSandbox(mode)) sandbox.update({ hostileAlive: hostileAi.state.active && drone.alive }, dt);
+
+  // §5 — an inactive hostile is not a target, either. Handing targeting an empty
+  // list is what stops the player locking a drone that is not in the mission yet.
+  const engaged = hostileAi.state.active && drone.alive;
+  _candidates.length = 0;
+  if (engaged) _candidates.push(drone);
+  for (const s of samNet.targets) _candidates.push(s);
+  targeting.update(observer, _candidates, screenOffsetOf, dt);
+  handleFireInput();
+  // §21/§22: the dodge window is evaluated once per frame, here, and read by
+  // every incoming round through the authority hook.
+  _evasion.inPeak = inDodgePeak(flightState.maneuver, isExpert(flightState));
+  _evasion.velocityDir = _velDir;
+  if (missiles) missiles.update(dt);
+
+  // Threat state after the missiles have moved, so the range the player reads is
+  // the range the fuze is working with.
+  threat.update(
+    {
+      hostile: hostileAi.state,
+      // Both owners' rounds, so a SAM shot escalates the display the same way a
+      // fighter's does and the nearest one wins.
+      incoming: missiles ? missiles.live.filter((m) => m.owner === "hostile" || m.owner === "sam") : [],
+      ground: (() => {
+        const src = samNet.threatSource();
+        return src
+          ? { tracking: src.phase === SamState.TRACK, locked: src.phase === SamState.LOCK || src.phase === SamState.LAUNCH, lockProgress: src.lockProgress, range: src.range }
+          : null;
+      })(),
+      position: aircraftRoot.position,
+      forward: _fwdV,
+      right: _right,
+      up: _upV,
+      expert: isExpert(flightState),
+      maneuver: flightState.maneuver,
+    },
+    dt
+  );
+  hitResponse.update(dt);
+
+  // The cannon runs whether or not it is selected: `armed` gates firing, while
+  // the lead solution is computed either way so switching to GUN shows a pipper
+  // on the first frame instead of a frame later.
+  gun.update(
+    {
+      armed: weapon === WeaponMode.GUN && director.weaponsHot,
+      firing: input.trigger && director.weaponsHot,
+      forward: _fwdV,
+      right: _right,
+      up: _upV,
+      ownVel: _ownVel,
+      // Whatever the targeting system has settled on — which may be a SAM site.
+      // The gun works on ground targets with no special case because the lead
+      // solution only needs a position and a velocity, and a SAM's is zero.
+      target: targeting.state.currentTarget || (engaged ? drone : null),
+    },
+    dt
+  );
+  director.stats.gunFired += gun.state.shots;
+
+  // §Flares — one latch, two sources (Z and the middle mouse button). Polled here
+  // rather than in a key handler so both behave identically, and gated on weapons
+  // being hot: no countermeasures under the closing autopilot.
+  if (input.takeFlare() && director.weaponsHot) {
+    if (!flares.dispense({ position: aircraftRoot.position, velocity: _ownVel, right: _right, up: _upV, forward: _fwdV })) {
+      if (flares.state.remaining <= 0) combatHud.flash("NO FLARES");
+    }
+  }
+
+  /* ---- §04.5: audio, driven entirely from published state ---- */
+  // The engine is the only continuous sound: a loop whose gain and pitch follow
+  // the throttle lever. It does NOT run on the deck — see the launch branch.
+  /**
+   * THE ENGINE LOOP HAS EXACTLY ONE OWNER: this line.
+   *
+   * It previously had four. The crash branch, the deck branch and the COMPLETE
+   * branch each switched it off for their own good reason, and then this line --
+   * running later in the SAME frame -- switched it back on, because its condition
+   * only knew about the deck. So every frame the element was paused and restarted,
+   * `start()` reset currentTime to 0, and the loop never advanced past a single
+   * frame of audio: `paused` read false, `readyState` read 4, no error was
+   * thrown, and the aircraft was silent. What you could hear was the restart
+   * itself -- a click or a burst, not an engine.
+   *
+   * A media element cannot be owned by four branches. Every condition that
+   * silences the engine belongs in THIS expression; do not add a fifth caller.
+   */
+  const onDeck = scripted && launch.state.stage === LaunchStage.DECK;
+  const ev = engineVoice(flightState.throttle, flightState.afterburner);
+  const engineRunning =
+    !onDeck && // the deck belongs to the start-up cue alone
+    !crashing && // §34 the engine fails with the aircraft
+    phase !== MissionPhase.COMPLETE && // frozen frame behind the end screen
+    flightState.throttle > 0.02;
+  audio.loop(Cue.ENGINE_LOOP, engineRunning, { volume: ev.volume, rate: ev.rate });
+  // The cannon is a loop too, gated on the trigger — 48 rounds a second is not a
+  // sequence of one-shots, and treating it as one would drown every warning.
+  audio.loop(Cue.GUN, gun.state.firing);
+
+  // Warnings, from the threat monitor's own escalation so the sound and the word
+  // on the HUD can never disagree.
+  const tl = threat.state.level;
+  if (tl === ThreatLevel.MISSILE) audio.play(Cue.MISSILE);
+  else if (tl === ThreatLevel.LOCK) audio.play(Cue.LOCK);
+
+  // Ground proximity. ALTITUDE is "low and descending"; PULL UP is a trajectory
+  // test, and needs the ground AHEAD as well as the ground below, or level flight
+  // into a ridge reads as safe until impact.
+  //
+  // NOTHING FIRES UNTIL THE PLAYER HAS ACTUALLY BEEN FLYING FOR A FEW SECONDS.
+  // On the deck and through the catapult the aircraft is 20 m over water and
+  // sinks off the bow before the wing takes over, so a trajectory warning is
+  // guaranteed at the exact moment the player has no control and the launch's own
+  // sound should own the mix. `playerFliesFor` resets whenever control is taken
+  // away, so the grace also covers a respawn and the recovery autopilot.
+  if (director.playerFlies) playerFliesFor += dt;
+  else playerFliesFor = 0;
+  if (director.playerFlies && playerFliesFor >= AUDIO.warnGraceSeconds && physics.state.queries) {
+    const look = AUDIO.lookSeconds * Math.max(flightState.speed, 1);
+    // Forward is (-sin h, -cos h). Sampled on the heading rather than the
+    // quaternion's nose: the warning is about where the aircraft is GOING.
+    const ax = flightState.position.x - Math.sin(flightState.heading) * look;
+    const az = flightState.position.z - Math.cos(flightState.heading) * look;
+    // Clearance the aircraft WOULD have over that ground if it held this height.
+    // Null when there is no terrain index, so the rule falls back to the
+    // vertical test rather than inventing a number.
+    const aglAhead = terrainIndexed ? flightState.position.y - groundAt(ax, az) : null;
+    const warn = groundWarning({
+      agl: physics.state.agl,
+      sink: flightState.sink,
+      aglAhead,
+      forwardImminent: physics.state.forwardImminent,
+      airborne: true,
+      // The water floor is height-only and water-only (§16). Over terrain the
+      // corridor is flown low on purpose and the forward probe supplies the
+      // warning instead.
+      overWater: physics.state.surface === SURFACE.OCEAN,
+    });
+    if (warn) audio.play(warn);
+    _tti = secondsToGround({ agl: physics.state.agl, sink: flightState.sink, aglAhead });
+  } else {
+    _tti = Infinity;
+  }
+
+  // 04.6 — a hostile crossing close aboard, once per pass rather than once per
+  // frame. Atmosphere, and the only cue the player cannot act on.
+  if (engaged) {
+    const hr = hostileAi.state.range;
+    if (flybyTriggered(hr, _prevHostileRange, dt)) audio.play(Cue.FLYBY);
+    _prevHostileRange = hr;
+  } else {
+    _prevHostileRange = Infinity;
+  }
+  // §Flares — moved and tested against every enemy round in the air. Order
+  // matters: this runs AFTER missiles.update() so a round that was decoyed this
+  // frame has already had its guidance zeroed by the time it next steers.
+  flares.update(
+    missiles ? missiles.live.filter((m) => m.owner !== "player") : [],
+    aircraftRoot.position,
+    dt
+  );
+  // §13 — both magazines come back on their own, on independent timers, so an
+  // empty aircraft two minutes in is a pause rather than a dead run.
+  if (rearm) rearm.update(dt);
+  audio.update(dt);
+
+  /* ---- atmospheric FX: read published state, write only their own visuals ---- */
+  /**
+   * §2/§48-50 — the environment is advanced HERE, once, for every mode. There is
+   * no per-mode branch: MISSION, FREE and PEACE all read the same clock, which
+   * is why switching modes cannot change the time of day.
+   */
+  worldClock.advance(dt);
+  const env = environmentFor(worldClock.tau);
+  applyEnvironment(env, dt);
+
+  atmosphere.update(aircraftRoot.position, dt);
+
+  const pitchNow = flightState.pitch / DEG;
+  // Damped so a single-frame attitude jump (a recovery restore, a mode switch)
+  // cannot read as a 400 deg/s pull and light the vapor for one frame.
+  const rawRate = dt > 1e-4 ? (pitchNow - prevPitchDeg) / dt : 0;
+  pitchRateDeg += (rawRate - pitchRateDeg) * Math.min(1, dt * 9);
+  prevPitchDeg = pitchNow;
+
+  engineFx.update({ throttle: flightState.throttle, afterburner: flightState.afterburner, speed: flightState.speed }, dt);
+  vaporFx.update(
+    {
+      camera,
+      humidity: atmosphere.state.humidity,
+      bankDeg: bankDegrees(flightState),
+      pitchRateDeg,
+      stickX: input.x,
+      stickY: input.y,
+    },
+    dt
+  );
+
+  combatHud.update(
+    {
+      camera,
+      expert: isExpert(flightState),
+      mode: flightState.mode,
+      speed: flightState.speed,
+      alt: aircraftRoot.position.y,
+      throttle: flightState.throttle,
+      afterburner: flightState.afterburner,
+      position: aircraftRoot.position,
+      forward: _fwd,
+      up: _up,
+      velocityDir: _velDir,
+      missiles: rounds ? rounds.count : 0,
+      weapon,
+      gun: gun.state,
+      targeting: targeting.state,
+      // The target the HUD brackets is whatever targeting settled on — which may
+      // be a SAM site. This was hardcoded to the drone, so a locked ground target
+      // drew no bracket, no lock diamond and no range: the lock worked and the
+      // player had no way to know, which reads exactly like "I cannot lock SAM".
+      target: targeting.state.currentTarget || (engaged ? drone : null),
+      advisory: atmosphere.state.advisory,
+      // Cloud dims the target bracket rather than hiding it: harder to read,
+      // never impossible (§36).
+      visibility: atmosphere.state.visibility,
+      threat: threat.state,
+      hit: hitResponse.state,
+      // §17/§18 — the navigation cue. Quiet, world-projected, and suppressed
+      // entirely while a missile is inbound.
+      nav: navCtx(),
+      radar: radarCtx(),
+      missionCue: director.cue,
+      missionCueAlpha: director.cueAlpha,
+      // Keep the instruments clear of the developer rail at narrow widths.
+      safeLeft: hudSafeLeft,
+    },
+    dt
+  );
+
+  // The ocean is 100 km wide and static — only the sky rides the camera.
+  sky.position.copy(camera.position);
+
+  updateHud(dt);
+  renderer.render(scene, camera);
+}
+
+let frameErrors = 0;
+
+/**
+ * The render loop, made unkillable.
+ *
+ * `requestAnimationFrame` used to be the LAST statement of the frame body, so a
+ * single thrown exception anywhere in a frame meant the loop was never
+ * rescheduled and the game stopped dead — leaving the last rendered image on
+ * screen. That is exactly how a crash presentation bug turned into "the whole
+ * game is frozen with a fireball on it": the theatre started, one frame threw,
+ * and nothing ever ran again. A presentation defect should never be able to end
+ * the session.
+ *
+ * So: schedule first, then run the frame inside a guard. A bad frame is skipped,
+ * not fatal. The error is logged (the first few times — a throw that repeats every
+ * frame must not flood the console), and if it happened while the player was
+ * being killed we fail SAFE toward playable rather than leaving them stuck
+ * watching an explosion that will never end.
+ */
+function frame() {
+  requestAnimationFrame(frame);
+  try {
+    step();
+  } catch (err) {
+    frameErrors += 1;
+    if (frameErrors <= 3) console.error("[frame] recovered from a thrown frame", err);
+    if (crashFx.state.active || missionFailure.state.active) {
+      // The crash could not be presented. Do not trap the player in it.
+      missionFailure.reset();
+      restartMission();
+    }
+  }
+}
+
+/* ---- load, then fly ---- */
+const loadingEl = document.getElementById("loading");
+const noteEl = document.getElementById("asset-note");
+const failures = [];
+
+const settle = (label, promise) =>
+  promise.then(
+    (value) => value,
+    (err) => {
+      console.error(`[world] ${label} FAILED —`, err);
+      failures.push(`${label}: ${err.message || err}`);
+      return null;
+    }
+  );
+
+Promise.all([
+  settle("F-15", loadF15(modelCorrection)),
+  settle("carrier", loadCarrier(world.carrierRoot, world.carrierCorrection)),
+  settle("terrain", loadTerrain(world.terrainRoot, world.terrainCorrection)),
+  settle("AIM-9", loadAim9()),
+  settle("F-16C", loadHostileFighter()),
+  settle("SAM launcher", loadSamLauncher()),
+]).then(([f15, carrier, terrain, aim9, hostileModel, samModel]) => {
+  carrierReport = carrier;
+  terrainReport = terrain;
+
+  // Weapons come up with the world: the prototype is cloned onto the mounts and
+  // again per launch, so the glTF is parsed exactly once.
+  const prototype = (aim9 && aim9.prototype) || null;
+  rounds = createMountedMissiles(mountSet, prototype);
+  missiles = createMissileSystem({
+    scene,
+    prototype,
+    // §21: the missile system does not know what a barrel roll is. It asks how
+    // much guidance this round still has, and the threat monitor answers.
+    //
+    // Stage 04.2 composes a second, independent penalty on top for SAM rounds:
+    // one that has lost sight of the player keeps almost nothing. That belongs
+    // here rather than in threat.js, because this is the only layer that knows
+    // where the ground is — and it means terrain masking defeats a round already
+    // in the air, not just an acquisition.
+    authorityFor: (m) => {
+      const base = threat.authorityFor(m, _evasion);
+      if (m.owner !== "sam") return base;
+      return lineOfSight(m.position, aircraftRoot.position, groundAt) ? base : Math.min(base, SAM.maskedAuthority);
+    },
+    // §29: a round that flies into the island dies there. One terrain sample per
+    // missile per frame, on the index physics already built.
+    groundAt: (x, z) => {
+      const h = physics.sampleTerrainBelow({ x, y: 0, z });
+      return h.foundTerrain ? h.terrainHeight : WORLD.oceanY;
+    },
+  });
+  missiles.on("hit", ({ missile, target }) => {
+    if (missile.owner === "hostile" || missile.owner === "sam") {
+      // §30/§31 — an event, not a reset call.
+      hitResponse.apply(
+        createPlayerDamageEvent({ source: DamageSource.MISSILE, at: performance.now() / 1000, position: missile.position })
+      );
+      return;
+    }
+    announceKill(target, missile.position);
+  });
+  missiles.on("expire", ({ missile }) => {
+    if (missile.owner === "hostile" || missile.owner === "sam") {
+      // §43 — only announce a miss that was going to be a hit, or the player
+      // learns nothing from the word.
+      if (evadeEarned(missile.minRange)) {
+        combatHud.flash("EVADE", "good");
+        director.stats.evasions += 1;
+      }
+      return;
+    }
+    if (targeting.state.currentTarget) combatHud.flash("MISSILE LOST");
+  });
+  if (aim9 && aim9.placeholder) failures.push("AIM-9: placeholder missile body in use");
+
+  // Physics comes up only once the terrain geometry exists (§34): queries
+  // against an undefined island are the one edge case worth designing out
+  // rather than guarding at every call site.
+  const index = physics.setTerrain(world.terrainRoot);
+  terrainIndexed = !!index;
+  physics.reset(flightState);
+  if (index) {
+    console.log("[physics] terrain index", benchmarkTerrainQuery(index, physics.terrainMeshes));
+  } else {
+    console.warn("[physics] no terrain geometry — ocean contact only");
+  }
+  if (carrier && carrier.anchors) {
+    anchorDebug = createCarrierAnchorDebug(carrier.anchors);
+    console.log("[carrier] references", carrier.references);
+  }
+
+  /* ---- Stage 05.4: night lights ---- */
+  /**
+   * Built once, after the terrain exists, because placement is terrain-aware:
+   * every light is queried against the real height field so none of them stand
+   * in the sea or on a peak (§37). Doing it at load costs a few hundred terrain
+   * queries once and nothing per frame.
+   */
+  if (terrainIndexed && terrain && terrain.ok) {
+    const halfX = (terrain.normalizedSize ? terrain.normalizedSize.x : 24857) / 2;
+    const spanZ = terrain.normalizedSize ? terrain.normalizedSize.z : 30000;
+    const bounds = {
+      minX: -halfX * 0.86,
+      maxX: halfX * 0.86,
+      minZ: terrain.nearEdgeZ - spanZ * 0.9,
+      maxZ: terrain.nearEdgeZ - 400,
+    };
+    const plan = planSettlements({ bounds, sampleHeight: groundAt });
+    settlementLights = createSettlementLights(plan);
+    scene.add(settlementLights.points);
+    console.log("[lights] settlements", {
+      lights: plan.count,
+      major: plan.clusters.filter((c) => c.kind === "major").length,
+      minor: plan.clusters.filter((c) => c.kind === "minor").length,
+      draws: 1,
+    });
+  }
+  if (carrier && carrier.references) {
+    carrierLights = createCarrierLights(carrier.references, { length: carrier.length });
+    world.carrierRoot.add(carrierLights.root);
+  }
+
+  /* ---- Stage 04.0: arm the mission ---- */
+  f15Visual = (f15 && f15.visual) || null;
+  if (carrier && carrier.anchors) {
+    // §6 — the deck spot and the release point come from the measured anchors.
+    // There is not a single deck coordinate in the launch or mission code.
+    launchAnchors = {
+      start: carrier.anchors.launchStart.getWorldPosition(new THREE.Vector3()),
+      end: carrier.anchors.launchEnd.getWorldPosition(new THREE.Vector3()),
+    };
+  } else {
+    // The carrier failed to load. The mission still has to be flyable, so the
+    // launch frame falls back to the authored offsets on an assumed deck height.
+    const L = WORLD.carrier.targetLength;
+    const ref = WORLD.carrier.references;
+    const cz = WORLD.carrier.position.z;
+    launchAnchors = {
+      start: new THREE.Vector3(0, 20, cz + ref.launchStartZ * L),
+      end: new THREE.Vector3(0, 20, cz + ref.launchEndZ * L),
+    };
+    failures.push("carrier: launch frame using authored fallback anchors");
+  }
+  const plan = launch.arm(launchAnchors.start, launchAnchors.end);
+  const route = buildRoute();
+  // Stage 04.2 — six sites, placed from the surveyed terrain route and dropped
+  // onto the ground. Two per inland leg, flanking the corridor.
+  const samPlan = planSamSites(route, groundAt);
+  const sites = samPlan.map((p) => createSamSite({ position: p, name: p.name }));
+  // One loaded prototype, one clone per site: three.js clone(true) copies the
+  // node tree and REUSES geometries and materials, so six launchers cost six
+  // transform hierarchies rather than six copies of a 20 MB mesh.
+  if (samModel) for (const s of sites) installSamVisual(s, samModel.prototype.clone(true));
+  else failures.push("SAM launcher: placeholder blockout in use");
+  for (const s of sites) combatRoot.add(s.root);
+  samNet.setSites(sites);
+  samNet.setActive(false);
+  console.log("[sam] sites", samPlan.map((p) => `${p.name} @ ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`));
+  // §13 — rearm needs the loaded stores, so it is built here and nowhere else.
+  rearm = createRearmSystem({
+    rounds,
+    gun,
+    onRearm: (label) => combatHud.flash(`${label} REARMED`, "good"),
+  });
+  console.log("[audio]", audio.report);
+  // Availability is settled by a readiness deadline inside the director, not by
+  // `error` events — those never fire for a missing file on this server. The
+  // director announces the settled picture itself, so the log cannot drift out of
+  // step with the deadline the way a second hand-typed timeout did.
+  audio.on("resolved", (report) => console.log("[audio] resolved", report));
+  // §40 — the mission owns the collision response from here. G swaps back to
+  // the development rewind without touching detection.
+  setResponsePolicy(missionFailure);
+  applyMode(mode);
+  restartMission();
+  console.log("[launch] plan", {
+    runMetres: +plan.run.toFixed(1),
+    strokeSeconds: +plan.time.toFixed(2),
+    exitSpeed: +plan.exitSpeed.toFixed(1),
+    clampedFrom: +plan.wanted.toFixed(2),
+    handoffSpeed: LAUNCH.handoffSpeed,
+    totalSeconds: +(LAUNCH.deckDwell + plan.time + LAUNCH.handoffAt).toFixed(2),
+  });
+
+  if (f15 && f15.placeholder) failures.push("F-15: placeholder airframe in use");
+  // The hostile is ONE instance reused by every encounter (§43), so its visual
+  // is swapped once here rather than per deploy.
+  if (hostileModel) installHostileVisual(drone, hostileModel.prototype);
+  else failures.push("F-16C: placeholder UCAV in use");
+  if (failures.length) {
+    noteEl.innerHTML = failures.map((f) => `asset error &mdash; ${f}`).join("<br />");
+    noteEl.hidden = false;
+  }
+
+  console.log("[world] scale check", {
+    f15Length: 19.4,
+    carrierLength: carrier && carrier.length,
+    carrierToCoastKm: carrier && terrain ? +((carrier.position.z - terrain.nearEdgeZ) / 1000).toFixed(2) : null,
+    spawnToCarrierKm: carrier ? +distanceKm(flightState.position, carrier.center).toFixed(2) : null,
+    ocean: `${WORLD.oceanSize / 1000} km`,
+    camera: { near: camera.near, far: camera.far },
+    fog: { type: "FogExp2", color: hazeHex, density: WORLD.fogDensity },
+  });
+
+  console.log("[atmos] cloud field", atmosphere.report);
+
+  window.__flightLab = { scene, camera, aircraftRoot, flightState, world, WORLD, FLIGHT, SPEED, THROTTLE, EXPERT, CHASE, PHYSICS, RECOVERY, physics, recovery, physicsDebug, carrier, terrain, WEAPONS, TARGETING, MISSILE, ENEMY, GUN, HOSTILE, HOSTILE_MISSILE, THREAT, mountSet, rounds, missiles, targeting, drone, hostileAi, threat, hitResponse, playerEntity, combatHud, tryFire, gun, WeaponMode, get weapon() { return weapon; }, input, ENGINE_FX, VAPOR, ATMOS, engineFx, vaporFx, atmosphere, MISSION, MissionPhase, LAUNCH, MISSION_FAILURE, director, launch, missionFailure, navRoot, restartMission, REARM, AUDIO, Cue, Priority, audio, SAM, SAM_MISSILE, SamState, samNet, FLARE, flares, CRASH, CrashCause, crashFx, step, GameMode, MODES, SANDBOX, sandbox, applyMode, lineOfSight, get mode() { return mode; }, get rearm() { return rearm; }, get route() { return director.route; }, get policy() { return physicsPolicy.name; } , worldClock, DAY, environmentFor, oceanVisual, OCEAN, LIGHTS, get settlementLights() { return settlementLights; }, get carrierLights() { return carrierLights; }, sun, moon, skyFill, sky, atmosphere };
+
+  loadingEl.hidden = true;
+  combatHud.reveal();
+  measureRail();
+  lastTime = performance.now();
+  frame();
+});
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  measureRail();
+});
+
+if (new URLSearchParams(location.search).has("test")) import("./flight.test.js");

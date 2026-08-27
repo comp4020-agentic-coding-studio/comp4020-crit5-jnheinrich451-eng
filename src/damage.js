@@ -1,83 +1,83 @@
-// PlayerDamageEvent and the feedback response. CLAUDE.md §4, stage 6.
-//
-// Taking a hit is an EVENT, not a reset call. Missile code must never call
-// anything that resets the flight state (§4's corollary) -- it emits, and a
-// response policy decides what a hit MEANS. This stage's response is feedback
-// only: a red veil, a HIT label, a camera kick. Stage 7 replaces the
-// CONSEQUENCE without touching a line of weapon code.
-
 /**
- * @typedef {{
- *   source: string, at: number,
- *   position: {x:number,y:number,z:number},
- *   amount: number, owner: string,
- * }} PlayerDamageEvent
+ * Stage 03.3 §30–§32 — the player taking a hit.
+ *
+ * Deliberately the same shape as Stage 02.3's collision architecture: the thing
+ * that detects damage produces an *event* and knows nothing else; a response
+ * policy decides what a hit means. Missile code never calls resetFlight() (§31),
+ * so replacing this development response with a real breakup-and-crash sequence
+ * later touches no weapon code.
  */
 
-const HOLD_SECONDS = 0.55;
-const COOLDOWN_SECONDS = 0.9;
-const CAMERA_KICK = 0.5;
+export const DamageSource = { MISSILE: "MISSILE", GUN: "GUN", TERRAIN: "TERRAIN" };
 
-export function createDamageResponse({ addShake, onFeedback } = {}) {
-  let hold = 0;
-  let cooldown = 0;
-  let taken = 0;
-  let last = null;
-
-  return {
-    name: "FeedbackDamageResponse",
-
-    /**
-     * ONE RESPONSE PER HIT.
-     *
-     * A proximity fuze inside a 22 m sphere can trip on consecutive frames,
-     * and a re-entrant response loops forever. Anything arriving while holding
-     * or in cooldown is SWALLOWED -- and swallowed silently, because a warning
-     * per frame is its own kind of loop.
-     */
-    handle(event) {
-      if (hold > 0 || cooldown > 0) return false;
-      hold = HOLD_SECONDS;
-      cooldown = HOLD_SECONDS + COOLDOWN_SECONDS;
-      taken++;
-      last = event;
-      if (addShake) addShake(CAMERA_KICK);
-      if (onFeedback) onFeedback(event);
-      return true;
-    },
-
-    tick(dt) {
-      if (hold > 0) hold = Math.max(0, hold - dt);
-      if (cooldown > 0) cooldown = Math.max(0, cooldown - dt);
-    },
-
-    /** 0..1, for the red veil. Presentation reads this; nothing else does. */
-    veil() {
-      return hold > 0 ? hold / HOLD_SECONDS : 0;
-    },
-    isHolding: () => hold > 0,
-    hitsTaken: () => taken,
-    lastEvent: () => last,
-
-    reset() {
-      hold = 0;
-      cooldown = 0;
-      last = null;
-    },
-    /** Presentation resets; the tally does not (§17.11). */
-    resetAll() {
-      this.reset();
-      taken = 0;
-    },
-  };
+/** The event. Plain data, no behaviour — that is the point. */
+export function createPlayerDamageEvent({ source = DamageSource.MISSILE, at = 0, position = null, amount = 1, owner = "hostile" } = {}) {
+  return { source, at, position, amount, owner };
 }
 
-export function playerDamageEvent({ source, at, position, amount, owner }) {
-  return {
-    source,
-    at,
-    position: { ...position },
-    amount,
-    owner,
+/**
+ * Development response: freeze-frame feedback, then the existing combat reset.
+ *
+ * The one hard requirement is that a hit produces exactly ONE response (§47). A
+ * proximity fuze inside a 22 m sphere can trip on consecutive frames, and a
+ * response that re-entered would loop the reset forever.
+ *
+ * @param onHit      called once, immediately, with the event (HUD flash, shake)
+ * @param onRecover  called when the hold expires (the reset)
+ */
+export function createDevelopmentHitResponse({ onHit = null, onRecover = null, holdTime = 1.0, cooldown = 1.2 } = {}) {
+  const state = {
+    hits: 0,
+    holding: false,
+    remaining: 0,
+    cooldown: 0,
+    lastSource: null,
+    /** 0..1 while the hit is being felt — drives the HUD flash and the camera. */
+    impact: 0,
   };
+  let pending = null;
+
+  function apply(event) {
+    // Already responding, or still settling from the last one: swallow it.
+    if (state.holding || state.cooldown > 0) return false;
+    state.hits += 1;
+    state.holding = true;
+    state.remaining = holdTime;
+    state.impact = 1;
+    state.lastSource = event ? event.source : null;
+    pending = event;
+    if (onHit) onHit(event);
+    return true;
+  }
+
+  function update(dt) {
+    if (state.cooldown > 0) state.cooldown = Math.max(0, state.cooldown - dt);
+    if (!state.holding) {
+      state.impact = Math.max(0, state.impact - dt * 2.5);
+      return state;
+    }
+    state.remaining = Math.max(0, state.remaining - dt);
+    // Impact decays across the hold, so the flash and the camera kick fade
+    // rather than switching off at the reset.
+    state.impact = holdTime > 0 ? state.remaining / holdTime : 0;
+    if (state.remaining <= 0) {
+      state.holding = false;
+      state.cooldown = cooldown;
+      const ev = pending;
+      pending = null;
+      if (onRecover) onRecover(ev);
+    }
+    return state;
+  }
+
+  function reset() {
+    state.holding = false;
+    state.remaining = 0;
+    state.cooldown = 0;
+    state.impact = 0;
+    pending = null;
+    return state;
+  }
+
+  return { state, apply, update, reset, get feedback() { return state.holding ? "HIT" : null; } };
 }

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>audio probe</title>
+    <style>body{font:14px ui-monospace,monospace;background:#0b1420;color:#cfe3f2;padding:1rem;white-space:pre}</style>
+  </head>
+  <body>
+    <pre id="out">probing…</pre>
+    <script>
+      /**
+       * Playability probe. The point of it: a clip the browser cannot STREAM
+       * reports perfect health on every field an element exposes -- readyState 4,
+       * paused false, a correct duration, a full buffered range, no error -- and
+       * play() resolves. The ONLY observable symptom is that currentTime never
+       * advances, so that is what this measures.
+       *
+       * Keep this file. Any future audio asset should be run through it before
+       * being wired into the cue table.
+       */
+      const out = document.getElementById("out");
+      const lines = [];
+      const say = (s) => { lines.push(s); out.textContent = lines.join("\n"); };
+
+      async function probe(url) {
+        const el = new Audio(url);
+        el.volume = 0.0001;
+        await new Promise((res) => {
+          el.addEventListener("canplay", res, { once: true });
+          el.addEventListener("error", res, { once: true });
+          setTimeout(res, 1200);
+        });
+        try { await el.play(); } catch (e) {}
+        await new Promise((r) => setTimeout(r, 600));
+        const t = el.currentTime;
+        el.pause();
+        const name = decodeURIComponent(url.split("/").pop());
+        say(`${(t > 0.05 ? "  OK  " : " SILENT")}  ${name.padEnd(24)} t=${t.toFixed(2)} dur=${Number.isFinite(el.duration) ? el.duration.toFixed(2) : el.duration}`);
+        return t > 0.05;
+      }
+
+      (async () => {
+        /**
+         * ORDER TEST. In every earlier run the first three files probed came back
+         * silent and later ones played, whichever files those were -- which is the
+         * signature of the autoplay policy warming up, not of a bad asset. So the
+         * known-good clips go FIRST here and the suspects LAST. If gun.mp3 now
+         * fails and engine-loop.wav now plays, the files were never the problem.
+         */
+        say("Known-good clips FIRST (were fine when probed late):");
+        for (const n of ["gun.mp3", "missile-hit.mp3", "pull-up.mp3"]) await probe(`assets/audio/${n}`);
+        say("");
+        say("Suspects LAST (were silent when probed early):");
+        let ok = 0, total = 0;
+        for (const n of ["engine-start.wav", "engine-loop.wav", "missile-launch.wav"]) {
+          total++; if (await probe(`assets/audio/${n}`)) ok++;
+        }
+        say("");
+        say("And the original low-rate mp3s, also last:");
+        for (const n of ["engine-start.mp3", "engine-loop.mp3", "missile-launch.mp3"]) await probe(`assets/audio/${n}`);
+        say("");
+        say(ok === total ? `all ${total} suspects played when probed LATE -> order effect, files are fine` : `${total - ok} of ${total} suspects still silent when probed late -> genuinely the files`);
+      })();
+    </script>
+  </body>
+</html>

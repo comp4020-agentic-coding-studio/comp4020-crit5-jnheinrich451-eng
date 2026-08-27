@@ -120,28 +120,12 @@ Axes ramp toward their target rather than snapping (a damping constant around
 arriving. Expose `heldKeys()` so the developer rail can show a stuck axis, and
 bind `C` to clear them manually.
 
-**Pointer steering — the aircraft is the centre.** The aircraft sits at the
-middle of the viewport and follows the cursor; deflection is distance from the
-screen centre.
-
-```
-dead zone   0.10 of the half-viewport   — hovering on the aircraft holds attitude
-full stick  0.52 of the half-viewport
-gain        0.95
-```
-
-Provide `pointerStick(px, py, w, h)` as a pure function, and combine it with the
-keyboard by taking **whichever axis is asking for more**, so a held key always
-overrides a resting cursor and neither input needs to know the other exists.
-
-**The centre is not synthesised.** It is the screen centre, permanently. Do not
-steer from relative movement with a claimed origin: that design was tried and
-abandoned after six fixes — a claimed origin, movement-gated edge drift, keyboard
-claim revocation, a settle timer, pointer-lock deltas and a spring return — each
-of which fixed a real defect and none of which closed the bug, because a
-synthesised centre has no detent the player can see or feel. If steering ever
-needs changing, change the mapping from position; do not reintroduce an origin
-that moves.
+PLACEHOLDER_MOUSE_BLOCK There must be no `pointermove`
+listener in this file. A screen position cannot be a stick: it has no centre, no
+detent and no spring, and every attempt to synthesise those from coordinates
+(relative origin, edge drift, claim revocation, settle timers, pointer lock,
+spring return) fixes one failure mode and leaves the others. The flight axes must
+be unreachable from the pointer as a structural property, not a policy.
 
 ---
 

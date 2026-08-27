@@ -8,6 +8,10 @@ Prerequisite: stage 9 green.
 No new systems. Feature freeze from here: tuning, polish, bug fixing and
 submission only.
 
+Stages 11–13 come *after* this one and respect that freeze — two model
+substitutions and presentation. Walk this checklist again once they are in; the
+additions each carry their own gate, and the last three items below are theirs.
+
 ---
 
 ## Acceptance checklist
@@ -22,7 +26,7 @@ Walk every line. Each is a thing to *do*, not to read.
 - [ ] **The run can be lost:** five pilots, and running out ends it on the
       `Mission Failed` screen
 - [ ] Each death shows the count dropping and dispatches a replacement at 4000 m
-- [ ] `tests.html` is green (target ~1280+ checks)
+- [ ] `tests.html` is green (target ~1400+ checks)
 - [ ] The full sortie completes: deck → launch → egress → intercept → defensive →
       terrain → final → extraction → complete
 - [ ] **Ignoring all combat still completes the mission** — fly straight through and
@@ -31,8 +35,8 @@ Walk every line. Each is a thing to *do*, not to read.
       let every fallback fire
 - [ ] Crashing produces the ~2.3 s presentation and an **automatic** flyable
       respawn: no key press needed, no repeated-explosion loop
-- [ ] Crashing repeatedly in one place escalates the respawn and eventually gets
-      you clear
+- [ ] Crashing over land and over water both respawn at the fixed 4000 m floor —
+      verify the post-condition check fires rather than trusting the number
 - [ ] `R` recovers at any moment, including mid-crash
 - [ ] `T` cycles three working modes; all three fly the catapult; PEACE still kills
       on ground contact and returns you to the deck
@@ -53,6 +57,12 @@ Walk every line. Each is a thing to *do*, not to read.
 - [ ] The HUD never overlaps the developer rail at 900 px wide
 - [ ] Warnings are audible over sustained cannon fire
 - [ ] The game runs with `assets/audio/` emptied, and says so in the load log
+- [ ] `Esc` pauses and resumes: the world frozen, the audio silent, the scene still
+      drawn, and no other key acting while paused
+- [ ] The sky is visibly different two minutes after launch, and the ocean has no
+      visible edge at any altitude the aircraft can reach
+- [ ] The rail names the engine's audio state — `CLICK PAGE` before the first
+      click, a climbing clock after it
 
 ---
 
@@ -84,8 +94,8 @@ expect longer — but you do not know how much longer until you watch someone.
 - **Did they ever press `Z`?** Nothing in the game teaches the flare. The
   countermeasure needing no skill is the one most likely to go unused.
 - **Did the gun feel hard or unusable?** Tracking on A/D and W/S is a real skill
-  step. If it reads as unusable, widen the effective cone — **do not reintroduce
-  mouse steering.**
+  step. If it reads as unusable, widen the effective cone — **do not widen the
+  pointer's authority**, and never go back to steering from relative movement.
 - **Did they climb after the handoff?** They get the aircraft at ~47 m over the
   sea with the first waypoint at 320 m as the cue. A player who ignores it flies
   the whole egress at wave height.
@@ -123,9 +133,14 @@ Do not add these while "polishing":
 ```
 landing · mesh fracture · pilot ejection · parachutes · damage subsystem
 component health · persistent wreckage · fuel · wingmen · scoring system
-music · mouse steering · a second camera rig · a crash state machine
+music · a second camera rig · a crash state machine · a weather system
+an options or settings menu · a reflection camera · a second render pass
 ```
 
 Every one of these was considered and rejected for a stated reason. If one now
 seems necessary, the reason is in the relevant stage file — read it before
 building.
+
+Note that **pointer steering is not on this list**: it is required by §7. What is
+out of scope is steering from *relative* movement with a synthesised origin, which
+was tried, cost six fixes and never worked.

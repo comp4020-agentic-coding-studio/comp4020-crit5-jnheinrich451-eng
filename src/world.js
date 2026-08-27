@@ -1,670 +1,512 @@
-// Scene, ocean, sky, fog, lighting. CLAUDE.md §5, stage 1.
-//
-// 1 world unit = 1 metre, everywhere, with no exceptions. Stage 2 onward
-// normalises every glTF asset from its MEASURED bounds to a real length, so
-// this is the only place the scale of the world is decided.
-
 import * as THREE from "three";
-import { loadGLTF, normalise, recordFailure } from "./assets.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
-export const OCEAN_EXTENT = 100000; // 100 km square
-export const CAMERA_NEAR = 0.5;
-export const CAMERA_FAR = 120000;
-export const FOG_DENSITY = 3.5e-5;
+/**
+ * Stage 02 — World Lab.
+ *
+ * Every world transform lives in WORLD. Nothing else in the project is allowed
+ * to hold a placement constant for the ocean, the carrier or the terrain: the
+ * point of this stage is that composition is tunable from one object.
+ *
+ * Game space (unchanged from Stage 01): 1 unit = 1 m, +Y up, -Z forward.
+ */
+export const WORLD = {
+  oceanY: 0,
+  oceanSize: 100000, // 100 km x 100 km, comfortably past the playable world
+  oceanTile: 90, // metres per texture tile
 
-// The sky's horizon band. The fog is tinted to EXACTLY this colour, which is
-// what stops a visible fog line where the water meets the sky -- fog is not
-// decoration here, it is the atmospheric perspective that keeps a 30 km world
-// from reading as a tabletop model.
-export const HORIZON_COLOR = 0xa8c4dc;
-const ZENITH_COLOR = 0x1e4f86;
-const OCEAN_DEEP = 0x0d2436;
-const OCEAN_SHALLOW = 0x1d5773;
+  // Fog and sky share this colour so the horizon has no seam.
+  haze: 0x9cbad2,
+  fogDensity: 0.000035,
+  skyRadius: 46000,
 
-// Sun direction, shared by the light, the sky glow and the ocean glint so all
-// three agree about where the sun is.
-export const SUN_DIR = new THREE.Vector3(0.42, 0.38, 0.82).normalize();
+  camera: { near: 0.5, far: 120000 },
 
-// Chunks that a custom ShaderMaterial must include by hand once the renderer
-// has logarithmicDepthBuffer on. Miss them and the material writes ordinary
-// depth while everything else writes logarithmic depth -- the ocean then
-// z-fights the terrain and disappears behind the sky at range, which reads as
-// "the shader is broken" rather than "the depth buffers disagree".
-const LOGDEPTH_PARS_VERT = "#include <logdepthbuf_pars_vertex>";
-const LOGDEPTH_VERT = "#include <logdepthbuf_vertex>";
-const LOGDEPTH_PARS_FRAG = "#include <logdepthbuf_pars_fragment>";
-const LOGDEPTH_FRAG = "#include <logdepthbuf_fragment>";
+  carrier: {
+    url: "assets/carrier/scene.gltf",
 
-// <common> must come FIRST in every one of these, because the log-depth and
-// fog chunks below are written against helpers it defines --
-// logdepthbuf_vertex calls isPerspectiveMatrix(), which lives in <common> and
-// nowhere else. Omitting it fails at SHADER LINK time, not at build time:
-// `pnpm check` stays green, the page throws nothing, and the only symptom is
-// a silent WebGL "program not valid" and an empty screen.
-const SKY_VERT = /* glsl */ `
-  #include <common>
-  varying vec3 vWorld;
-  ${LOGDEPTH_PARS_VERT}
-  void main() {
-    vWorld = normalize((modelMatrix * vec4(position, 1.0)).xyz - cameraPosition);
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    ${LOGDEPTH_VERT}
-  }
-`;
+    // The asset is a named vessel: USS Dwight D. Eisenhower (CVN-69),
+    // Nimitz-class, 332.8 m overall. Preferred over the generic 300 m
+    // calibration figure because the real number is known.
+    targetLength: 332.8,
 
-const SKY_FRAG = /* glsl */ `
-  #include <common>
-  uniform vec3 uZenith;
-  uniform vec3 uHorizon;
-  uniform vec3 uSunDir;
-  varying vec3 vWorld;
-  ${LOGDEPTH_PARS_FRAG}
-  void main() {
-    vec3 dir = normalize(vWorld);
-    // Compress the gradient toward the horizon: a linear ramp in height puts
-    // most of the interesting band overhead, where nobody is looking.
-    float h = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-    float band = pow(clamp(1.0 - abs(dir.y), 0.0, 1.0), 3.0);
-    vec3 col = mix(uHorizon, uZenith, smoothstep(0.5, 0.92, h));
-    col = mix(col, uHorizon, band * 0.85);
-    // Warm glow around the sun, widest at the horizon.
-    float sun = max(dot(dir, uSunDir), 0.0);
-    col += vec3(0.42, 0.30, 0.16) * pow(sun, 7.0);
-    col += vec3(0.20, 0.14, 0.07) * pow(sun, 2.2) * band;
-    // NO below-horizon darkening. An earlier version faded the dome to 55%
-    // under dir.y = 0 on the reasoning that the ocean hides it anyway. It
-    // does not: the ocean plane is 100 km wide, so from 900 m its far edge
-    // sits about 1 degree BELOW eye level, and the strip of dome showing
-    // through just under that edge was being darkened ~12% while the fogged
-    // water beside it sat at exactly the fog colour. The result was a hard
-    // grey seam along the whole horizon -- the visible fog line stage 1 says
-    // to avoid, arriving from the sky rather than from the fog.
-    //
-    // Leaving the dome at the horizon colour below the horizon is what makes
-    // the seam impossible rather than merely small: fogged water and open sky
-    // converge on the same value from both sides.
-    gl_FragColor = vec4(col, 1.0);
-    ${LOGDEPTH_FRAG}
-  }
-`;
+    position: new THREE.Vector3(0, 0, -1600), // 1.6 km ahead of the spawn
+    rotationY: 0, // meaningful world heading, applied to CarrierRoot
 
-const OCEAN_VERT = /* glsl */ `
-  #include <common>
-  varying vec3 vWorld;
-  ${LOGDEPTH_PARS_VERT}
-  #include <fog_pars_vertex>
-  void main() {
-    vec4 world = modelMatrix * vec4(position, 1.0);
-    vWorld = world.xyz;
-    // MUST be named mvPosition: <fog_vertex> below is a text include that
-    // reads a variable of exactly that name out of the surrounding scope.
-    // Calling it anything else compiles to "undeclared identifier" inside a
-    // chunk this file never shows.
-    vec4 mvPosition = viewMatrix * world;
-    gl_Position = projectionMatrix * mvPosition;
-    #include <fog_vertex>
-    ${LOGDEPTH_VERT}
-  }
-`;
+    // Source-orientation correction, applied to CarrierModelCorrection on top
+    // of the measured length-axis alignment. Use Math.PI to flip bow/stern.
+    modelYaw: 0,
 
-// The ocean is the only thing on screen in stage 1, and a flat colour plane
-// gives a player NO sense of motion -- at 900 m over featureless water you
-// cannot tell 110 m/s from 250 m/s, which makes the throttle unlearnable.
-// So the surface carries procedural swell whose scale is chosen to be legible
-// at speed, and it fades out with distance because detail that small aliases
-// into noise past a few kilometres and the fog is doing the work by then.
-const OCEAN_FRAG = /* glsl */ `
-  #include <common>
-  uniform float uTime;
-  uniform vec3 uDeep;
-  uniform vec3 uShallow;
-  uniform vec3 uSunDir;
-  uniform vec3 uHorizon;
-  varying vec3 vWorld;
-  ${LOGDEPTH_PARS_FRAG}
-  #include <fog_pars_fragment>
+    // Nimitz-class draft is 11.9 m. The hull bottom is put that far below the
+    // waterline; heightOffset trims it if the model has no underwater hull.
+    draft: 11.9,
+    heightOffset: 0,
 
-  float hash(vec2 p) {
-    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
-  }
-  float vnoise(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    f = f * f * (3.0 - 2.0 * f);
-    return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
-               mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
-  }
-
-  void main() {
-    vec2 p = vWorld.xz;
-    float dist = length(vWorld - cameraPosition);
-    // Detail dies off between 1.5 and 12 km; past that the fog owns the pixel.
-    float detail = 1.0 - smoothstep(1500.0, 12000.0, dist);
-
-    // Three octaves of swell drifting on a fixed wind bearing. Periods are in
-    // metres: ~220 m primary swell, ~70 m secondary, ~24 m chop.
-    vec2 wind = vec2(0.78, 0.62);
-    float s = 0.0;
-    s += vnoise(p / 220.0 + wind * uTime * 0.020) * 0.55;
-    s += vnoise(p / 70.0  - wind * uTime * 0.055) * 0.30;
-    s += vnoise(p / 24.0  + wind * uTime * 0.130) * 0.15;
-    s = (s - 0.5) * detail;
-
-    vec3 col = mix(uDeep, uShallow, clamp(s * 1.6 + 0.5, 0.0, 1.0));
-
-    // A cheap normal from the swell gradient, enough for a moving glint.
-    float e = 3.0;
-    float gx = vnoise((p + vec2(e, 0.0)) / 70.0) - vnoise((p - vec2(e, 0.0)) / 70.0);
-    float gz = vnoise((p + vec2(0.0, e)) / 70.0) - vnoise((p - vec2(0.0, e)) / 70.0);
-    vec3 n = normalize(vec3(-gx * detail * 6.0, 1.0, -gz * detail * 6.0));
-    vec3 viewDir = normalize(cameraPosition - vWorld);
-    vec3 halfV = normalize(viewDir + uSunDir);
-    float spec = pow(max(dot(n, halfV), 0.0), 90.0);
-    col += vec3(1.0, 0.93, 0.78) * spec * 0.9 * detail;
-
-    // Grazing angles pick up the sky rather than the water.
-    float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 4.0);
-    col = mix(col, uHorizon, fres * 0.75);
-
-    gl_FragColor = vec4(col, 1.0);
-    ${LOGDEPTH_FRAG}
-    #include <fog_fragment>
-  }
-`;
-
-export function createWorld(canvas) {
-  const renderer = new THREE.WebGLRenderer({
-    canvas,
-    antialias: true,
-    // Required, not optional. Near 0.5 with a 120 km far plane has nowhere
-    // near enough integer precision for both a 19 m airframe at 24 m and a
-    // coastline 25 km out; without this the whole scene z-fights. §5.
-    logarithmicDepthBuffer: true,
-    powerPreference: "high-performance",
-  });
-  renderer.setPixelRatio(Math.min(globalThis.devicePixelRatio || 1, 2));
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-
-  const scene = new THREE.Scene();
-  const horizon = new THREE.Color(HORIZON_COLOR);
-  scene.fog = new THREE.FogExp2(horizon.getHex(), FOG_DENSITY);
-  scene.background = horizon;
-
-  const camera = new THREE.PerspectiveCamera(
-    59,
-    1,
-    CAMERA_NEAR,
-    CAMERA_FAR,
-  );
-
-  // ── sky ──────────────────────────────────────────────────────────────────
-  // Inside the far plane so it is never clipped, and unfogged: fog on the
-  // dome would flatten the gradient to one colour.
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(CAMERA_FAR * 0.42, 32, 20),
-    new THREE.ShaderMaterial({
-      uniforms: {
-        uZenith: { value: new THREE.Color(ZENITH_COLOR) },
-        uHorizon: { value: horizon.clone() },
-        uSunDir: { value: SUN_DIR.clone() },
-      },
-      vertexShader: SKY_VERT,
-      fragmentShader: SKY_FRAG,
-      side: THREE.BackSide,
-      depthWrite: false,
-      fog: false,
-    }),
-  );
-  sky.frustumCulled = false;
-  scene.add(sky);
-
-  // ── ocean ────────────────────────────────────────────────────────────────
-  const oceanUniforms = THREE.UniformsUtils.merge([
-    THREE.UniformsLib.fog,
-    {
-      uTime: { value: 0 },
-      uDeep: { value: new THREE.Color(OCEAN_DEEP) },
-      uShallow: { value: new THREE.Color(OCEAN_SHALLOW) },
-      uSunDir: { value: SUN_DIR.clone() },
-      uHorizon: { value: horizon.clone() },
+    // Stage 02.2 reference anchors, as fractions of the measured length so
+    // retuning targetLength moves them with the ship. Bow is -Z.
+    references: {
+      deckOffsetZ: 0.0, // deck centre, along the ship
+      launchStartZ: 0.16, // aft end of the future catapult run
+      launchEndZ: -0.44, // release point, short of the bow
+      launchLateralX: 0.0, // centreline; move to port when the cats are chosen
+      approachDistance: 1500, // metres astern of the stern
+      approachAltitude: 140,
     },
-  ]);
-  const oceanMat = new THREE.ShaderMaterial({
-    uniforms: oceanUniforms,
-    vertexShader: OCEAN_VERT,
-    fragmentShader: OCEAN_FRAG,
-    fog: true,
-  });
-  const ocean = new THREE.Mesh(
-    new THREE.PlaneGeometry(OCEAN_EXTENT, OCEAN_EXTENT, 1, 1),
-    oceanMat,
-  );
-  ocean.rotation.x = -Math.PI / 2;
-  ocean.frustumCulled = false;
-  scene.add(ocean);
+  },
 
-  // ── lighting ─────────────────────────────────────────────────────────────
-  const sun = new THREE.DirectionalLight(0xfff2dc, 2.4);
-  sun.position.copy(SUN_DIR).multiplyScalar(1000);
-  scene.add(sun);
-  scene.add(new THREE.HemisphereLight(HORIZON_COLOR, OCEAN_DEEP, 1.15));
+  terrain: {
+    url: "assets/ireland/scene.gltf",
 
-  function resize() {
-    const w = canvas.clientWidth || globalThis.innerWidth || 1;
-    const h = canvas.clientHeight || globalThis.innerHeight || 1;
-    renderer.setSize(w, h, false);
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
-  }
+    // Deliberately game-compressed: real Ireland is ~480 km. 30 km puts the
+    // whole island inside a few minutes of flight at 170-250 m/s.
+    targetHorizontalSize: 30000,
+    horizontalScaleMultiplier: 1,
 
-  function update(dt, state) {
-    oceanMat.uniforms.uTime.value += dt;
-    // Keep the sky and the ocean centred on the player. The ocean is 100 km
-    // and the world is 30 km, so this never shows an edge, and it means
-    // neither has to be large enough to cover the whole flyable area.
-    if (state) {
-      sky.position.copy(camera.position);
-      ocean.position.x = state.position.x;
-      ocean.position.z = state.position.z;
-    }
-  }
+    // The source tile carries only ~380 m of relief across its whole extent,
+    // so at 1x it reads as a plain. 2x is the Stage 02 starting point; try
+    // 1.0 / 1.5 / 2.0 / 2.5 and pick visually.
+    verticalScaleMultiplier: 2,
 
-  return {
-    renderer,
-    scene,
-    camera,
-    ocean,
-    sky,
-    sun,
-    resize,
-    update,
-    render: () => renderer.render(scene, camera),
-  };
+    rotationY: 0,
+
+    // This asset has no coastline of its own — it is an inland patch sitting on
+    // a ~900 m pedestal, with no painted sea. So the waterline is *chosen*: the
+    // terrain is sunk until the ocean plane cuts it at this percentile of its
+    // area-weighted low ground, which floods the lowest valleys and leaves a
+    // ragged coast. 0 = whole tile above water, 1 = whole tile submerged.
+    seaLevelPercentile: 0.35,
+    heightOffset: 0, // metres of waterline trim on top of the percentile
+
+    // Placement derives from the measured land, not from a guessed number: the
+    // nearest above-water ground is put this far beyond the carrier, so
+    // retuning scale or waterline keeps the offshore approach the same length.
+    autoPlaceFromCoast: true,
+    coastOffsetFromCarrier: 6000,
+    position: new THREE.Vector3(0, 0, -22000), // used when autoPlace is off
+  },
+};
+
+/* ---- pure helpers (no THREE, unit-testable) ---- */
+
+/** Which horizontal axis of a measured size is the object's length. */
+export function longestHorizontalAxis(size) {
+  return size.x > size.z ? "x" : "z";
 }
 
-// ── terrain (stage 3) ──────────────────────────────────────────────────────
-
-export const TERRAIN_ACROSS = 30000; // 30 km, §5
-export const TERRAIN_PEAK = 643;  // §5, the target for the vertical scale
-export const COASTLINE_Z = -7600; // where the measured near edge is placed
-const TERRAIN_URL = "./models/terrain/scene.gltf";
-
-/**
- * Load the heightfield, normalise it from measured bounds, and position it so
- * its MEASURED coastline lands on COASTLINE_Z.
- *
- * §5: nothing hardcodes a world coordinate. -7600 is where the coast is *put*,
- * not where the mesh happens to end -- the mesh carries seabed well past the
- * waterline, so the bounding-box edge is not the coast. The report publishes
- * what was actually measured, because the mission route, the SAM placement and
- * the distance-to-coast readout all derive from it.
- */
-export async function loadTerrain(scene) {
-  const report = {
-    ok: false,
-    nearEdgeZ: COASTLINE_Z,
-    across: TERRAIN_ACROSS,
-    peakAboveSea: 0,
-    verticalRange: 0,
-    triangles: 0,
-  };
-
-  let gltf;
-  try {
-    gltf = await loadGLTF(TERRAIN_URL);
-  } catch (err) {
-    recordFailure("terrain", err && err.message ? err.message : err);
-    console.warn("terrain missing -- the game stays playable over open water");
-    return { report, group: null };
-  }
-
-  const model = gltf.scene;
-  // Already Y-up with its long axis on Z (verified by composing the file's
-  // node matrices, not by reading raw accessors -- that mistake is what made
-  // the F-15 fly knife-edge). So no orientation correction, and the axis that
-  // gets normalised is the longest horizontal one.
-  //
-  // recentre "xz", NOT "xyz": this mesh carries real bathymetry, and its own
-  // y = 0 is sea level. Sliding that to the middle of the bounding box put
-  // the shoreline 321 m up a hillside and made the coast measurement below
-  // meaningless -- the samples then reported "land" three kilometres out to
-  // sea and every number after it was quietly wrong.
-  const norm = normalise(model, {
-    targetLength: TERRAIN_ACROSS,
-    axis: "z",
-    recentre: "xz",
-  });
-  if (!norm.ok) {
-    recordFailure("terrain", norm.reason);
-    return { report, group: null };
-  }
-
-  // The vertical scale is SEPARATE, and measured rather than typed.
-  //
-  // §5 asks for three things at once -- 30 km across, ~643 m peak above sea,
-  // ~2595 m total range -- and this asset cannot give all three under one
-  // uniform factor: shrinking Ireland's 486 km to 30 km also flattens its
-  // relief by the same 16x, leaving a 292 m peak and terrain with nothing to
-  // hide behind. Relief is not decoration here: §13's whole SAM mechanic is
-  // line-of-sight, and §10 surveys the route by looking for passes between
-  // flanks. So the horizontal scale comes from the 30 km target and the
-  // vertical from the 643 m one, each measured against what the mesh actually
-  // is. The ratio is reported, not assumed.
-  const peakBefore = norm.box.max.y;
-  const verticalScale = peakBefore > 0 ? TERRAIN_PEAK / peakBefore : 1;
-  model.scale.y *= verticalScale;
-  model.updateWorldMatrix(true, true);
-
-  // Collect world-space triangles once. They are needed for the coastline
-  // measurement here and for the grid index in physics.js, and walking the
-  // geometry twice would double the only expensive part of the load.
-  model.updateWorldMatrix(true, true);
-  const tris = collectTriangles(norm.holder);
-  report.triangles = tris.length / 9;
-
-  // Sea level is the model's own y = 0. Measure the coast as the largest z at
-  // which the surface is still above water -- NOT the bounding-box edge.
-  let coastZ = -Infinity;
-  let peak = -Infinity;
-  let lowest = Infinity;
-  for (let i = 0; i < tris.length; i += 3) {
-    const y = tris[i + 1];
-    const z = tris[i + 2];
-    if (y > peak) peak = y;
-    if (y < lowest) lowest = y;
-    if (y >= 0 && z > coastZ) coastZ = z;
-  }
-  if (!(coastZ > -Infinity)) coastZ = norm.box.max.z;
-
-  const shiftZ = COASTLINE_Z - coastZ;
-  norm.holder.position.z += shiftZ;
-  for (let i = 2; i < tris.length; i += 3) tris[i] += shiftZ;
-
-  report.ok = true;
-  report.nearEdgeZ = COASTLINE_Z;
-  report.measuredCoastZ = coastZ;
-  report.shiftZ = shiftZ;
-  report.peakAboveSea = peak;
-  report.seabed = lowest;
-  report.verticalRange = peak - lowest;
-  report.extent = { x: norm.size.x, y: norm.size.y * verticalScale, z: norm.size.z };
-  report.scale = norm.scale;
-  report.verticalScale = verticalScale;
-  report.exaggeration = verticalScale;
-
-  scene.add(norm.holder);
-
-  console.log(
-    `terrain: ${report.triangles.toLocaleString()} tris, ` +
-      `${(norm.size.x / 1000).toFixed(1)} x ${(norm.size.z / 1000).toFixed(1)} km, ` +
-      `peak ${peak.toFixed(0)} m above sea, seabed ${lowest.toFixed(0)} m, ` +
-      `range ${report.verticalRange.toFixed(0)} m`,
-  );
-  console.log(
-    `terrain scale: horizontal ${norm.scale.toExponential(3)} from the 30 km ` +
-      `target, vertical x${verticalScale.toFixed(2)} on top of it from the ` +
-      `${TERRAIN_PEAK} m peak target (peak measured ${peakBefore.toFixed(0)} m before)`,
-  );
-  console.log(
-    `terrain: coast measured at z=${coastZ.toFixed(0)}, shifted ${shiftZ.toFixed(0)} m ` +
-      `to put it on z=${COASTLINE_Z}`,
-  );
-  // §5 also quotes ~2595 m total range. That is NOT the target here -- the
-  // peak is -- so say plainly where the asset lands rather than letting a
-  // quiet mismatch turn into "the SAM ridges are wrong" three stages later.
-  if (Math.abs(report.verticalRange - 2595) > 400) {
-    console.warn(
-      `terrain: total range ${report.verticalRange.toFixed(0)} m against the ` +
-        `~2595 m §5 quotes. The peak is on target at ${peak.toFixed(0)} m; the ` +
-        `difference is all bathymetry, which nothing in the game can reach.`,
-    );
-  }
-
-  return { report, group: norm.holder, triangles: tris };
+/** Yaw that rotates that axis onto Z, the game's forward/course axis. */
+export function alignYaw(axis) {
+  return axis === "x" ? Math.PI / 2 : 0;
 }
 
-// ── carrier (stage 4) ──────────────────────────────────────────────────────
+export function scaleToTarget(measured, target) {
+  return measured > 0 ? target / measured : 1;
+}
 
-export const CARRIER_LENGTH = 332.8; // USS Eisenhower, CVN-69
-export const CARRIER_Z = -1600; // 6.0 km from the measured coast
-const CARRIER_URL = "./models/carrier/scene.gltf";
+export function distanceKm(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) / 1000;
+}
 
-// Where along the deck the catapult run begins and ends, as fractions of the
-// measured deck length. These two fractions are the only authored numbers
-// here: the RUN ITSELF is measured between the resulting anchors, which is
-// what §9 solves the stroke against. On this asset they give
-// (0.90 - 0.30) x 332.8 = 199.7 m, the figure §2 quotes -- but a shorter deck
-// simply produces a shorter run and the stroke re-solves for it.
-// The flight deck of a Nimitz-class carrier stands about 20 m above the
-// waterline. That is a real-world measurement of the real ship, in the same
-// way its 332.8 m length is, and it is what fixes the hull vertically: the
-// mesh carries no waterline marker, so the deck height is the measurable
-// thing to place. Everything else -- the parked pose, the launch reference
-// frame, the deck run -- hangs off the MEASURED deck plane, not off this.
-const DECK_ABOVE_SEA = 20;
-
-const LAUNCH_START_FRACTION = 0.3;
-const LAUNCH_END_FRACTION = 0.9;
+/** Percentile of a numeric list, sorted ascending. */
+export function percentile(values, p) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))))];
+}
 
 /**
- * Find the flight deck by measuring, not by assuming.
- *
- * The deck is the largest horizontal surface on the ship. Histogram the AREA
- * of up-facing triangles by height and take the heaviest bin: the hull sides
- * are vertical and contribute nothing, and the island is tall but small.
- * Using the bounding box top instead would put the deck on the mast.
+ * The most populated bin of a height histogram, returned as the bin's centre.
+ * On a carrier the flight deck is by far the largest flat surface, so the modal
+ * vertex height is the deck — whereas the bounding-box top is the mast, ~47 m
+ * higher. Anything that wants to put an aircraft on the deck needs this one.
  */
-export function measureDeckPlane(triangles, binSize = 1) {
+export function modalHeight(heights, binSize = 2) {
+  if (!heights.length) return null;
   const bins = new Map();
-  for (let i = 0; i < triangles.length; i += 9) {
-    const ax = triangles[i], ay = triangles[i + 1], az = triangles[i + 2];
-    const bx = triangles[i + 3], by = triangles[i + 4], bz = triangles[i + 5];
-    const cx = triangles[i + 6], cy = triangles[i + 7], cz = triangles[i + 8];
-    // Cross product of two edges: its length is twice the area, and its y
-    // component tells us how much the face points upward.
-    const ux = bx - ax, uy = by - ay, uz = bz - az;
-    const vx = cx - ax, vy = cy - ay, vz = cz - az;
-    const nx = uy * vz - uz * vy;
-    const ny = uz * vx - ux * vz;
-    const nz = ux * vy - uy * vx;
-    const len = Math.hypot(nx, ny, nz);
-    if (len === 0) continue;
-    if (ny / len < 0.85) continue; // not a horizontal, upward face
-    const area = len / 2;
-    const y = (ay + by + cy) / 3;
-    const bin = Math.round(y / binSize);
-    bins.set(bin, (bins.get(bin) ?? 0) + area);
-  }
-  let bestBin = null;
-  let bestArea = 0;
-  for (const [bin, area] of bins) {
-    if (area > bestArea) {
-      bestArea = area;
-      bestBin = bin;
+  let bestKey = null;
+  let bestCount = 0;
+  for (const y of heights) {
+    const k = Math.round(y / binSize);
+    const n = (bins.get(k) || 0) + 1;
+    bins.set(k, n);
+    if (n > bestCount) {
+      bestCount = n;
+      bestKey = k;
     }
   }
-  return bestBin === null ? null : { y: bestBin * binSize, area: bestArea };
+  return bestKey * binSize;
 }
 
-export async function loadCarrier(scene) {
-  const report = { ok: false, deckY: 0, runLength: 0 };
-  let gltf;
-  try {
-    gltf = await loadGLTF(CARRIER_URL);
-  } catch (err) {
-    recordFailure("carrier", err && err.message ? err.message : err);
-    // §4/stage 4: fall back to authored offsets on an assumed deck height so
-    // the mission stays flyable, and record that it happened.
-    return { report, group: null, anchors: fallbackAnchors() };
-  }
+/* ---- measurement ---- */
 
-  const model = gltf.scene;
-  // recentre "xz", NOT "xyz" -- the same trap the terrain fell into. Centring
-  // the hull vertically puts the middle of its BOUNDING BOX at y = 0, and
-  // since that box runs from the keel to the top of the mast, the flight deck
-  // lands 8 m UNDER the sea. The hull is placed by its measured deck instead.
-  const norm = normalise(model, {
-    targetLength: CARRIER_LENGTH,
-    axis: "z",
-    recentre: "xz",
+const _box = new THREE.Box3();
+
+export function measure(object) {
+  object.updateMatrixWorld(true);
+  _box.setFromObject(object);
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  _box.getSize(size);
+  _box.getCenter(center);
+  return { size, center, min: _box.min.clone(), max: _box.max.clone() };
+}
+
+const v3 = (v) => ({ x: +v.x.toFixed(2), y: +v.y.toFixed(2), z: +v.z.toFixed(2) });
+
+/* ---- hierarchy ---- */
+
+/**
+ * Scene
+ *  |- WorldRoot
+ *      |- Ocean
+ *      |- CarrierRoot -> CarrierModelCorrection -> CarrierGLTF
+ *      |- TerrainRoot -> TerrainModelCorrection -> IrelandGLTF
+ *
+ * *Root nodes carry world placement. *ModelCorrection nodes carry everything
+ * that is the source asset's fault: its axes, its units, its pivot.
+ */
+export function createWorldHierarchy() {
+  const worldRoot = new THREE.Object3D();
+  worldRoot.name = "WorldRoot";
+
+  const ocean = buildOcean();
+
+  const carrierRoot = new THREE.Object3D();
+  carrierRoot.name = "CarrierRoot";
+  const carrierCorrection = new THREE.Object3D();
+  carrierCorrection.name = "CarrierModelCorrection";
+  carrierRoot.add(carrierCorrection);
+
+  const terrainRoot = new THREE.Object3D();
+  terrainRoot.name = "TerrainRoot";
+  const terrainCorrection = new THREE.Object3D();
+  terrainCorrection.name = "TerrainModelCorrection";
+  terrainRoot.add(terrainCorrection);
+
+  carrierRoot.position.copy(WORLD.carrier.position);
+  carrierRoot.rotation.y = WORLD.carrier.rotationY;
+  terrainRoot.rotation.y = WORLD.terrain.rotationY;
+
+  worldRoot.add(ocean, carrierRoot, terrainRoot);
+  return { worldRoot, ocean, carrierRoot, carrierCorrection, terrainRoot, terrainCorrection };
+}
+
+/**
+ * Stage 02 ocean: one large plane. Intentionally not a water shader — but it
+ * does carry a faint tiling streak texture, because a flat colour gives no
+ * parallax at all and this stage is partly a judgement about speed and scale.
+ */
+function buildOcean() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 256;
+  const g = c.getContext("2d");
+  g.fillStyle = "#3d5265";
+  g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 900; i++) {
+    g.fillStyle = `rgba(205,228,245,${0.05 + Math.random() * 0.14})`;
+    g.fillRect(Math.random() * 256, Math.random() * 256, 2 + Math.random() * 9, 1);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const repeat = WORLD.oceanSize / WORLD.oceanTile;
+  tex.repeat.set(repeat, repeat);
+  tex.anisotropy = 4;
+
+  const ocean = new THREE.Mesh(
+    new THREE.PlaneGeometry(WORLD.oceanSize, WORLD.oceanSize),
+    new THREE.MeshStandardMaterial({ map: tex, color: 0xc4d6e4, roughness: 0.78, metalness: 0.02 })
+  );
+  ocean.name = "Ocean";
+  ocean.rotation.x = -Math.PI / 2;
+  ocean.position.y = WORLD.oceanY;
+  return ocean;
+}
+
+/* ---- loading ---- */
+
+function loadGLTF(url) {
+  return new Promise((resolve, reject) => {
+    new GLTFLoader().load(url, resolve, undefined, (err) =>
+      reject(new Error(`${url} failed to load (${err && err.message ? err.message : "unknown error"})`))
+    );
   });
-  if (!norm.ok) {
-    recordFailure("carrier", norm.reason);
-    return { report, group: null, anchors: fallbackAnchors() };
-  }
+}
 
-  // Which end is the bow? Measured, not guessed: on a carrier the island is
-  // the tallest structure and sits AFT of midships, so the bow is the end
-  // away from the highest point. The launch must run toward -Z (§5), so the
-  // hull is turned if it is facing the other way.
-  let tris = collectTriangles(norm.holder);
-  let highestY = -Infinity;
-  let highestZ = 0;
-  for (let i = 0; i < tris.length; i += 3) {
-    if (tris[i + 1] > highestY) {
-      highestY = tris[i + 1];
-      highestZ = tris[i + 2];
-    }
-  }
-  const islandIsAft = highestZ > 0;
-  if (!islandIsAft) {
-    // Island forward of centre means the model points the other way; turn it.
-    model.rotateY(Math.PI);
-    norm.holder.updateWorldMatrix(true, true);
-    tris = collectTriangles(norm.holder);
-  }
+/**
+ * Stage 02.2 carrier anchors.
+ *
+ * CarrierRoot
+ *  |- CarrierModelCorrection -> CarrierGLTF
+ *  |- References
+ *      |- DeckReference | LaunchStart | LaunchEnd | ApproachReference
+ *
+ * Positioned from the MEASURED deck height and hull length, in CarrierRoot's
+ * local space, so nothing downstream ever holds a raw Sketchfab coordinate or
+ * a world magic number: move or re-yaw the ship and the anchors follow.
+ */
+export function createCarrierReferences(carrierRoot, { length, deckY }) {
+  const cfg = WORLD.carrier.references;
+  const container = new THREE.Object3D();
+  container.name = "References";
 
-  const deck = measureDeckPlane(tris);
-  const deckInModel = deck ? deck.y : norm.size.y * 0.62;
-  if (!deck) recordFailure("carrier deck", "no horizontal deck surface found");
-  // Float the hull so its measured deck sits at deck height above the sea.
-  const lift = DECK_ABOVE_SEA - deckInModel;
-  const deckY = DECK_ABOVE_SEA;
+  // deckY is measured in world space; CarrierRoot may be offset vertically.
+  const localDeckY = deckY - carrierRoot.position.y;
 
-  // The deck's own extent along the hull, at the measured deck height.
-  let deckMinZ = Infinity;
-  let deckMaxZ = -Infinity;
-  for (let i = 0; i < tris.length; i += 3) {
-    if (Math.abs(tris[i + 1] - deckInModel) > 4) continue;
-    const z = tris[i + 2];
-    if (z < deckMinZ) deckMinZ = z;
-    if (z > deckMaxZ) deckMaxZ = z;
-  }
-  if (!(deckMaxZ > deckMinZ)) {
-    deckMinZ = -CARRIER_LENGTH / 2;
-    deckMaxZ = CARRIER_LENGTH / 2;
-  }
-  const deckLength = deckMaxZ - deckMinZ;
-
-  // Bow is -Z, stern is +Z, so the run goes from high z toward low z.
-  const startZ = deckMaxZ - LAUNCH_START_FRACTION * deckLength;
-  const endZ = deckMaxZ - LAUNCH_END_FRACTION * deckLength;
-
-  norm.holder.position.z = CARRIER_Z;
-  norm.holder.position.y = lift;
-  norm.holder.updateWorldMatrix(true, true);
-
-  const anchors = {
-    deck: { x: 0, y: deckY, z: CARRIER_Z },
-    launchStart: { x: 0, y: deckY, z: CARRIER_Z + startZ },
-    launchEnd: { x: 0, y: deckY, z: CARRIER_Z + endZ },
-    // Astern and below the deck: where stage 7's recovery run begins.
-    approach: { x: 0, y: deckY + 120, z: CARRIER_Z + deckMaxZ + 2400 },
-    runLength: Math.abs(endZ - startZ),
-    deckY,
-    deckLength,
-    measured: true,
+  const anchor = (name, x, y, z) => {
+    const o = new THREE.Object3D();
+    o.name = name;
+    o.position.set(x, y, z);
+    container.add(o);
+    return o;
   };
 
-  report.ok = true;
-  report.deckY = deckY;
-  report.deckLength = deckLength;
-  report.runLength = anchors.runLength;
-  report.islandAft = islandIsAft;
-  report.size = { x: norm.size.x, y: norm.size.y, z: norm.size.z };
+  const deck = anchor("DeckReference", 0, localDeckY, cfg.deckOffsetZ * length);
+  const launchStart = anchor("LaunchStart", cfg.launchLateralX * length, localDeckY, cfg.launchStartZ * length);
+  const launchEnd = anchor("LaunchEnd", cfg.launchLateralX * length, localDeckY, cfg.launchEndZ * length);
+  // Astern and above: a future approach gate, not a landing system.
+  const approach = anchor("ApproachReference", 0, localDeckY + cfg.approachAltitude, length / 2 + cfg.approachDistance);
 
-  scene.add(norm.holder);
+  carrierRoot.add(container);
+  carrierRoot.updateMatrixWorld(true);
 
-  console.log(
-    `carrier: measured ${norm.sourceLength.toFixed(1)} -> ${CARRIER_LENGTH} m ` +
-      `(${norm.size.x.toFixed(1)} beam, ${norm.size.y.toFixed(1)} tall), ` +
-      `island ${islandIsAft ? "aft" : "forward -- hull turned"}`,
-  );
-  console.log(
-    `carrier deck: measured at y=${deckInModel.toFixed(1)} in the model ` +
-      `(${deck ? (deck.area / 1000).toFixed(1) + "k m2 of horizontal surface" : "FALLBACK"}), ` +
-      `hull lifted ${lift.toFixed(1)} m so the deck sits ${deckY} m above the sea; ` +
-      `deck runs z ${deckMinZ.toFixed(1)}..${deckMaxZ.toFixed(1)} (${deckLength.toFixed(1)} m)`,
-  );
-  console.log(
-    `carrier anchors: launchStart z=${anchors.launchStart.z.toFixed(1)}, ` +
-      `launchEnd z=${anchors.launchEnd.z.toFixed(1)}, ` +
-      `RUN ${anchors.runLength.toFixed(1)} m`,
-  );
+  const worldOf = (o) => o.getWorldPosition(new THREE.Vector3());
+  const launchRun = worldOf(launchEnd).distanceTo(worldOf(launchStart));
 
-  return { report, group: norm.holder, anchors };
-}
-
-function fallbackAnchors() {
-  // Authored offsets on an assumed deck height, used only when the asset is
-  // missing. The run is still measured from these two points, so the stroke
-  // solver downstream needs no special case.
-  const deckY = 20;
   return {
-    deck: { x: 0, y: deckY, z: CARRIER_Z },
-    launchStart: { x: 0, y: deckY, z: CARRIER_Z + 100 },
-    launchEnd: { x: 0, y: deckY, z: CARRIER_Z - 99.7 },
-    approach: { x: 0, y: deckY + 120, z: CARRIER_Z + 2600 },
-    runLength: 199.7,
-    deckY,
-    deckLength: 332.8,
-    measured: false,
+    container,
+    deck,
+    launchStart,
+    launchEnd,
+    approach,
+    report: {
+      deckY: +deckY.toFixed(1),
+      local: {
+        DeckReference: v3(deck.position),
+        LaunchStart: v3(launchStart.position),
+        LaunchEnd: v3(launchEnd.position),
+        ApproachReference: v3(approach.position),
+      },
+      launchRunMetres: +launchRun.toFixed(1),
+    },
   };
 }
 
-/** Every triangle of an object as a flat world-space Float32Array (9 per tri). */
-export function collectTriangles(root) {
-  const out = [];
-  const v = new THREE.Vector3();
-  root.updateWorldMatrix(true, true);
-  root.traverse((node) => {
-    if (!node.isMesh || !node.geometry) return;
-    const geom = node.geometry;
-    const pos = geom.attributes.position;
-    if (!pos) return;
-    const index = geom.index;
-    const count = index ? index.count : pos.count;
-    for (let i = 0; i < count; i++) {
-      const vi = index ? index.getX(i) : i;
-      v.fromBufferAttribute(pos, vi).applyMatrix4(node.matrixWorld);
-      out.push(v.x, v.y, v.z);
+/**
+ * Carrier normalization. Measured, not assumed: the source is a Sketchfab
+ * export with a Z-up wrapper matrix, so which local axis is ship length is a
+ * runtime question. Length is taken as the longest horizontal dimension and
+ * rotated onto Z, the future course axis.
+ */
+export async function loadCarrier(root, correction) {
+  const gltf = await loadGLTF(WORLD.carrier.url);
+  const visual = gltf.scene;
+  visual.name = "CarrierGLTF";
+  visual.traverse((o) => {
+    if (o.isMesh) o.castShadow = false;
+  });
+
+  correction.add(visual);
+  const source = measure(visual);
+
+  const axis = longestHorizontalAxis(source.size);
+  const lengthSource = axis === "x" ? source.size.x : source.size.z;
+  const scale = scaleToTarget(lengthSource, WORLD.carrier.targetLength);
+
+  correction.rotation.y = alignYaw(axis) + WORLD.carrier.modelYaw;
+  correction.scale.setScalar(scale);
+  correction.position.set(0, 0, 0);
+
+  // Recentre horizontally on CarrierRoot, then drop the hull to its draft.
+  let box = measure(root);
+  correction.position.x -= box.center.x - root.position.x;
+  correction.position.z -= box.center.z - root.position.z;
+  box = measure(root);
+  correction.position.y += WORLD.oceanY - WORLD.carrier.draft + WORLD.carrier.heightOffset - box.min.y;
+
+  const final = measure(root);
+
+  // Deck height is measured from the geometry, not inferred from the bounds:
+  // the bounding-box top is the mast. A raw vertex mode is no good either —
+  // hull plating outvotes the deck. So the ship's footprint is gridded and the
+  // TOP surface of each cell taken; the flight deck is then the most common of
+  // those, because it is the largest single upward-facing area on the vessel.
+  root.updateMatrixWorld(true);
+  const p = new THREE.Vector3();
+  const cells = 48;
+  const spanX = Math.max(final.size.x, 1e-6);
+  const spanZ = Math.max(final.size.z, 1e-6);
+  const tops = new Map();
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    const pos = o.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      p.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      if (p.y <= WORLD.oceanY) continue;
+      const gj = Math.floor(((p.x - final.min.x) / spanX) * cells);
+      const gi = Math.floor(((p.z - final.min.z) / spanZ) * cells);
+      const k = gi * cells + gj;
+      const prev = tops.get(k);
+      if (prev === undefined || p.y > prev) tops.set(k, p.y);
     }
   });
-  return new Float32Array(out);
+  const deckY = modalHeight([...tops.values()], 1);
+
+  const length = +Math.max(final.size.x, final.size.z).toFixed(1);
+  const references = createCarrierReferences(root, {
+    length,
+    deckY: deckY === null ? WORLD.oceanY + 18 : deckY,
+  });
+
+  const report = {
+    ok: true,
+    url: WORLD.carrier.url,
+    sourceSize: v3(source.size),
+    lengthAxis: axis,
+    scale: +scale.toFixed(5),
+    normalizedSize: v3(final.size),
+    length,
+    beam: +Math.min(final.size.x, final.size.z).toFixed(1),
+    draft: +(-final.min.y).toFixed(1),
+    // Highest point on the ship: mast/island, not a surface anything lands on.
+    mastAboveWater: +final.max.y.toFixed(1),
+    // Flight deck: the surface a later catapult/landing stage should spawn on.
+    deckY: deckY === null ? null : +deckY.toFixed(1),
+    position: v3(root.position),
+    rotationYDeg: +((WORLD.carrier.rotationY * 180) / Math.PI).toFixed(1),
+    center: final.center.clone(),
+    references: references.report,
+    anchors: references,
+  };
+  console.log("[carrier]", report);
+  return report;
 }
 
-// A stand-in airframe for stage 1, superseded by the normalised F-15E glTF in
-// stage 2. Deliberately 19.4 m long -- the same length the real asset is
-// normalised to -- so the camera standoff and framing tuned against it do not
-// all have to be re-tuned when the model arrives.
-export function createPlaceholderAircraft() {
-  const group = new THREE.Group();
-  const body = new THREE.Mesh(
-    new THREE.BoxGeometry(2.2, 2.0, 19.4),
-    new THREE.MeshStandardMaterial({ color: 0x6d7683, roughness: 0.55, metalness: 0.4 }),
-  );
-  group.add(body);
-  const wing = new THREE.Mesh(
-    new THREE.BoxGeometry(13.05, 0.5, 4.2),
-    new THREE.MeshStandardMaterial({ color: 0x5a636f, roughness: 0.6, metalness: 0.4 }),
-  );
-  wing.position.z = 1.2;
-  group.add(wing);
-  const tail = new THREE.Mesh(
-    new THREE.BoxGeometry(5.4, 0.45, 2.6),
-    new THREE.MeshStandardMaterial({ color: 0x5a636f, roughness: 0.6, metalness: 0.4 }),
-  );
-  tail.position.set(0, 0.9, 8.2);
-  group.add(tail);
-  return group;
+/**
+ * Area-weighted height field of a terrain subtree, in the space of `object`'s
+ * parent. A grid of per-cell min/max is used rather than raw vertices because
+ * the mesh is adaptive: flat ground has almost no vertices, so a vertex
+ * percentile would report the mountains as typical terrain.
+ */
+export function sampleHeightField(object, cells = 64) {
+  object.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(object);
+  const spanX = Math.max(box.max.x - box.min.x, 1e-6);
+  const spanZ = Math.max(box.max.z - box.min.z, 1e-6);
+  const grid = new Array(cells * cells).fill(null);
+  const p = new THREE.Vector3();
+
+  object.traverse((o) => {
+    if (!o.isMesh) return;
+    const pos = o.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      p.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      const gj = Math.min(cells - 1, Math.max(0, Math.floor(((p.x - box.min.x) / spanX) * cells)));
+      const gi = Math.min(cells - 1, Math.max(0, Math.floor(((p.z - box.min.z) / spanZ) * cells)));
+      const k = gi * cells + gj;
+      const c = grid[k];
+      if (!c) grid[k] = { min: p.y, max: p.y, z: p.z, x: p.x };
+      else {
+        if (p.y < c.min) c.min = p.y;
+        if (p.y > c.max) {
+          c.max = p.y;
+          c.z = p.z;
+          c.x = p.x;
+        }
+      }
+    }
+  });
+
+  const filled = grid.filter(Boolean);
+  return { cells: filled, box, lows: filled.map((c) => c.min) };
+}
+
+/**
+ * Terrain normalization. Horizontal and vertical scale are separate: the source
+ * Ireland tile already exaggerates elevation, and Stage 02 wants that
+ * exaggeration on a dial rather than baked in.
+ */
+export async function loadTerrain(root, correction) {
+  const gltf = await loadGLTF(WORLD.terrain.url);
+  const visual = gltf.scene;
+  visual.name = "IrelandGLTF";
+  visual.traverse((o) => {
+    if (o.isMesh) {
+      o.castShadow = false;
+      o.receiveShadow = false;
+    }
+  });
+
+  correction.add(visual);
+  const source = measure(visual);
+
+  const horizontalSource = Math.max(source.size.x, source.size.z);
+  const base = scaleToTarget(horizontalSource, WORLD.terrain.targetHorizontalSize);
+  const h = base * WORLD.terrain.horizontalScaleMultiplier;
+  const v = base * WORLD.terrain.verticalScaleMultiplier;
+
+  correction.scale.set(h, v, h);
+  correction.position.set(0, 0, 0);
+  root.position.set(0, 0, 0);
+  correction.updateMatrixWorld(true);
+
+  // Waterline first: everything downstream (coast position, reported extents)
+  // depends on where the ocean cuts this tile.
+  const field = sampleHeightField(correction);
+  const seaLevel = percentile(field.lows, WORLD.terrain.seaLevelPercentile);
+  const waterlineY = WORLD.oceanY + WORLD.terrain.heightOffset;
+
+  correction.position.x -= field.box.min.x + (field.box.max.x - field.box.min.x) / 2;
+  correction.position.y += waterlineY - seaLevel;
+  correction.updateMatrixWorld(true);
+
+  // Nearest above-water ground on the +Z side becomes the coast the player
+  // approaches; the tile's geometric edge is irrelevant once it is flooded.
+  const shift = correction.position.y;
+  const land = field.cells.filter((c) => c.max + shift > waterlineY);
+  const landFrontZ = land.length ? Math.max(...land.map((c) => c.z)) : field.box.max.z;
+
+  if (WORLD.terrain.autoPlaceFromCoast) {
+    root.position.set(
+      WORLD.terrain.position.x,
+      0,
+      WORLD.carrier.position.z - WORLD.terrain.coastOffsetFromCarrier - landFrontZ
+    );
+  } else {
+    root.position.copy(WORLD.terrain.position);
+  }
+
+  const final = measure(root);
+  const peak = Math.max(...land.map((c) => c.max + shift), waterlineY);
+  const report = {
+    ok: true,
+    url: WORLD.terrain.url,
+    sourceSize: v3(source.size),
+    horizontalScale: +h.toFixed(5),
+    verticalScale: +v.toFixed(5),
+    verticalMultiplier: WORLD.terrain.verticalScaleMultiplier,
+    normalizedSize: v3(final.size),
+    horizontalExtent: +Math.max(final.size.x, final.size.z).toFixed(0),
+    verticalRange: +final.size.y.toFixed(0),
+    // What the player actually sees: relief above the chosen waterline.
+    seaLevelPercentile: WORLD.terrain.seaLevelPercentile,
+    peakAboveSea: +peak.toFixed(0),
+    landFraction: +(land.length / field.cells.length).toFixed(3),
+    position: v3(root.position),
+    rotationYDeg: +((WORLD.terrain.rotationY * 180) / Math.PI).toFixed(1),
+    // Cached once: the HUD must not rebuild 30 km of bounds every frame.
+    nearEdgeZ: +(landFrontZ + root.position.z).toFixed(0),
+    center: final.center.clone(),
+  };
+  console.log("[terrain]", report);
+  return report;
+}
+
+/** HemisphereLight + sun. Legible relief, no shadow maps over 30 km. */
+export function createWorldLighting() {
+  const sun = new THREE.DirectionalLight(0xfff2df, 2.3);
+  sun.position.set(-4200, 5200, 2600);
+  sun.name = "Sun";
+  const sky = new THREE.HemisphereLight(0xbcd6ea, 0x33424f, 1.15);
+  sky.name = "SkyFill";
+  return { sun, sky };
 }

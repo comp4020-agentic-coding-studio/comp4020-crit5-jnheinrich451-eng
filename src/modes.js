@@ -1,103 +1,161 @@
-// The rules table, and the sandbox driver. CLAUDE.md §11, stage 8.
-//
-// A RULES TABLE, NOT THREE COPIES OF THE GAME. Anything that reads like a mode
-// check elsewhere should be a lookup here.
-//
-// Three-free.
+/**
+ * Stage 04.2 — game modes.
+ *
+ * Until now there was one experience: a four-minute authored sortie you either
+ * completed or restarted. The mission is the *point* of the project, but it is a
+ * bad place to learn to fly, and it is a worse place to just look at the world.
+ * So there are three modes, and the difference between them is a rules table
+ * rather than three copies of the game.
+ *
+ *   MISSION   the authored sortie: phases, nav, checkpoints, a clock, an ending
+ *   FREE      no clock, no phases; hostiles and SAMs keep coming; go anywhere
+ *   PEACE     an empty sky, no clock, no threats — but the ground still kills
+ *
+ * Two things are deliberately the same in all three:
+ *
+ * - **Every mode starts on the carrier deck.** The catapult launch is the best
+ *   thing in the build and it is also the thing that teaches the throttle and
+ *   the camera, so no mode skips it.
+ * - **The ground still kills you in PEACE.** "No hostiles" is not "no
+ *   consequences" — a sky with nothing to hit is not a flight model, it is a
+ *   screensaver. What changes is the cost: you go back to the deck, not to a
+ *   checkpoint, and nothing is being timed.
+ *
+ * The respawn rule is the one real mechanical difference, and it falls out of
+ * work that already exists: `placeOnDeck()` plus the launch sequence IS a
+ * carrier respawn, so the sandbox modes get their loop for free.
+ */
 
-export const MISSION = "MISSION";
-export const FREE = "FREE";
-export const PEACE = "PEACE";
+export const GameMode = { MISSION: "MISSION", FREE: "FREE", PEACE: "PEACE" };
 
-export const MODE_ORDER = [MISSION, FREE, PEACE];
+export const MODE_ORDER = [GameMode.MISSION, GameMode.FREE, GameMode.PEACE];
 
+/**
+ * The whole difference between the modes. Anything that reads like a mode check
+ * elsewhere in the project should be a lookup in here instead.
+ */
 export const MODES = {
-  [MISSION]: {
-    phases: true, timer: true, nav: true,
-    hostiles: true, sams: true,
-    respawn: "crash-relative",
-    lives: 5,
+  MISSION: {
+    label: "OPERATION VECTOR",
+    blurb: "authored sortie",
+    phases: true, // the MissionDirector advances
+    timer: true,
+    nav: true,
+    hostiles: true,
+    sams: true,
+    respawn: "CHECKPOINT",
+    ending: true,
+    /**
+     * Stage 05.0 — only the authored sortie counts pilots. FREE and PEACE are
+     * practice, and counting deaths in a sandbox turns it into a test.
+     */
+    lives: true,
   },
-  [FREE]: {
-    phases: false, timer: false, nav: false,
-    hostiles: true, sams: true,
-    respawn: "carrier",
-    lives: null, // LIVES ARE MISSION ONLY: FREE and PEACE are practice, and
-                 // counting deaths in a sandbox turns it into a test.
-    sandbox: true,
+  FREE: {
+    label: "FREE FLY",
+    blurb: "open sky, live threats",
+    phases: false,
+    timer: false,
+    nav: false,
+    hostiles: true,
+    sams: true,
+    respawn: "CARRIER",
+    ending: false,
+    lives: false,
   },
-  [PEACE]: {
-    phases: false, timer: false, nav: false,
-    hostiles: false, sams: false,
-    respawn: "carrier",
-    lives: null,
-    sandbox: true,
+  PEACE: {
+    label: "PEACE",
+    blurb: "open sky, no threats",
+    phases: false,
+    timer: false,
+    nav: false,
+    hostiles: false,
+    sams: false,
+    respawn: "CARRIER",
+    ending: false,
+    lives: false,
   },
 };
 
-// Two rules identical across all three modes:
-//
-//  - EVERY MODE FLIES THE CATAPULT LAUNCH. It is the strongest moment in the
-//    build and it is what teaches the throttle and the camera.
-//  - THE GROUND STILL KILLS YOU IN PEACE. "No hostiles" is not "no
-//    consequences" -- a sky with nothing to hit is a screensaver. What changes
-//    is the COST: you return to the deck and nothing is timed.
-export const ALWAYS = { launch: true, groundKills: true };
+export function modeRules(mode) {
+  return MODES[mode] || MODES.MISSION;
+}
 
-export const rulesFor = (mode) => MODES[mode] ?? MODES[MISSION];
-export const nextMode = (mode) =>
-  MODE_ORDER[(MODE_ORDER.indexOf(mode) + 1) % MODE_ORDER.length];
+export function nextMode(mode) {
+  const i = MODE_ORDER.indexOf(mode);
+  return MODE_ORDER[(i + 1) % MODE_ORDER.length];
+}
+
+/** Does this mode run the authored phase machine at all? */
+export const isSandbox = (mode) => !modeRules(mode).phases;
+
+export const SANDBOX = {
+  /**
+   * How long after a hostile dies before another shows up. Long enough that a
+   * kill is a moment rather than a conveyor belt, short enough that FREE mode
+   * does not become PEACE mode with extra steps.
+   */
+  hostileRespawn: 12,
+  /**
+   * SAM sites do NOT come back. Six of them is a finite thing to clear, and a
+   * player who has spent four minutes destroying them has earned an empty
+   * valley — the reward for clearing FREE mode is that you can then fly it. A
+   * respawning site would make that work meaningless.
+   */
+  samRespawn: null,
+  /** First hostile appears a beat after the player has the aircraft. */
+  firstHostile: 8,
+};
 
 /**
- * The sandbox driver, DELIBERATELY TINY: no waves, no difficulty curve, no
- * hidden score. One hostile at a time, respawning 12 s after a kill, first
- * arrival 8 s after the handoff.
+ * The sandbox driver: what MISSION's phase machine does for FREE and PEACE.
+ *
+ * It is deliberately tiny. There is no wave logic, no difficulty curve and no
+ * director — one hostile at a time, respawning on a timer, and whatever SAM
+ * sites are left. FREE mode is a place to practise, not a survival mode with a
+ * hidden score.
+ *
+ * @param spawnHostile () => void   place and activate the hostile
+ * @param setHostile   (on) => void
+ * @param setSams      (on) => void
  */
-export const SANDBOX = { firstArrival: 8, respawnAfter: 12 };
+export function createSandbox({ spawnHostile = null, setHostile = null, setSams = null, cfg = SANDBOX } = {}) {
+  const state = { mode: GameMode.FREE, live: false, respawn: 0, spawns: 0, elapsed: 0 };
 
-export function createSandbox({ cfg = SANDBOX } = {}) {
-  let timer = 0;
-  let armed = false;
-  let spawns = 0;
+  /** Called once when the player receives control in a sandbox mode. */
+  function begin(mode) {
+    const rules = modeRules(mode);
+    state.mode = mode;
+    state.live = true;
+    state.elapsed = 0;
+    state.spawns = 0;
+    state.respawn = rules.hostiles ? cfg.firstHostile : Infinity;
+    if (setSams) setSams(!!rules.sams);
+    if (setHostile) setHostile(false);
+    return state;
+  }
 
-  return {
-    spawnCount: () => spawns,
-    pending: () => (armed ? Math.max(0, timer) : null),
+  /** @param hostileAlive is the current hostile still flying? */
+  function update({ hostileAlive }, dt) {
+    if (!state.live) return state;
+    state.elapsed += dt;
+    if (!Number.isFinite(state.respawn)) return state;
+    if (hostileAlive) return state; // one at a time, always
+    state.respawn -= dt;
+    if (state.respawn > 0) return state;
+    state.respawn = cfg.hostileRespawn;
+    state.spawns += 1;
+    if (spawnHostile) spawnHostile();
+    return state;
+  }
 
-    /** @returns true on the frame a hostile should be deployed. */
-    update(dt, { mode, handedOff, hostileAlive }) {
-      const rules = rulesFor(mode);
-      // PEACE spawns NOTHING, however long you fly.
-      if (!rules.sandbox || !rules.hostiles || !handedOff) {
-        armed = false;
-        return false;
-      }
-      if (!armed) {
-        armed = true;
-        timer = cfg.firstArrival;
-        return false;
-      }
-      // ONE AT A TIME: nothing is queued while one is alive.
-      if (hostileAlive) {
-        timer = cfg.respawnAfter;
-        return false;
-      }
-      timer -= dt;
-      if (timer <= 0) {
-        timer = cfg.respawnAfter;
-        spawns++;
-        return true;
-      }
-      return false;
-    },
+  function reset() {
+    state.live = false;
+    state.respawn = 0;
+    state.spawns = 0;
+    state.elapsed = 0;
+    return state;
+  }
 
-    reset() {
-      timer = 0;
-      armed = false;
-    },
-    resetAll() {
-      this.reset();
-      spawns = 0;
-    },
-  };
+  return { state, cfg, begin, update, reset };
 }

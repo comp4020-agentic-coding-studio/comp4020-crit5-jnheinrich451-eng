@@ -81,6 +81,14 @@ Beyond it, the player has genuinely broken the lock.
 **A spent site must never acquire again** — still a target, still worth a kill, but
 no longer a threat. Otherwise it sits in LOCK forever with nothing to fire.
 
+**Guard that at every edge, not just at `SEARCH`.** Enforcing it only on the way in
+leaves `LAUNCH` with no exit except firing — and firing is itself gated on having a
+round, so a site that reaches LAUNCH empty never sets `launched` and the table
+returns LAUNCH forever. It then holds a permanent lock with no missile ever
+arriving, which reads in play as "the SAM locks and warns but never shoots" and
+appears halfway through a sortie, when a site is most likely to be spent. So
+`LAUNCH` → `RELOAD` on an empty magazine, and `LOCK` → `SEARCH` on one.
+
 ### Destroyable with no special cases
 
 A site publishes the **stage-5 target contract** — `{ position, velocity, alive,
@@ -288,7 +296,9 @@ than a fighter tracking from 4 km.
   means visible.
 - **`samTransition`:** the full table, including that a spent site never acquires,
   the loss grace holds a lock through a flicker but not beyond, and leaving the
-  envelope breaks a lock.
+  envelope breaks a lock. Plus **termination**: for every magazine value, no state
+  leaves itself as itself — specifically that a spent site can neither sit in
+  LAUNCH nor hold a LOCK, while an armed one still waits in LAUNCH for its shot.
 - **One launch per LOCK**, not two. (Firing on both "LOCK with expired timer" and
   the LAUNCH state spends two rounds per engagement — they are the same frame.)
 - **A masked site never launches**, however long the player loiters.

@@ -1,211 +1,266 @@
-// The engine: exhaust plume, afterburner ring, shock diamonds. CLAUDE.md §3.
-//
-// THREE-FREE ON PURPOSE, exactly as crash-fx.js is. This module is the MODEL
-// of the engine visual -- it decides, every frame, how long the plume is, how
-// bright it is, whether the burner ring is in and where the shock diamonds sit
-// -- and aircraft.js is the painter that copies those numbers onto sprites
-// parented to the measured nozzles.
-//
-// The split is not decoration. The whole reason this module did not exist in
-// the first build is that its output is looked at rather than asserted, so
-// nothing went red when it was missing. Keeping the arithmetic here means the
-// budget, the pooling and the burner rule are all gated headlessly, and the
-// painter has no arithmetic of its own to drift from them.
-//
-// EVERYTHING IS POOLED. The sprite list is allocated once at construction and
-// its records are mutated in place forever after; `update()` returns the same
-// array with the same objects in it, and a gate asserts that identity across
-// 600 frames of varying throttle. A 60 Hz effect that allocated a record per
-// sprite would allocate 43,000 objects a minute for nothing.
+/**
+ * Stage 03.15 — twin-engine propulsion FX.
+ *
+ * Not a particle system and not combustion physics: four cheap layered pieces
+ * per engine (core cone, billboard plume stack, shock diamonds, nozzle bloom)
+ * driven by one normalized intensity. Additive blending does the heat work.
+ *
+ * Intensity comes from throttle and afterburner state — never from airspeed
+ * (§4/§5). Speed only stretches the plume slightly, so a dive that gains 80 m/s
+ * on idle thrust does not light the burners.
+ */
+import * as THREE from "three";
 
 export const ENGINE_FX = {
-  // 2 sprites per nozzle: a bright short core and a longer, dimmer tail. One
-  // sprite cannot both have a hot mouth and fade out over five metres.
-  plumesPerNozzle: 2,
-  // 3 diamonds per nozzle, not 3 in total: each nozzle has its own plume and a
-  // single shared column would sit between them, in the air, attached to
-  // nothing.
-  diamondsPerNozzle: 3,
+  /**
+   * Nozzle anchors in AircraftRoot space, re-measured from the airframe mesh by
+   * slicing the aft fuselage (§28). The aft cross-section has FOUR structures,
+   * and the outer pair is not the engines: solid booms at |x| 1.4–1.9 carrying
+   * the stabilator and fins, and inboard of them two hollow rings spanning
+   * |x| 0.30–1.02, y -0.92..-0.20 — the tailpipes. Nozzle centre is therefore
+   * (±0.66, -0.56) with a 0.36 m radius, and the last body geometry inside that
+   * annulus is at z 8.18, which is the exit plane. An earlier pass read the
+   * booms as the nozzles and hung both plumes on the stabilator roots, ~1.05 m
+   * too far outboard and 0.9 m too far aft.
+   */
+  nozzles: [
+    { name: "EngineFxLeft", side: -1, position: new THREE.Vector3(-0.66, -0.56, 8.2) },
+    { name: "EngineFxRight", side: 1, position: new THREE.Vector3(0.66, -0.56, 8.2) },
+  ],
+  nozzleRadius: 0.36,
+  // Sanity bound for the test that keeps the anchors off the booms: measured
+  // boom inner edge is |x| 1.25, so engine structure lives inboard of that.
+  boomInnerX: 1.25,
 
-  plumeIdle: 0.9, // m, at throttle 0
-  plumeDry: 5.5, // m, at throttle 1 with no burner
-  plumeBurnerExtra: 7.5, // m of elongation the burner adds on top
-  opacityIdle: 0.25,
-  opacityDry: 0.75,
+  // Dry thrust: nothing below this, full dry glow at 1.0 throttle.
+  dryOnset: 0.34,
+  dryCeiling: 0.55, // intensity reached at full dry throttle
+  abIntensity: 1.0,
+  abRise: 7.0, // 1/s — AB lights fast but not instantly
+  dryRise: 3.5,
 
-  ringRadius: 0.55, // m
-  // The burner fades in over 0.18 s rather than cutting: a hard cut reads as a
-  // bug, and the same easing runs backwards on shutdown for the same reason.
-  ringFade: 0.18,
+  // Geometry, in metres. Deliberately SHORT. The chase camera sits almost
+  // directly astern, so an axial cone is seen end-on and foreshortening turns
+  // any length into an apparent beam aimed at the viewer — a 7 m plume read as
+  // a 30 m searchlight over the carrier. Compact core plus bloom plus shock
+  // train carries the power read instead (§6/§27).
+  coreLength: 1.15,
+  coreRadius: 0.32,
+  /**
+   * Stage 03.2 (§33): the outer plume is no longer a cone. A second cone behind
+   * the first is what made the burner read as ring-and-funnel — a hard conical
+   * silhouette with a visible rim, and the worst of the dead-astern
+   * foreshortening. It is now a short stack of additive billboards, which has no
+   * silhouette to foreshorten and no rim to see. plumeLength/plumeRadius are now
+   * the extent of that stack.
+   */
+  plumeLength: 2.6,
+  plumeRadius: 0.4,
+  plumeSprites: 3,
+  // Speed stretches the plume by at most this fraction, as a secondary cue.
+  speedStretch: 0.18,
+  speedRef: 320,
 
-  diamondSpacing: 1.4, // m along the plume
-  diamondSize: 0.34, // m
-  diamondHz: 14,
-  diamondLow: 0.35,
-  diamondHigh: 0.7,
+  rings: 3,
+  ringSpacing: 0.42,
+  ringRadius: 0.13,
+  ringTube: 0.024,
+  // §33: shock *diamonds*, not hoops. A torus seen from behind is a ring with a
+  // hole in it, and three of them read as three hoops hanging in the air. These
+  // are small stretched octahedra riding inside the core instead, which is what
+  // a shock train actually looks like down the pipe.
+  ringStretch: 2.2,
+  // Rings are an AB-only structure: dry thrust has no visible shock train.
+  ringOnset: 0.62,
 
-  // How far aft of the nozzle the plume's two sprites sit, as fractions of the
-  // current plume length, and how much of it each one covers.
-  // The two tubes overlap and together cover the whole plume: the core spans
-  // 0.01-0.67 of its length and the tail 0.37-0.99, so neither pokes forward
-  // into the engine can and there is no gap between them.
-  coreAt: 0.34,
-  coreSpan: 0.66,
-  tailAt: 0.68,
-  tailSpan: 0.62,
-  // The mouth diameter, matched to the measured nozzle rather than guessed:
-  // the shared tube geometry is 0.5 in radius at its forward end, so a width
-  // of 1.0 puts a 1.0 m mouth on a 1.0 m nozzle.
-  width: 1, // m at the nozzle mouth, widened a little by the burner
-  burnerWidth: 1.15, // x width with the burner fully in
-  // The tail tube is only slightly wider than the core. A large multiplier
-  // reads as a funnel rather than as exhaust, and the burner plume already
-  // reaches within a few metres of the chase camera at the launch standoff.
-  tailWidth: 1.2,
+  flicker: 0.09, // amplitude as a fraction of intensity
+  flickerHz: [17, 29], // two incommensurate rates, so it never buzzes
+  wobbleHz: 3.4,
+  wobble: 0.035, // plume lateral wobble, in metres
+
+  bloomScale: 1.7,
 };
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const smooth = (t) => t * t * (3 - 2 * t);
 
 /**
- * Plume length in metres. Monotonic non-decreasing in throttle at any fixed
- * burner weight, which is the whole readability claim: a player learns what
- * the lever does by watching the back of their own aircraft.
+ * Normalized visual intensity of one engine. Pure — the piece worth testing.
+ * Dry thrust ramps from dryOnset to full throttle and tops out at dryCeiling;
+ * afterburner is a separate, higher band so AB always reads stronger than
+ * military power (§5).
  */
-export function plumeLength(throttle, burner = 0) {
-  const t = clamp01(throttle);
-  return (
-    ENGINE_FX.plumeIdle +
-    (ENGINE_FX.plumeDry - ENGINE_FX.plumeIdle) * t +
-    ENGINE_FX.plumeBurnerExtra * clamp01(burner)
-  );
+export function engineIntensity(throttle, afterburner, cfg = ENGINE_FX) {
+  const dry = smooth(clamp01((throttle - cfg.dryOnset) / (1 - cfg.dryOnset))) * cfg.dryCeiling;
+  if (!afterburner) return dry;
+  // AB blends from the dry ceiling to full so lighting it is a visible step up
+  // rather than a jump discontinuity.
+  return Math.max(dry, cfg.dryCeiling + (cfg.abIntensity - cfg.dryCeiling) * smooth(clamp01((throttle - cfg.dryOnset) / (1 - cfg.dryOnset))));
 }
 
-/** Plume opacity over the same range. */
-export function plumeOpacity(throttle, burner = 0) {
-  const t = clamp01(throttle);
-  return (
-    ENGINE_FX.opacityIdle +
-    (ENGINE_FX.opacityDry - ENGINE_FX.opacityIdle) * t +
-    0.18 * clamp01(burner)
-  );
+/** Shock rings fade in only near the top of the range. Pure. */
+export function ringOpacity(intensity, cfg = ENGINE_FX) {
+  return smooth(clamp01((intensity - cfg.ringOnset) / (1 - cfg.ringOnset)));
+}
+
+/** Two-rate flicker, deterministic in time. Pure. */
+export function flickerAt(time, cfg = ENGINE_FX) {
+  const [a, b] = cfg.flickerHz;
+  return 1 + cfg.flicker * 0.5 * (Math.sin(time * a) + Math.sin(time * b * 1.37 + 1.1));
+}
+
+function plumeTexture() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const g = c.getContext("2d");
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, "rgba(255,252,242,1)");
+  grad.addColorStop(0.25, "rgba(198,224,255,0.72)");
+  grad.addColorStop(0.6, "rgba(255,168,92,0.34)");
+  grad.addColorStop(1, "rgba(255,120,40,0)");
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
 /**
- * The burner's fade weight, integrated one frame at a time. Separate from the
- * boolean so the ring and the elongation share ONE easing -- a ring that fades
- * against a plume that steps is worse than either alone.
+ * AircraftRoot
+ *  |- EngineFx
+ *      |- EngineFxLeft  -> core | plume | rings | bloom
+ *      |- EngineFxRight -> ...
+ * Anchors are plain Object3Ds, so nothing outside this module holds a nozzle
+ * coordinate (§7).
  */
-export function stepBurner(weight, lit, dt) {
-  const rate = dt / Math.max(ENGINE_FX.ringFade, 1e-6);
-  return clamp01(lit ? weight + rate : weight - rate);
-}
+export function createEngineFx(aircraftRoot, cfg = ENGINE_FX) {
+  const group = new THREE.Object3D();
+  group.name = "EngineFx";
 
-/**
- * Create the engine's visual model over a MEASURED set of nozzle anchors.
- *
- * `nozzles` are aircraft-local positions, measured from the airframe's own
- * geometry by aircraft.js. Nothing here types a coordinate.
- */
-export function createEngineFx(nozzles) {
-  const anchors = nozzles.map((n) => ({ x: n.x, y: n.y, z: n.z }));
+  const tex = plumeTexture();
+  // One material set shared by both engines: twin symmetry is guaranteed by
+  // construction rather than by keeping two copies in step.
+  const coreMat = new THREE.MeshBasicMaterial({ color: 0xcfe6ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false });
+  const puffMat = new THREE.SpriteMaterial({ map: tex, color: 0xffa060, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0xbfd8ff, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
+  const bloomMat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false });
 
-  // The pool, built ONCE. Order is fixed and the painter matches sprites to it
-  // by index, so a record can never change kind under a sprite.
-  const sprites = [];
-  for (let i = 0; i < anchors.length; i++) {
-    for (let k = 0; k < ENGINE_FX.plumesPerNozzle; k++) {
-      sprites.push({
-        kind: "plume", nozzle: i, slot: k,
-        x: 0, y: 0, z: 0, w: 0, h: 0, opacity: 0, visible: false,
-      });
+  // Cones open toward +Z (aft): +90° about X sends the cone's +Y apex onto +Z.
+  const coreGeo = new THREE.ConeGeometry(cfg.coreRadius, cfg.coreLength, 14, 1, true);
+  const ringGeo = new THREE.OctahedronGeometry(cfg.ringRadius, 0);
+
+  const engines = cfg.nozzles.map((n) => {
+    const anchor = new THREE.Object3D();
+    anchor.name = n.name;
+    anchor.position.copy(n.position);
+    anchor.userData.side = n.side;
+
+    const core = new THREE.Mesh(coreGeo, coreMat.clone());
+    core.rotation.x = Math.PI / 2;
+    core.position.z = cfg.coreLength * 0.5;
+    core.name = "Core";
+
+    const plume = new THREE.Object3D();
+    plume.name = "Plume";
+    const puffs = [];
+    for (let i = 0; i < cfg.plumeSprites; i++) {
+      const puff = new THREE.Sprite(puffMat.clone());
+      puff.name = `Puff${i}`;
+      puffs.push(puff);
+      plume.add(puff);
     }
-    sprites.push({
-      kind: "ring", nozzle: i, slot: 0,
-      x: 0, y: 0, z: 0, w: 0, h: 0, opacity: 0, visible: false,
-    });
-    for (let k = 0; k < ENGINE_FX.diamondsPerNozzle; k++) {
-      sprites.push({
-        kind: "diamond", nozzle: i, slot: k,
-        x: 0, y: 0, z: 0, w: 0, h: 0, opacity: 0, visible: false,
-      });
+
+    const rings = [];
+    for (let i = 0; i < cfg.rings; i++) {
+      const ring = new THREE.Mesh(ringGeo, ringMat.clone());
+      ring.position.z = (i + 1) * cfg.ringSpacing;
+      ring.scale.z = cfg.ringStretch;
+      ring.name = `Ring${i}`;
+      rings.push(ring);
+      anchor.add(ring);
+    }
+
+    const bloom = new THREE.Sprite(bloomMat.clone());
+    bloom.scale.setScalar(cfg.bloomScale);
+    bloom.name = "Bloom";
+
+    anchor.add(core, plume, bloom);
+    group.add(anchor);
+    return { anchor, core, plume, puffs, rings, bloom };
+  });
+
+  aircraftRoot.add(group);
+
+  let time = 0;
+  const state = { intensity: 0, ring: 0, afterburner: false };
+
+  /** @param ctx { throttle, afterburner, speed } */
+  function update(ctx, dt) {
+    time += dt;
+    const target = engineIntensity(ctx.throttle, ctx.afterburner, cfg);
+    // Spooling: AB lights faster than it decays, so a throttle chop reads as
+    // the burner going out rather than a hard cut.
+    const rise = target > state.intensity ? (ctx.afterburner ? cfg.abRise : cfg.dryRise) : cfg.dryRise;
+    state.intensity += (target - state.intensity) * (1 - Math.exp(-rise * dt));
+    state.afterburner = !!ctx.afterburner;
+
+    const i = state.intensity;
+    const f = flickerAt(time, cfg);
+    const ringOp = ringOpacity(i, cfg);
+    state.ring = ringOp;
+    // Length responds to speed only as a secondary cue (§5).
+    const stretch = 1 + cfg.speedStretch * clamp01((ctx.speed || 0) / cfg.speedRef);
+    const wob = Math.sin(time * cfg.wobbleHz) * cfg.wobble * i;
+
+    for (const e of engines) {
+      // 0.42 rather than 0.7: the core cone is open-ended and double-sided, so
+      // seen end-on from the chase camera you are looking down its length and
+      // the additive layers stack — at 0.7 the nozzle clipped to a flat white
+      // plate with a hard rim. The bloom carries the brightness instead, which
+      // has no edge to see (§33).
+      e.core.material.opacity = 0.34 * i * f;
+      e.core.scale.set(1, Math.max(0.05, i * f * stretch), 1);
+      e.core.position.z = cfg.coreLength * 0.5 * i * f * stretch;
+
+      // Billboard stack: each puff sits further aft, narrows and fades, so the
+      // plume has depth without a conical edge anywhere in it (§33).
+      for (let p = 0; p < e.puffs.length; p++) {
+        const puff = e.puffs[p];
+        const frac = (p + 0.6) / e.puffs.length;
+        const breathe = 1 + 0.07 * Math.sin(time * (5.3 + p * 1.9) + p * 2.1);
+        puff.position.z = frac * cfg.plumeLength * i * stretch;
+        puff.position.x = wob * e.anchor.userData.side * frac;
+        puff.scale.setScalar(cfg.plumeRadius * 2.4 * (1 - 0.34 * frac) * (0.5 + 0.5 * i) * breathe);
+        puff.material.opacity = 0.34 * i * i * (1 - 0.5 * frac) * breathe;
+        puff.visible = i > 0.01;
+      }
+
+      for (let r = 0; r < e.rings.length; r++) {
+        const ring = e.rings[r];
+        // Diamonds ride out with intensity and pulse slightly out of phase,
+        // which is what makes the shock train read as a train rather than three
+        // identical accents.
+        const phase = 1 + 0.06 * Math.sin(time * 11 + r * 1.7);
+        ring.position.z = (r + 1) * cfg.ringSpacing * i * phase * stretch;
+        const s = (1.05 - r * 0.15) * (0.7 + 0.3 * i) * phase;
+        ring.scale.set(s, s, s * cfg.ringStretch);
+        // Later diamonds are fainter, so the structure has a direction.
+        ring.material.opacity = ringOp * (0.34 - r * 0.09) * f;
+        ring.visible = ringOp > 0.01;
+      }
+
+      // Additive white over a dark tailpipe clips to a flat plate long before
+      // opacity 1: at 0.58 the nozzle read as a hard-edged white disc. 0.36
+      // keeps the falloff visible, so it reads as a glow with a centre.
+      e.bloom.material.opacity = 0.36 * i * f;
+      e.bloom.scale.setScalar(cfg.bloomScale * (0.6 + 0.5 * i));
     }
   }
 
-  const state = { burner: 0, clock: 0, length: 0, throttle: 0 };
-
-  function update(dt, { throttle = 0, afterburner = false } = {}) {
-    state.clock += dt;
-    state.burner = stepBurner(state.burner, afterburner === true, dt);
-    state.throttle = clamp01(throttle);
-
-    const b = state.burner;
-    const len = plumeLength(state.throttle, b);
-    const alpha = plumeOpacity(state.throttle, b);
-    const width = ENGINE_FX.width * (1 + (ENGINE_FX.burnerWidth - 1) * b);
-    state.length = len;
-
-    // The diamond oscillation, one phase for the whole engine: they are one
-    // standing pattern in one exhaust, not three independent flickers.
-    const osc =
-      ENGINE_FX.diamondLow +
-      (ENGINE_FX.diamondHigh - ENGINE_FX.diamondLow) *
-        (0.5 + 0.5 * Math.sin(state.clock * ENGINE_FX.diamondHz * Math.PI * 2));
-
-    for (const s of sprites) {
-      const a = anchors[s.nozzle];
-      s.x = a.x;
-      s.y = a.y;
-      if (s.kind === "plume") {
-        const at = s.slot === 0 ? ENGINE_FX.coreAt : ENGINE_FX.tailAt;
-        const span = s.slot === 0 ? ENGINE_FX.coreSpan : ENGINE_FX.tailSpan;
-        // Aft is +Z: the project's forward is -Z (§5), so the exhaust grows
-        // the other way and a sign error here points the plume at the nose.
-        s.z = a.z + len * at;
-        s.h = len * span;
-        s.w = width * (s.slot === 0 ? 1 : ENGINE_FX.tailWidth);
-        s.opacity = s.slot === 0 ? alpha : alpha * 0.3;
-        s.visible = true;
-      } else if (s.kind === "ring") {
-        s.z = a.z + ENGINE_FX.ringRadius * 0.2;
-        s.w = ENGINE_FX.ringRadius * 2;
-        s.h = ENGINE_FX.ringRadius * 2;
-        // Dimmer than the plume it sits on: the ring is the mouth, and a
-        // mouth brighter than the flame reads as a light rather than as an
-        // engine. It is also the closest thing on the aircraft to the launch
-        // camera, so it carries more screen area than its metre suggests.
-        s.opacity = 0.5 * b;
-        // The ring belongs to the burner and to nothing else, so it goes with
-        // the same weight that elongates the plume.
-        s.visible = b > 0;
-      } else {
-        // SHOCK DIAMONDS EXIST ONLY WITH THE BURNER LIT. They are a feature of
-        // an over-expanded supersonic jet, so showing them at military power
-        // would be showing the player something that is not happening.
-        s.z = a.z + ENGINE_FX.diamondSpacing * (s.slot + 1);
-        s.w = ENGINE_FX.diamondSize;
-        s.h = ENGINE_FX.diamondSize;
-        s.opacity = osc * b * (1 - s.slot * 0.18);
-        s.visible = afterburner === true && b > 0;
-      }
-    }
-    return sprites;
+  function reset() {
+    time = 0;
+    state.intensity = 0;
   }
 
-  return {
-    anchors,
-    sprites,
-    state,
-    update,
-    /** Presentation resets; nothing here is gameplay (§17.11). */
-    clear() {
-      state.burner = 0;
-      state.clock = 0;
-      state.length = 0;
-      state.throttle = 0;
-      for (const s of sprites) {
-        s.opacity = 0;
-        s.visible = false;
-      }
-    },
-  };
+  return { group, engines, state, update, reset, cfg };
 }

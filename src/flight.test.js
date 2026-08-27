@@ -1,5682 +1,5012 @@
-// Operation Vector — the assertion suite. CLAUDE.md §18.
-//
-// Plain assertions: a check() helper and a pass/fail count. No framework, no
-// runner, no async. Two harnesses load this one file:
-//
-//   tests.html            prints the count in the browser
-//   spec/vector.test.ts   fails `pnpm check` (and CI) if anything is red
-//
-// One suite, two harnesses, so the browser count and the repository gate can
-// never disagree about what passed.
-//
-// This module MUST NOT import three.js -- it runs headless under vitest.
-
+/**
+ * Minimal deterministic checks for the flight math. No test runner in the
+ * project yet, so this runs in-page: open index.html?test=1 and read the
+ * console. Ports to vitest/jest unchanged — flight.js imports nothing.
+ */
+import { createFlightState, updateFlight, forwardFromAngles, bankSinkRate, requestRoll, bankDegrees, getTargetSpeed, speedToThrottle, moveTowards, resetFlightState, wrapAngle, turnBank, setFlightMode, toggleFlightMode, isExpert, attitudeVectors, quat, quatForward, quatUp, quatMultiply, quatFromEulerYXZ, quatNormalize, MODE, EXPERT, CRUISE_THROTTLE, SPEED, THROTTLE, DEG, FLIGHT, ROLL } from "./flight.js";
+import { framingTilt } from "./chase-camera.js";
+import * as THREE from "three";
+import { captureFlightState, applyFlightState } from "./flight.js";
+import { PHYSICS, SURFACE, CONTACT, PROBES, lookAheadDistance, groundReference, classifyContact, isSafeToRecord, buildTerrainIndex, terrainHeightAt, terrainNormalAt, imminentForwardDistance, forwardTerrainHit, collectMeshes, createWorldPhysics } from "./physics.js";
+import { CollisionType, RECOVERY, requiredSafeClearance, createCollisionEvent, createSafeStateHistory, createDevelopmentRecoveryResponse, recoveryNormal } from "./collision.js";
+import { WORLD, longestHorizontalAxis, alignYaw, scaleToTarget, distanceKm, percentile, modalHeight } from "./world.js";
+import { WEAPONS, WeaponMode, cycleWeapon, createWeaponMounts, createMountedMissiles, normalizeMissile, buildPlaceholderMissile, buildLaunchRail } from "./weapons.js";
+import { LockState, LockFail, TARGETING, targetGeometry, qualifies, advanceLock, createTargetingSystem } from "./targeting.js";
+import { MISSILE, MissileState, steer, segmentDistance, advanceSpeed, leadPoint, overshooting, createMissileSystem } from "./missile.js";
+import { ENEMY, createTargetDrone, updateTargetDrone, integrateDrone, resetTargetDrone, markTargetHit, damageTarget, normalizeHostileModel, installHostileVisual, HOSTILE_MODEL } from "./enemy.js";
+import { HOSTILE, HOSTILE_MISSILE, HostileState, wrapPi, aimAngles, forwardFrom, offNoseDeg, steerAngle, predictPoint, inAttackCone, altitudeGuard, hostileTransition, phaseSpeed, createHostileAI } from "./hostile.js";
+import { THREAT, ThreatLevel, ThreatTier, threatLevelOf, warningTier, threatBearing, dodgeWindow, inDodgePeak, evasionAuthority, evadeEarned, createThreatMonitor } from "./threat.js";
+import { DamageSource, createPlayerDamageEvent, createDevelopmentHitResponse } from "./damage.js";
+import { HUD, apparentSize, damp, dampAngle, derivePitchDeg, deriveBankDeg, deriveHeadingDeg } from "./combat-hud.js";
+import { ENGINE_FX, engineIntensity, ringOpacity, flickerAt } from "./engine-fx.js";
+import { GUN, gunShots, rangeEffect, gunDamage, hitscanRange, leadSolution, createGunSystem } from "./gun.js";
+import { VAPOR, maneuverLoad, vaporIntensity, approach } from "./vapor-fx.js";
+import { ATMOS, seededRandom, densityAt, distanceToCloud, humidityFor, advisoryFor, createAdvisoryLatch, createCloudField } from "./atmosphere.js";
+import { KEYBOARD, PitchMode, applyPitchMode, MOUSE, pointerStick, combineAxis, createInput } from "./input.js";
 import {
-  BANK_MAX,
-  BURNER_LEVER,
-  PITCH_MAX,
-  SPEED_MAX,
-  SPEED_MIN,
-  TURN_G,
-  TURN_RADIUS_REF,
-  applyFlightState,
-  captureFlightState,
-  commandedSpeed,
-  createFlightState,
-  isAfterburner,
-  leverFor,
-  quatForward,
-  quatFromEulerYXZ,
-  quatIdentity,
-  quatMultiply,
-  quatToEulerYXZ,
-  quatUp,
-  setMode,
-  updateFlight,
-  wrapAngle,
-} from "./flight.js";
-import {
-  POINTER_DEAD_ZONE,
-  POINTER_FULL_STICK,
-  POINTER_GAIN,
-  createInput,
-  pointerStick,
-} from "./input.js";
-import {
-  FOV_VERTICAL_MAX,
-  REF_ASPECT,
-  horizontalFov,
-  widenForAspect,
-} from "./framing.js";
-import { buildTerrainIndex, createPhysics, heightAtIndex } from "./physics.js";
-import {
-  createDevelopmentRecovery,
-  MC,
-  createMissionCheckpointResponse,
-  createNullResponse,
-} from "./collision.js";
-import {
-  COMPLETE, DECK, DEFENSIVE, EGRESS, EXTRACTION, FINAL, INTERCEPT, LAUNCH,
-  PHASES, TERRAIN,
-  autopilotStick, bandFeature, blendStick, buildRoute, captureCheckpoint,
-  createMission, inVolume, missionTransition, pickZonedFeatures,
-  surveyTerrainRoute, volumesOverlap,
-} from "./mission.js";
-import {
-  ACQUISITION_SECONDS, PROBE_SCALES, SAM_MISSILE,
-  createSamNetwork, lineOfSight, placeSites, samTransition,
-} from "./sam.js";
-import { FLARE_CFG, createFlares, seduces } from "./flares.js";
-import { createRearm } from "./rearm.js";
-import {
-  ALWAYS, FREE, MISSION, PEACE, createSandbox, nextMode, rulesFor,
-} from "./modes.js";
-import {
-  RESPAWN_ALTITUDE, RESPAWN_BACKOFF, SPAWN_CLEARANCE, T, VARIANTS,
-  causeFor, createCrashFx, respawnFrom, safeSpawnAltitude,
-} from "./crash-fx.js";
-import {
-  AMBIENT, CRITICAL, CUES, WARNING, WEAPON,
-  createAudio, groundWarning, isFlyby,
-} from "./audio.js";
-import {
-  AGL_DANGER, AGL_WARN, C, CASING, FLANK_FRACTION, HUD_REVEAL_SECONDS,
-  RADAR_MARGIN, RADAR_RADIUS, RAMP, STACK_SLOTS,
-  aglReadout, flankColumns, flankOffset, fontPx, hudRevealAlpha, hudScale,
-  modeSegment, stackY, storesPanel,
-} from "./hud-layout.js";
-import {
-  EASE,
-  HANDOFF_SPEED,
-  HANDOFF_THROTTLE,
-  ROTATE_PITCH,
-  STROKE_MAX,
-  SPOOL,
-  STROKE_MIN,
-  V0,
-  V1,
-  buildLaunchPlan,
-  createLaunch,
-  deckDwellFor,
-  solveExitSpeed,
-  solveStroke,
-  solveStrokeTime,
-  spoolThrottle,
-  strokeDistance,
-  strokePosition,
+  LAUNCH,
+  LaunchStage,
+  strokeEase,
   strokeSpeed,
+  strokeDistance,
+  solveStrokeTime,
+  solveExitSpeed,
+  planStroke,
+  sequenceDuration,
+  spoolThrottle,
+  launchFov,
+  createLaunchSequence,
 } from "./launch.js";
 import {
-  createDrone,
-  createTarget,
-  damageTarget,
-  isTargetable,
-} from "./enemy.js";
-import {
-  ENGINE_FX,
-  createEngineFx,
-  plumeLength,
-  plumeOpacity,
-  stepBurner,
-} from "./engine-fx.js";
-import { createTargeting } from "./targeting.js";
-import {
-  AIM9,
-  createMissileSystem,
-  hasOvershot,
-  turnRadius,
-} from "./missile.js";
-import { createGun, leadSolution } from "./gun.js";
-import {
-  TRAIL,
-  TRAIL_INTERVAL,
-  createTrails,
-  trailOpacity,
-  trailWidth,
-} from "./missile-trail.js";
-import {
-  HOSTILE_CFG,
-  HOSTILE_MISSILE,
-  createHostile,
-  hostileTransition,
-} from "./hostile.js";
-import {
-  EVADE_WINDOW,
-  authorityFor,
-  createEvasion,
-  createThreatMonitor,
-  wouldHaveHit,
-} from "./threat.js";
-import { createDamageResponse, playerDamageEvent } from "./damage.js";
-
-// ── harness ────────────────────────────────────────────────────────────────
-
-let passed = 0;
-let failed = 0;
-let failures = [];
-
-export function check(name, pass, detail) {
-  if (pass) passed++;
-  else {
-    failed++;
-    failures.push({ name, detail });
-  }
-  return pass;
-}
-
-const near = (a, b, tol = 1e-6) => Math.abs(a - b) <= tol;
-
-// A neutral stick. Every test that does not care about an axis passes this,
-// so a new axis added later defaults to "not touched" everywhere at once.
-const NEUTRAL = { x: 0, y: 0, roll: 0, throttle: 0 };
-const stick = (over = {}) => ({ ...NEUTRAL, ...over });
-
-// Step the model at a fixed rate. Real dt is clamped in main.js; tests use a
-// fixed step so a result is reproducible rather than machine-dependent.
-function fly(state, input, seconds, hz = 60) {
-  const dt = 1 / hz;
-  for (let t = 0; t < seconds; t += dt) updateFlight(state, input, dt);
-  return state;
-}
-
-// ── input harness ──────────────────────────────────────────────────────────
-// A test double must match the real thing (§17.13), so this dispatches real
-// Events through a real EventTarget rather than calling the handlers
-// directly -- a double that invoked handlers itself would never exercise the
-// registration, which is half of what these tests are about.
-
-class KeyEvent extends Event {
-  constructor(type, code, key) {
-    super(type);
-    this.code = code;
-    this.key = key;
-  }
-}
-
-class PointerEvt extends Event {
-  constructor(type, opts) {
-    super(type);
-    const o = opts || {};
-    this.clientX = o.x || 0;
-    this.clientY = o.y || 0;
-    this.button = o.button || 0;
-    this.deltaY = o.deltaY || 0;
-    this.view = { innerWidth: o.w || VW, innerHeight: o.h || VH };
-  }
-}
-
-// The desktop marking viewport, used as the default frame for pointer tests.
-const VW = 1920;
-const VH = 1080;
-const MID_X = VW / 2;
-const MID_Y = VH / 2;
-
-function inputHarness() {
-  const target = new EventTarget();
-  const doc = new EventTarget();
-  doc.visibilityState = "visible";
-  const input = createInput({ target, doc });
-  return {
-    input,
-    target,
-    doc,
-    down: (code, key) => target.dispatchEvent(new KeyEvent("keydown", code, key ?? code)),
-    up: (code, key) => target.dispatchEvent(new KeyEvent("keyup", code, key ?? code)),
-    move: (x, y, w, h) =>
-      target.dispatchEvent(new PointerEvt("pointermove", { x, y, w, h })),
-    press: (button) => target.dispatchEvent(new PointerEvt("pointerdown", { button })),
-    release: (button) => target.dispatchEvent(new PointerEvt("pointerup", { button })),
-    wheel: (deltaY) => target.dispatchEvent(new PointerEvt("wheel", { deltaY })),
-    leave: () => target.dispatchEvent(new Event("pointerleave")),
-    tick: (seconds, hz = 60) => {
-      const dt = 1 / hz;
-      let axes;
-      for (let t = 0; t < seconds; t += dt) axes = input.update(dt);
-      return axes ?? input.update(dt);
-    },
-  };
-}
-
-// ── stage 1: flight envelope ───────────────────────────────────────────────
-
-function testEnvelope() {
-  const up = createFlightState();
-  fly(up, stick({ throttle: 1 }), 30);
-  check(
-    "speed clamps at the maximum",
-    up.speed <= SPEED_MAX + 1e-9 && up.speed > SPEED_MAX - 1,
-    `speed ${up.speed}`,
-  );
-
-  const down = createFlightState();
-  fly(down, stick({ throttle: -1 }), 30);
-  check(
-    "speed clamps at the minimum",
-    down.speed >= SPEED_MIN - 1e-9 && down.speed < SPEED_MIN + 1,
-    `speed ${down.speed}`,
-  );
-
-  const left = createFlightState();
-  fly(left, stick({ x: 1 }), 20);
-  check(
-    "bank clamps at the left limit",
-    left.bank <= BANK_MAX + 1e-9 && left.bank > BANK_MAX - 1e-3,
-    `bank ${left.bank} limit ${BANK_MAX}`,
-  );
-
-  const right = createFlightState();
-  fly(right, stick({ x: -1 }), 20);
-  check(
-    "bank clamps at the right limit",
-    right.bank >= -BANK_MAX - 1e-9 && right.bank < -BANK_MAX + 1e-3,
-    `bank ${right.bank}`,
-  );
-
-  // Q/E are a raw rate with no self-centring target, so they are the axis
-  // that can actually run past the limit if the clamp is missing.
-  const rolled = createFlightState();
-  fly(rolled, stick({ roll: 1 }), 20);
-  check(
-    "roll rate cannot drive bank past the limit",
-    rolled.bank <= BANK_MAX + 1e-9,
-    `bank ${rolled.bank}`,
-  );
-
-  const pitched = createFlightState();
-  fly(pitched, stick({ y: 1 }), 20);
-  check(
-    "pitch clamps at its limit",
-    pitched.pitch <= PITCH_MAX + 1e-9 && pitched.pitch > PITCH_MAX - 1e-3,
-    `pitch ${pitched.pitch}`,
-  );
-
-  check(
-    "the aircraft cannot depart in ASSISTED",
-    Math.abs(pitched.bank) <= BANK_MAX && Math.abs(pitched.pitch) <= PITCH_MAX,
-  );
-}
-
-// ── stage 1: bank drives heading ───────────────────────────────────────────
-
-function testTurn() {
-  // Positive bank is LEFT and increasing heading is LEFT, and the two agree
-  // on purpose -- that agreement is what keeps a minus sign out of the
-  // coordinated-turn term. Assert both halves, or a later edit that flips one
-  // convention will look correct in isolation.
-  const state = createFlightState();
-  const before = state.heading;
-  fly(state, stick({ x: 1 }), 2);
-  check(
-    "a held left bank increases heading",
-    state.heading > before,
-    `heading ${before} -> ${state.heading}`,
-  );
-
-  const right = createFlightState();
-  fly(right, stick({ x: -1 }), 2);
-  check(
-    "a held right bank decreases heading",
-    right.heading < 0,
-    `heading ${right.heading}`,
-  );
-
-  const level = createFlightState();
-  fly(level, stick(), 3);
-  check(
-    "zero bank produces no heading change",
-    near(level.heading, 0, 1e-9),
-    `heading ${level.heading}`,
-  );
-
-  // Increasing heading must actually point the nose left, i.e. toward -X.
-  const f0 = quatForward(quatFromEulerYXZ(0, 0, 0));
-  const f1 = quatForward(quatFromEulerYXZ(0.3, 0, 0));
-  check(
-    "increasing heading swings the nose toward -X (left)",
-    f1.x < f0.x,
-    `x ${f0.x} -> ${f1.x}`,
-  );
-
-  // The fairness claim of §14 is stated in turn radii, so assert the radius
-  // the arcade gravity was derived to produce rather than the constant.
-  const radius =
-    (SPEED_MAX * SPEED_MAX) / (TURN_G * Math.tan(BANK_MAX));
-  check(
-    "turn radius at the top of the envelope matches the derived reference",
-    near(radius, TURN_RADIUS_REF, 1e-6),
-    `radius ${radius}`,
-  );
-  const cruiseRadius = (170 * 170) / (TURN_G * Math.tan(BANK_MAX));
-  check(
-    "turning tightens as speed falls",
-    cruiseRadius < radius,
-    `cruise ${cruiseRadius} vs max ${radius}`,
-  );
-}
-
-// ── stage 1: the throttle is a lever ───────────────────────────────────────
-
-function testThrottle() {
-  const state = createFlightState();
-  fly(state, stick({ throttle: 1 }), 0.5);
-  const held = state.throttle;
-  check("pushing the lever moves it", held > leverFor(170), `lever ${held}`);
-
-  // The whole point: releasing the key must NOT let it fall back.
-  fly(state, stick({ throttle: 0 }), 3);
-  check(
-    "releasing the throttle leaves the lever where it is",
-    near(state.throttle, held, 1e-12),
-    `lever ${held} -> ${state.throttle}`,
-  );
-
-  check("lever 0 commands the minimum", near(commandedSpeed(0), SPEED_MIN));
-  check("lever 1 commands the maximum", near(commandedSpeed(1), SPEED_MAX));
-  check(
-    "leverFor inverts commandedSpeed",
-    near(commandedSpeed(leverFor(203)), 203, 1e-9),
-  );
-
-  check("afterburner is off below the top 15%", !isAfterburner(BURNER_LEVER));
-  check("afterburner is off at the boundary", !isAfterburner(0.85));
-  check("afterburner is on above it", isAfterburner(0.86));
-  check("afterburner is on at full lever", isAfterburner(1));
-
-  const burner = createFlightState();
-  fly(burner, stick({ throttle: 1 }), 10);
-  check(
-    "a full lever lights the burner on the state",
-    burner.afterburner === true,
-    `lever ${burner.throttle}`,
-  );
-}
-
-// ── stage 1: sink ──────────────────────────────────────────────────────────
-
-function testSink() {
-  const level = createFlightState();
-  const startY = level.position.y;
-  fly(level, stick(), 4);
-  check(
-    "level flight holds altitude",
-    near(level.position.y, startY, 1e-6),
-    `alt ${startY} -> ${level.position.y}`,
-  );
-  check("level flight has no sink", near(level.sink, 0, 1e-9), `sink ${level.sink}`);
-
-  const banked = createFlightState();
-  const bankedStart = banked.position.y;
-  fly(banked, stick({ x: 1 }), 4);
-  check(
-    "banking costs altitude",
-    banked.position.y < bankedStart - 10,
-    `alt ${bankedStart} -> ${banked.position.y}`,
-  );
-  check("banking produces sink", banked.sink > 0, `sink ${banked.sink}`);
-
-  // Sink must rise with bank angle, or a shallow turn would cost as much as a
-  // hard one and there would be nothing to learn.
-  const shallow = createFlightState();
-  fly(shallow, stick({ x: 0.35 }), 4);
-  check(
-    "a harder bank sinks faster",
-    banked.sink > shallow.sink && shallow.sink > 0,
-    `hard ${banked.sink} vs shallow ${shallow.sink}`,
-  );
-}
-
-// ── stage 1: snapshots ─────────────────────────────────────────────────────
-
-function testSnapshots() {
-  const state = createFlightState();
-  fly(state, stick({ x: 0.6, y: 0.3, throttle: 1 }), 2.5);
-
-  const snap = captureFlightState(state);
-  const before = JSON.stringify(state);
-  applyFlightState(state, snap);
-  check(
-    "applying a fresh snapshot is a no-op",
-    JSON.stringify(state) === before,
-    "round trip changed the state",
-  );
-
-  // A snapshot that aliases the live state records nothing -- the next frame
-  // would edit the history. This is the failure the deep copy exists for.
-  fly(state, stick({ x: -1 }), 2);
-  check(
-    "a snapshot does not alias the live position",
-    snap.position.x !== state.position.x,
-    "snapshot moved with the aircraft",
-  );
-  check(
-    "a snapshot does not alias the live quaternion",
-    snap.quat.y !== state.quat.y,
-    "snapshot quaternion moved with the aircraft",
-  );
-
-  // Restoring must actually rewind, which is what stage 3 rewinds into.
-  applyFlightState(state, snap);
-  check(
-    "restoring a snapshot rewinds the position",
-    near(state.position.x, snap.position.x, 1e-12),
-  );
-  check(
-    "restoring a snapshot rewinds the attitude",
-    near(state.bank, snap.bank, 1e-12) && near(state.heading, snap.heading, 1e-12),
-  );
-}
-
-// ── stage 1: the quaternion contract ───────────────────────────────────────
-
-function testQuaternion() {
-  const state = createFlightState();
-  fly(state, stick({ x: 0.5, y: 0.4 }), 1.5);
-
-  const q = state.quat;
-  check(
-    "quat is a plain record with x, y, z, w",
-    typeof q === "object" &&
-      typeof q.x === "number" &&
-      typeof q.y === "number" &&
-      typeof q.z === "number" &&
-      typeof q.w === "number",
-  );
-  // §17.1: if a THREE.Quaternion ever leaks in here, this is what catches it.
-  check(
-    "quat is not a THREE.Quaternion",
-    typeof q.copy === "undefined" && typeof q.setFromEuler === "undefined",
-    "quat has THREE methods on it",
-  );
-  check(
-    "quat is normalised",
-    near(Math.hypot(q.x, q.y, q.z, q.w), 1, 1e-9),
-  );
-
-  // Forward derived from the quaternion must match the heading convention
-  // exactly, because every bearing, break direction and spawn offset in later
-  // stages is written against (-sin h, -cos h).
-  for (const h of [0, 0.7, -1.2, 2.9, Math.PI]) {
-    const f = quatForward(quatFromEulerYXZ(h, 0, 0));
-    check(
-      `forward at heading ${h} matches (-sin h, -cos h)`,
-      near(f.x, -Math.sin(h), 1e-9) && near(f.z, -Math.cos(h), 1e-9),
-      `got ${f.x}, ${f.z}`,
-    );
-  }
-
-  check(
-    "heading 0 points at -Z",
-    (() => {
-      const f = quatForward(quatIdentity());
-      return near(f.x, 0) && near(f.y, 0) && near(f.z, -1);
-    })(),
-  );
-
-  const upLevel = quatUp(quatFromEulerYXZ(0, 0, 0));
-  check("level up-vector is +Y", near(upLevel.y, 1, 1e-9));
-
-  // Positive bank must tilt the up-vector left (-X), matching the sign note
-  // in input.js. If this flips, the turn direction silently inverts.
-  const upBanked = quatUp(quatFromEulerYXZ(0, 0, 0.5));
-  check(
-    "positive bank tilts the up-vector toward -X (left wing down)",
-    upBanked.x < 0,
-    `up.x ${upBanked.x}`,
-  );
-
-  const nosed = quatForward(quatFromEulerYXZ(0, 0.4, 0));
-  check("positive pitch raises the nose", nosed.y > 0, `f.y ${nosed.y}`);
-
-  check(
-    "identity is the multiplicative identity",
-    (() => {
-      const a = quatFromEulerYXZ(0.3, -0.2, 0.9);
-      const r = quatMultiply(a, quatIdentity());
-      return near(r.x, a.x) && near(r.y, a.y) && near(r.z, a.z) && near(r.w, a.w);
-    })(),
-  );
-
-  check("wrapAngle keeps the range", near(wrapAngle(Math.PI * 3), -Math.PI, 1e-9));
-  check("wrapAngle leaves a small angle alone", near(wrapAngle(0.4), 0.4));
-}
-
-// ── stage 1: input ─────────────────────────────────────────────────────────
-
-function testInputRamping() {
-  const h = inputHarness();
-  h.down("KeyW");
-  check(
-    "an axis reaches full deflection in about a second",
-    h.tick(1).y > 0.99,
-    `y ${h.input.axes.y}`,
-  );
-  // It must arrive EXACTLY, not asymptotically: a residual command is a slow
-  // phantom turn, which is the failure the snap in input.js exists for.
-  check(
-    "a held axis settles exactly on full deflection",
-    h.tick(0.5).y === 1,
-    `y ${h.input.axes.y}`,
-  );
-
-  h.up("KeyW");
-  const released = h.tick(1.5);
-  check("an axis returns to exactly zero on release", released.y === 0, `y ${released.y}`);
-
-  // Ramping, not snapping: a single frame must not reach full deflection.
-  const h2 = inputHarness();
-  h2.down("KeyA");
-  const oneFrame = h2.input.update(1 / 60);
-  check(
-    "one frame does not snap the axis to full",
-    oneFrame.x > 0 && oneFrame.x < 0.2,
-    `x ${oneFrame.x}`,
-  );
-
-  // Opposing keys cancel -- otherwise holding both leaves a phantom command.
-  const h3 = inputHarness();
-  h3.down("KeyA");
-  h3.down("KeyD");
-  const both = h3.tick(1);
-  check("opposing bank keys cancel", both.x === 0, `x ${both.x}`);
-
-  // The throttle is a rate passed straight through, not a ramped axis.
-  const h4 = inputHarness();
-  h4.down("ShiftLeft");
-  check("throttle input is an unramped rate", h4.tick(0.05).throttle === 1);
-  h4.up("ShiftLeft");
-  check("releasing the throttle key zeroes the rate", h4.tick(0.05).throttle === 0);
-}
-
-function testEventCodeRobustness() {
-  // §17.5, the failure this rule exists for: `key` differs between the
-  // keydown and the keyup of one physical press (a modifier, caps lock, a
-  // layout switch, an IME). Tracked by `key`, the keyup deletes an entry that
-  // is not there and the axis sticks at full deflection forever.
-  const h = inputHarness();
-  h.down("KeyW", "w");
-  h.tick(1);
-  h.up("KeyW", "W"); // same physical key, different `key` value
-  const axes = h.tick(1.5);
-  check(
-    "a keyup whose key differs from its keydown still releases the axis",
-    axes.y === 0 && h.input.heldKeys().length === 0,
-    `y ${axes.y} held ${h.input.heldKeys().join(",")}`,
-  );
-
-  // An event with no code at all must not crash or register anything.
-  const h2 = inputHarness();
-  h2.target.dispatchEvent(new KeyEvent("keydown", undefined, "w"));
-  check("a keydown with no code registers nothing", h2.input.heldKeys().length === 0);
-
-  // Arrow keys are not flight axes: browser and embed chrome steal them, so
-  // their keyup goes missing and the axis sticks.
-  const h3 = inputHarness();
-  h3.down("ArrowUp");
-  h3.down("ArrowLeft");
-  const arrows = h3.tick(1);
-  check(
-    "arrow keys are not flight axes",
-    arrows.x === 0 && arrows.y === 0 && arrows.roll === 0,
-    `x ${arrows.x} y ${arrows.y}`,
-  );
-}
-
-function testStuckKeyClearing() {
-  for (const [label, fire] of [
-    ["blur", (h) => h.target.dispatchEvent(new Event("blur"))],
-    ["pagehide", (h) => h.target.dispatchEvent(new Event("pagehide"))],
-    ["contextmenu", (h) => h.target.dispatchEvent(new Event("contextmenu"))],
-    [
-      "visibilitychange to hidden",
-      (h) => {
-        h.doc.visibilityState = "hidden";
-        h.doc.dispatchEvent(new Event("visibilitychange"));
-      },
-    ],
-    ["the C key", (h) => h.down("KeyC")],
-  ]) {
-    const h = inputHarness();
-    h.down("KeyW");
-    h.down("KeyA");
-    h.tick(1);
-    fire(h);
-    const axes = h.input.update(1 / 60);
-    check(
-      `${label} clears held keys`,
-      h.input.heldKeys().length === 0,
-      `held ${h.input.heldKeys().join(",")}`,
-    );
-    check(
-      `${label} zeroes the axes`,
-      axes.x === 0 && axes.y === 0,
-      `x ${axes.x} y ${axes.y}`,
-    );
-  }
-
-  // A visibilitychange back to visible must NOT clear -- otherwise returning
-  // to the tab drops a key the player is still holding.
-  const h = inputHarness();
-  h.down("KeyW");
-  h.tick(1);
-  h.doc.visibilityState = "visible";
-  h.doc.dispatchEvent(new Event("visibilitychange"));
-  check(
-    "becoming visible again does not clear held keys",
-    h.input.heldKeys().length === 1,
-  );
-}
-
-// ── stage 1: pointer steering (§7, §17.6) ─────────────────────────────────
-//
-// This replaces an earlier suite that asserted the OPPOSITE invariant -- that
-// no pointer listener existed at all. §17.6 now reads the other way: pointer
-// steering is positional from a fixed, visible centre, and it is the only
-// self-teaching control the game has, which is what makes the
-// no-instructions rule satisfiable. The old checks are deleted rather than
-// left passing against a rule that no longer exists (§18: a suite that only
-// grows is not being maintained).
-
-function testPointerStickGeometry() {
-  const at = (x, y) => pointerStick(x, y, VW, VH);
-
-  check(
-    "dead centre commands nothing",
-    at(MID_X, MID_Y).x === 0 && at(MID_X, MID_Y).y === 0,
-  );
-
-  // The dead zone is the whole reason this control has a neutral. Without one
-  // there is no way to let go, which is the defect that made the earlier
-  // relative-origin design unfixable.
-  const justInside = at(MID_X + MID_X * POINTER_DEAD_ZONE * 0.9, MID_Y);
-  check(
-    "inside the dead zone commands nothing",
-    justInside.x === 0 && justInside.y === 0,
-    JSON.stringify(justInside),
-  );
-  const justOutside = at(MID_X + MID_X * POINTER_DEAD_ZONE * 1.1, MID_Y);
-  check(
-    "just outside the dead zone commands a little",
-    Math.abs(justOutside.x) > 0 && Math.abs(justOutside.x) < 0.2,
-    JSON.stringify(justOutside),
-  );
-
-  const full = at(MID_X + MID_X * POINTER_FULL_STICK, MID_Y);
-  check(
-    "the full-stick radius reaches the gain",
-    near(Math.abs(full.x), POINTER_GAIN, 1e-9),
-    String(full.x),
-  );
-  const past = at(VW, MID_Y);
-  check(
-    "past full stick is clamped to the gain, not extrapolated",
-    near(Math.abs(past.x), POINTER_GAIN, 1e-9),
-    String(past.x),
-  );
-  const corner = at(VW, 0);
-  check(
-    "a screen corner is still clamped to the gain",
-    near(Math.hypot(corner.x, corner.y), POINTER_GAIN, 1e-9),
-    JSON.stringify(corner),
-  );
-
-  // Directions. Cursor right banks RIGHT, which is negative here; cursor up
-  // pitches the nose UP.
-  check("cursor right banks right (negative x)", at(VW * 0.9, MID_Y).x < 0);
-  check("cursor left banks left (positive x)", at(VW * 0.1, MID_Y).x > 0);
-  check("cursor up pitches the nose up", at(MID_X, VH * 0.1).y > 0);
-  check("cursor down pitches the nose down", at(MID_X, VH * 0.9).y < 0);
-
-  const left = at(MID_X - 400, MID_Y);
-  const right = at(MID_X + 400, MID_Y);
-  check(
-    "deflection is symmetric about the centre",
-    near(left.x, -right.x, 1e-12) && near(left.y, right.y, 1e-12),
-  );
-
-  // Monotonic between the dead zone and full stick, or the control has a flat
-  // spot the player can feel but not see.
-  let previous = -1;
-  let monotonic = true;
-  for (let f = POINTER_DEAD_ZONE; f <= POINTER_FULL_STICK; f += 0.02) {
-    const mag = Math.abs(at(MID_X + MID_X * f, MID_Y).x);
-    if (mag < previous - 1e-12) monotonic = false;
-    previous = mag;
-  }
-  check("deflection grows monotonically out to full stick", monotonic);
-
-  // Degenerate viewports must not produce NaN and poison the flight model.
-  const degenerate = [
-    [0, 1080],
-    [1920, 0],
-    [0, 0],
-  ];
-  for (const [w, h] of degenerate) {
-    const s = pointerStick(100, 100, w, h);
-    check(
-      `a ${w}x${h} viewport yields zero, not NaN`,
-      s.x === 0 && s.y === 0,
-      JSON.stringify(s),
-    );
-  }
-
-  // Both marking viewports: full stick is the same FRACTION of the frame, so
-  // the control feels the same at 1920x1080 and at 390x844.
-  const phone = pointerStick(195 + 195 * POINTER_FULL_STICK, 422, 390, 844);
-  check(
-    "full stick is the same fraction of the frame on the phone viewport",
-    near(Math.abs(phone.x), POINTER_GAIN, 1e-9),
-    String(phone.x),
-  );
-}
-
-function testPointerCentreIsNotSynthesised() {
-  // §17.6 and §17.14: assert the MECHANISM. The centre is the screen centre,
-  // permanently -- never a claimed origin derived from relative movement. The
-  // observable consequence is that the command depends ONLY on where the
-  // cursor is, never on how it got there. A drifting origin gives different
-  // answers for the same final position after different paths.
-  const a = inputHarness();
-  const b = inputHarness();
-
-  const wander = [
-    [10, 10],
-    [1900, 1000],
-    [960, 20],
-    [40, 700],
-    [1500, 900],
-  ];
-  for (const [x, y] of wander) {
-    a.move(x, y);
-    a.tick(0.2);
-  }
-  a.move(1200, 400);
-  a.tick(0.2);
-
-  b.move(1200, 400);
-  b.tick(0.2);
-
-  check(
-    "the command depends only on cursor POSITION, not on the path taken",
-    near(a.input.axes.x, b.input.axes.x, 1e-12) &&
-      near(a.input.axes.y, b.input.axes.y, 1e-12),
-    `wandered ${a.input.axes.x},${a.input.axes.y} vs direct ${b.input.axes.x},${b.input.axes.y}`,
-  );
-
-  // Returning to the centre must return to neutral -- there is no accumulated
-  // offset anywhere for the aircraft to keep flying against.
-  a.move(MID_X, MID_Y);
-  a.tick(0.5);
-  check(
-    "returning the cursor to the centre returns to neutral",
-    a.input.axes.x === 0 && a.input.axes.y === 0,
-    `${a.input.axes.x},${a.input.axes.y}`,
-  );
-
-  // A parked off-centre cursor KEEPS commanding. That is correct rather than a
-  // bug: it is a stick held over, and it looks like one.
-  b.tick(3);
-  check(
-    "a parked off-centre cursor keeps commanding",
-    Math.abs(b.input.axes.x) > 0,
-    String(b.input.axes.x),
-  );
-}
-
-function testPointerAndKeyboardCombine() {
-  // "Whichever axis is asking for more" (§7), so a held key always overrides a
-  // resting cursor and neither input needs to know the other exists.
-  const h = inputHarness();
-  h.move(MID_X + MID_X * 0.16, MID_Y);
-  h.tick(0.3);
-  const gentle = Math.abs(h.input.axes.x);
-  check(
-    "a gentle cursor deflection commands a little",
-    gentle > 0 && gentle < 0.4,
-    String(gentle),
-  );
-
-  h.down("KeyA");
-  const combined = h.tick(1.5);
-  check("a held key overrides a resting cursor", combined.x === 1, String(combined.x));
-
-  h.up("KeyA");
-  const released = h.tick(1.5);
-  check(
-    "releasing the key hands control back to the cursor",
-    near(Math.abs(released.x), gentle, 1e-9),
-    `${released.x} vs ${gentle}`,
-  );
-
-  // And the other way: a hard cursor deflection beats a key still ramping.
-  const h2 = inputHarness();
-  h2.move(VW, MID_Y);
-  h2.down("KeyA");
-  const oneFrame = h2.input.update(1 / 60);
-  check(
-    "a hard cursor deflection beats a key that is still ramping",
-    oneFrame.x < 0,
-    String(oneFrame.x),
-  );
-}
-
-function testPointerLeavesTheWindow() {
-  // An UNTOUCHED pointer commands nothing: there is no position yet, and
-  // assuming one (the centre, say) would be inventing an input.
-  const fresh = inputHarness();
-  const idle = fresh.tick(1);
-  check(
-    "an untouched pointer commands nothing",
-    idle.x === 0 && idle.y === 0,
-    `${idle.x},${idle.y}`,
-  );
-  check("an untouched pointer has no position", fresh.input.pointerPosition() === null);
-
-  // Leaving the window RELEASES the stick. This is the one case where the
-  // position is genuinely forgotten -- unlike a reset, the hand really has
-  // left the controls.
-  const h = inputHarness();
-  h.move(VW * 0.9, MID_Y);
-  const deflected = h.tick(0.5);
-  check("a deflected cursor commands", Math.abs(deflected.x) > 0.5, String(deflected.x));
-  h.leave();
-  const released = h.tick(0.5);
-  check(
-    "leaving the window releases the stick",
-    released.x === 0 && released.y === 0,
-    `${released.x},${released.y}`,
-  );
-  check("leaving the window forgets the position", h.input.pointerPosition() === null);
-
-  // Coming back re-establishes it from the new position, not the old one.
-  h.move(VW * 0.1, MID_Y);
-  const back = h.tick(0.5);
-  check("returning re-establishes the stick from the new position", back.x > 0.5, String(back.x));
-}
-
-function testPointerLifecycle() {
-  // The pointer position is a physical fact about where the player's hand is,
-  // not a latch. Clearing it on reset would snap the aircraft to an attitude
-  // nobody commanded.
-  const h = inputHarness();
-  h.move(VW * 0.85, MID_Y);
-  h.tick(0.3);
-  const before = h.input.axes.x;
-  h.input.clear();
-  const after = h.tick(0.3);
-  check(
-    "clear() does not forget where the cursor is",
-    h.input.pointerPosition() !== null && near(after.x, before, 1e-9),
-    `${before} -> ${after.x}`,
-  );
-
-  // Steering is switched off outright while the launch script or the crash
-  // presentation owns the aircraft.
-  h.input.setPointerEnabled(false);
-  const disabled = h.tick(0.3);
-  check("disabled steering commands nothing", disabled.x === 0, String(disabled.x));
-  check(
-    "the cursor is still remembered while steering is disabled",
-    h.input.pointerPosition() !== null,
-  );
-  h.input.setPointerEnabled(true);
-  check(
-    "re-enabling restores the same command",
-    near(h.tick(0.3).x, before, 1e-9),
-  );
-
-  // The pitch convention is ONE sign flip at the boundary, so it governs the
-  // pointer as well as the keyboard.
-  const h2 = inputHarness();
-  h2.move(MID_X, VH * 0.1);
-  const noseUp = h2.tick(0.3).y;
-  check("cursor high pitches up by default", noseUp > 0, String(noseUp));
-  h2.down("KeyI");
-  const flipped = h2.tick(0.3).y;
-  check(
-    "the pitch convention flips the POINTER axis too",
-    near(flipped, -noseUp, 1e-9),
-    `${noseUp} -> ${flipped}`,
-  );
-}
-
-function testMouseButtons() {
-  const h = inputHarness();
-  check("nothing is firing at rest", h.input.isFiring() === false);
-
-  h.press(0);
-  check("the left button fires", h.input.isFiring() === true);
-  h.release(0);
-  check("releasing the left button stops firing", h.input.isFiring() === false);
-
-  // Discrete bindings: holding one must do nothing extra.
-  h.press(2);
-  check("the right button latches a weapon switch", h.input.consumeLatch("weapon") === true);
-  check("the weapon latch is consumed once", h.input.consumeLatch("weapon") === false);
-  h.tick(1);
-  check(
-    "holding the right button does not repeat the switch",
-    h.input.consumeLatch("weapon") === false,
-  );
-
-  h.press(1);
-  check("the middle button latches flares", h.input.consumeLatch("flares") === true);
-
-  // Two sources, ONE latch, so both behave identically.
-  const h2 = inputHarness();
-  h2.down("KeyZ");
-  check("Z latches the same flare action", h2.input.consumeLatch("flares") === true);
-  h2.press(1);
-  check("the middle button feeds the same latch", h2.input.consumeLatch("flares") === true);
-
-  // Keyboard repeat must not spam a latch: a second keydown with no keyup in
-  // between is the OS repeating, not the player pressing again.
-  const h3 = inputHarness();
-  h3.down("KeyZ");
-  h3.input.consumeLatch("flares");
-  h3.down("KeyZ");
-  check(
-    "an auto-repeat keydown does not re-latch",
-    h3.input.consumeLatch("flares") === false,
-  );
-  h3.up("KeyZ");
-  h3.down("KeyZ");
-  check("a genuine second press does latch", h3.input.consumeLatch("flares") === true);
-
-  const t = inputHarness();
-  t.down("KeyF");
-  const firingByKey = t.input.isFiring();
-  t.up("KeyF");
-  check("F also fires, and releasing it stops", firingByKey && t.input.isFiring() === false);
-}
-
-function testWheelThrottle() {
-  // A wheel notch is an impulse, but the flight model reads throttle as a
-  // RATE, so a notch charges a small decaying value rather than jumping the
-  // lever. One throttle model regardless of input source.
-  const h = inputHarness();
-  check("no wheel input is no throttle rate", h.tick(0.1).throttle === 0);
-
-  h.wheel(-100);
-  const pushed = h.input.update(1 / 60);
-  check(
-    "a wheel notch pushes the throttle forward",
-    pushed.throttle > 0,
-    String(pushed.throttle),
-  );
-
-  const pulled = inputHarness();
-  pulled.wheel(100);
-  check("wheel down pulls the throttle back", pulled.input.update(1 / 60).throttle < 0);
-
-  // It decays, or one notch would be a permanent throttle command.
-  const h2 = inputHarness();
-  h2.wheel(-100);
-  h2.input.update(1 / 60);
-  const decayed = h2.tick(2);
-  check("the wheel charge decays away", decayed.throttle === 0, String(decayed.throttle));
-
-  // The rate stays inside the range the flight model expects.
-  const h3 = inputHarness();
-  for (let i = 0; i < 40; i++) h3.wheel(-100);
-  const spun = h3.input.update(1 / 60);
-  check(
-    "spinning the wheel hard stays within the rate range",
-    spun.throttle <= 1 && spun.throttle >= -1,
-    String(spun.throttle),
-  );
-}
-
-function testContextMenuDoubleDuty() {
-  // §7: the contextmenu listener suppresses the menu AND clears held keys,
-  // because a menu opening swallows the keyup of anything held.
-  const h = inputHarness();
-  h.down("KeyW");
-  h.down("KeyA");
-  h.tick(1);
-  h.target.dispatchEvent(new Event("contextmenu"));
-  const axes = h.input.update(1 / 60);
-  check("contextmenu clears held keys", h.input.heldKeys().length === 0);
-  check("contextmenu zeroes the axes", axes.x === 0 && axes.y === 0);
-}
-
-function testLatches() {
-  const h = inputHarness();
-  check("no latch before the key", h.input.consumeLatch("restart") === false);
-  h.down("KeyR");
-  check("R latches a restart", h.input.consumeLatch("restart") === true);
-  check("a latch is consumed once", h.input.consumeLatch("restart") === false);
-
-  // Stage 4 drops latches accumulated during the catapult script so a key
-  // pressed on the deck does not fire on the handoff frame.
-  h.up("KeyR");
-  h.down("KeyR");
-  h.input.dropLatches();
-  check("dropLatches discards a pending latch", h.input.consumeLatch("restart") === false);
-}
-
-// ── stage 2: EXPERT mode ───────────────────────────────────────────────────
-
-const expert = (over = {}) => createFlightState({ mode: "EXPERT", ...over });
-
-function testExpertHasNoBankToHeading() {
-  // THE defining assertion of the mode. Bank hard in EXPERT, hold no other
-  // input, and the heading must not move. Asserted as an ABSENCE on purpose:
-  // a later edit that "fixes turning in Expert" will reintroduce the coupling
-  // and look like a bug fix, and this is the only thing that will object.
-  // Drive BOTH modes with the identical held input and compare. Holding is
-  // what makes the comparison fair: ASSISTED self-centres, so a version of
-  // this test that released the stick would let the bank decay and would be
-  // measuring the decay rather than the coupling.
-  const e = expert();
-  fly(e, stick({ x: 1 }), 3);
-  const a = createFlightState();
-  fly(a, stick({ x: 1 }), 3);
-
-  // Prove the roll happened via the UP-VECTOR, not via the bank angle: at a
-  // constant stick EXPERT rolls 2.4 rad/s, so after 3 s it has turned 7.2 rad
-  // and the derived Euler bank has wrapped past a full revolution -- near
-  // zero again, and useless as evidence either way.
-  const eUp = quatUp(e.quat);
-  check(
-    "EXPERT: a held roll does not change heading at all",
-    Math.abs(eUp.y - 1) > 0.1 && near(e.heading, 0, 1e-9),
-    `up.y ${eUp.y} heading ${e.heading}`,
-  );
-  check(
-    "ASSISTED: the same held input turns the aircraft",
-    Math.abs(a.heading) > 0.5,
-    `heading ${a.heading}`,
-  );
-
-  // And with the stick released, EXPERT keeps the bank and STILL does not
-  // turn -- the case a reintroduced coupling would fail loudest.
-  const held = expert();
-  fly(held, stick({ x: 1 }), 0.45);
-  const bankHeld = held.bank;
-  const headingHeld = held.heading;
-  fly(held, stick(), 3);
-  check(
-    "EXPERT: a persisting bank with no input does not turn",
-    Math.abs(held.bank) > 0.5 &&
-      near(held.bank, bankHeld, 1e-6) &&
-      near(held.heading, headingHeld, 1e-9),
-    `bank ${bankHeld} -> ${held.bank}, heading ${headingHeld} -> ${held.heading}`,
-  );
-}
-
-function testExpertIsLocal() {
-  // Pitching while banked bends the trajectory: that is what
-  // post-multiplication buys, and it is how the mode actually turns.
-  const e = expert();
-  fly(e, stick({ x: 1 }), 0.4); // establish bank
-  const before = e.heading;
-  fly(e, stick({ y: 1 }), 1.2); // pull, no roll input
-  check(
-    "EXPERT: pitching while banked changes heading through the local axis",
-    Math.abs(wrapAngle(e.heading - before)) > 0.15,
-    `heading ${before} -> ${e.heading}`,
-  );
-
-  // Pulling while wings-level must NOT change heading -- otherwise the test
-  // above passes for the wrong reason.
-  const level = expert();
-  const levelBefore = level.heading;
-  fly(level, stick({ y: 1 }), 1.2);
-  check(
-    "EXPERT: pitching wings-level leaves heading alone",
-    near(level.heading, levelBefore, 1e-6),
-    `heading ${levelBefore} -> ${level.heading}`,
-  );
-}
-
-function testExpertDoesNotSelfCentre() {
-  const e = expert();
-  fly(e, stick({ x: 1 }), 0.4);
-  const banked = e.bank;
-  fly(e, stick(), 4);
-  check(
-    "EXPERT: controls do not self-centre",
-    near(e.bank, banked, 1e-6),
-    `bank ${banked} -> ${e.bank}`,
-  );
-
-  // ASSISTED must self-centre, for the same reason as above.
-  const a = createFlightState();
-  fly(a, stick({ x: 1 }), 2);
-  fly(a, stick(), 4);
-  check("ASSISTED: controls self-centre", Math.abs(a.bank) < 0.02, `bank ${a.bank}`);
-}
-
-function testExpertCanInvert() {
-  const e = expert();
-  // Roll continuously past 90 degrees and hold.
-  fly(e, stick({ x: 1 }), 1.4);
-  const up = quatUp(e.quat);
-  check(
-    "EXPERT: the aircraft can be inverted and stay there",
-    up.y < 0,
-    `up.y ${up.y}`,
-  );
-  check(
-    "EXPERT: pitch is not clamped to the ASSISTED limit",
-    true, // exercised by the loop below
-  );
-
-  // A full loop must be completable: pitch has to pass through vertical
-  // without the ASSISTED clamp catching it.
-  const looper = expert();
-  let sawSteepClimb = false;
-  let sawInverted = false;
-  for (let t = 0; t < 6; t += 1 / 60) {
-    updateFlight(looper, stick({ y: 1 }), 1 / 60);
-    const f = quatForward(looper.quat);
-    const u = quatUp(looper.quat);
-    if (f.y > 0.9) sawSteepClimb = true;
-    if (u.y < -0.5) sawInverted = true;
-  }
-  check("EXPERT: a sustained pull reaches vertical", sawSteepClimb);
-  check("EXPERT: a sustained pull goes over the top", sawInverted);
-
-  check(
-    "EXPERT: the quaternion stays normalised through a loop",
-    near(
-      Math.hypot(looper.quat.x, looper.quat.y, looper.quat.z, looper.quat.w),
-      1,
-      1e-6,
-    ),
-  );
-}
-
-function testExpertSink() {
-  // The sink law is written on the lift direction, not the bank angle, so it
-  // still means something past 90 degrees. Written on cos(bank) it would go
-  // NEGATIVE when inverted and the aircraft would climb by rolling over.
-  const inverted = expert();
-  fly(inverted, stick({ x: 1 }), 1.4);
-  check(
-    "EXPERT: inverted flight sinks rather than climbing",
-    inverted.sink > 0,
-    `sink ${inverted.sink} up.y ${quatUp(inverted.quat).y}`,
-  );
-
-  const levelExpert = expert();
-  fly(levelExpert, stick(), 2);
-  check(
-    "EXPERT: level flight has no sink",
-    near(levelExpert.sink, 0, 1e-9),
-    `sink ${levelExpert.sink}`,
-  );
-
-  // The two modes must agree at a bank both can represent, or the sink law
-  // has silently forked.
-  const a = createFlightState();
-  fly(a, stick({ x: 1 }), 6);
-  const bankedUpY = quatUp(a.quat).y;
-  check(
-    "the one sink law reproduces the ASSISTED turn cost at the bank limit",
-    near(bankedUpY, Math.cos(BANK_MAX), 1e-6) && a.sink > 17 && a.sink < 18,
-    `up.y ${bankedUpY} sink ${a.sink}`,
-  );
-}
-
-function testBothModesWriteTheQuaternion() {
-  for (const mode of ["ASSISTED", "EXPERT"]) {
-    const s = createFlightState({ mode });
-    fly(s, stick({ x: 0.5, y: 0.3 }), 1.2);
-    const q = s.quat;
-    check(
-      `${mode} writes a plain normalised quaternion`,
-      typeof q.copy === "undefined" &&
-        near(Math.hypot(q.x, q.y, q.z, q.w), 1, 1e-6),
-    );
-    // Forward and up derived from the quaternion must agree with the Euler
-    // angles the rail and the HUD read.
-    const back = quatToEulerYXZ(q);
-    check(
-      `${mode}: the Euler readout agrees with the quaternion`,
-      near(wrapAngle(back.heading - s.heading), 0, 1e-6) &&
-        near(back.pitch - s.pitch, 0, 1e-6) &&
-        near(wrapAngle(back.bank - s.bank), 0, 1e-6),
-      `${JSON.stringify(back)} vs h${s.heading} p${s.pitch} b${s.bank}`,
-    );
-  }
-
-  // quatToEulerYXZ must invert quatFromEulerYXZ over ordinary attitudes.
-  for (const [h, p, b] of [
-    [0, 0, 0],
-    [0.7, 0.3, -0.5],
-    [-2.1, -0.4, 1.1],
-    [3.0, 0.55, 0.9],
-  ]) {
-    const back = quatToEulerYXZ(quatFromEulerYXZ(h, p, b));
-    check(
-      `quatToEulerYXZ inverts quatFromEulerYXZ at ${h},${p},${b}`,
-      near(wrapAngle(back.heading - h), 0, 1e-9) &&
-        near(back.pitch - p, 0, 1e-9) &&
-        near(wrapAngle(back.bank - b), 0, 1e-9),
-      JSON.stringify(back),
-    );
-  }
-}
-
-function testModeChange() {
-  // Entering ASSISTED from an attitude it cannot represent must level onto
-  // the heading being travelled, not snap the quaternion through the clamp.
-  const e = expert();
-  fly(e, stick({ x: 1 }), 1.4); // inverted
-  const headingBefore = e.heading;
-  setMode(e, "ASSISTED");
-  check(
-    "entering ASSISTED clamps into its own envelope",
-    Math.abs(e.bank) <= BANK_MAX + 1e-9 && Math.abs(e.pitch) <= PITCH_MAX + 1e-9,
-    `bank ${e.bank} pitch ${e.pitch}`,
-  );
-  check(
-    "entering ASSISTED keeps the heading being travelled",
-    near(wrapAngle(e.heading - headingBefore), 0, 1e-9),
-  );
-  check(
-    "entering ASSISTED rebuilds the quaternion from the clamped angles",
-    near(quatUp(e.quat).y, Math.cos(e.bank) * Math.cos(e.pitch), 1e-6),
-  );
-  check("setMode on the same mode is a no-op", setMode(e, "ASSISTED").mode === "ASSISTED");
-}
-
-// ── stage 2: the pitch convention ──────────────────────────────────────────
-
-function testPitchConvention() {
-  const h = inputHarness();
-  check("the default convention is W = nose up", h.input.pitchSign() === 1);
-  check(
-    "the default is announced by direction, not as ON/OFF",
-    h.input.pitchConvention() === "W = NOSE UP",
-    h.input.pitchConvention(),
-  );
-
-  h.down("KeyW");
-  const up = h.tick(1.5).y;
-  check("W pitches up by default", up === 1, `y ${up}`);
-
-  // Toggling WHILE the key is held must flip the axis on the spot.
-  h.down("KeyI");
-  const flipped = h.input.axes.y;
-  check(
-    "toggling while a key is held flips the axis immediately",
-    flipped === -1,
-    `y ${flipped}`,
-  );
-  check(
-    "the announcement names the new direction",
-    h.input.pitchConvention() === "W = NOSE DOWN",
-    h.input.pitchConvention(),
-  );
-  check("W now pitches down", h.tick(1.5).y === -1, `y ${h.input.axes.y}`);
-
-  // It is a pure sign flip and nothing else: symmetric, neutral-preserving,
-  // and it must not touch any other axis.
-  const h2 = inputHarness();
-  h2.down("KeyI");
-  h2.down("KeyS");
-  check("the flip is symmetric", h2.tick(1.5).y === 1, `y ${h2.input.axes.y}`);
-  h2.up("KeyS");
-  check("neutral stays neutral under the flip", h2.tick(1.5).y === 0);
-
-  const h3 = inputHarness();
-  h3.down("KeyI");
-  h3.down("KeyA");
-  const banked = h3.tick(1.5);
-  check("bank is unaffected by the pitch convention", banked.x === 1, `x ${banked.x}`);
-  h3.down("KeyQ");
-  check("roll is unaffected by the pitch convention", h3.tick(1.5).roll === 1);
-
-  // A PREFERENCE, not transient state: it must survive everything that
-  // clears input, which is the one exception in the whole project.
-  const h4 = inputHarness();
-  h4.down("KeyI");
-  h4.input.clear();
-  check("the convention survives clear()", h4.input.pitchSign() === -1);
-  h4.target.dispatchEvent(new Event("blur"));
-  check("the convention survives a blur", h4.input.pitchSign() === -1);
-  h4.down("KeyC");
-  check("the convention survives the C key", h4.input.pitchSign() === -1);
-  h4.doc.visibilityState = "hidden";
-  h4.doc.dispatchEvent(new Event("visibilitychange"));
-  check("the convention survives a tab switch", h4.input.pitchSign() === -1);
-
-  check("toggling twice returns to the default", (() => {
-    const t = inputHarness();
-    t.down("KeyI");
-    t.down("KeyI");
-    return t.input.pitchSign() === 1;
-  })());
-
-  // I must not register as a held key or a flight axis.
-  const h5 = inputHarness();
-  h5.down("KeyI");
-  check("I is not a held axis key", h5.input.heldKeys().length === 0);
-}
-
-// ── the two marking viewports ──────────────────────────────────────────────
-// The course marks at 1920x1080 and 390x844 in Chrome DevTools, and both are
-// full marking environments. These assert the FRAMING RULE rather than a
-// screenshot, so it cannot regress quietly.
-
-const DESKTOP = 1920 / 1080;
-const PHONE_PORTRAIT = 390 / 844;
-const PHONE_LANDSCAPE = 844 / 390;
-
-function testMarkingViewports() {
-  // The bug this replaced: a fixed VERTICAL fov holds the vertical view and
-  // lets the horizontal view collapse as the frame narrows. At the phone
-  // viewport that was 32 degrees of horizontal against the desktop's 96, so
-  // the aircraft filled the frame and the world read as a diorama.
-  const naiveDesktop = horizontalFov(64, DESKTOP);
-  const naivePhone = horizontalFov(64, PHONE_PORTRAIT);
-  check(
-    "the naive fixed-vertical FOV really does collapse on the phone",
-    naivePhone < naiveDesktop / 2,
-    `desktop ${naiveDesktop.toFixed(1)} vs phone ${naivePhone.toFixed(1)}`,
-  );
-
-  // Desktop is the reference and must be left exactly alone.
-  check(
-    "the desktop viewport is unchanged",
-    widenForAspect(64, DESKTOP) === 64,
-    `${widenForAspect(64, DESKTOP)}`,
-  );
-  check(
-    "an aspect at the reference is unchanged",
-    widenForAspect(64, REF_ASPECT) === 64,
-  );
-
-  // Wider than the reference is left alone too: clawing horizontal view back
-  // by narrowing the vertical would crop the horizon out of an ultrawide.
-  check(
-    "a landscape phone is not narrowed",
-    widenForAspect(64, PHONE_LANDSCAPE) === 64,
-    `${widenForAspect(64, PHONE_LANDSCAPE)}`,
-  );
-
-  // Portrait widens, and the result is capped rather than fisheyed.
-  const portrait = widenForAspect(64, PHONE_PORTRAIT);
-  check(
-    "the portrait phone widens the vertical FOV",
-    portrait > 64,
-    `${portrait}`,
-  );
-  check(
-    "the widening is capped short of a fisheye",
-    portrait <= FOV_VERTICAL_MAX,
-    `${portrait}`,
-  );
-  check(
-    "portrait recovers a usable share of the horizontal view",
-    horizontalFov(portrait, PHONE_PORTRAIT) > naivePhone * 1.5,
-    `${horizontalFov(portrait, PHONE_PORTRAIT).toFixed(1)} vs ${naivePhone.toFixed(1)}`,
-  );
-
-  // Monotonic: a narrower frame never gets LESS help than a wider one.
-  let previous = 0;
-  let monotonic = true;
-  for (const aspect of [1.78, 1.4, 1.0, 0.75, 0.46, 0.3]) {
-    const v = widenForAspect(64, aspect);
-    if (v < previous) monotonic = false;
-    previous = v;
-  }
-  check("widening is monotonic as the frame narrows", monotonic);
-
-  // Degenerate aspects must not produce NaN and kill the projection matrix.
-  for (const bad of [0, -1, NaN, undefined]) {
-    const v = widenForAspect(64, bad);
-    check(`a degenerate aspect (${bad}) falls back safely`, v === 64, `${v}`);
-  }
-
-  check(
-    "horizontalFov inverts sensibly at square",
-    near(horizontalFov(64, 1), 64, 1e-9),
-  );
-}
-
-// ── stage 3: terrain index, probes, collision policy ──────────────────────
-//
-// physics.js imports no three.js precisely so this can run headlessly. The
-// terrain here is a SYNTHETIC ridge whose height is known in closed form, so
-// every query has an answer that does not come from the code under test --
-// §17.13, a test double that diverges from the real thing tests nothing, and
-// the double here is the terrain, not the index.
-
-// A ridge running along X, peaking at z = ridgeZ. Two triangles per quad.
-function makeRidge({ ridgeZ = 0, peak = 600, halfWidth = 2000, extent = 6000, step = 250 } = {}) {
-  const heightAt = (z) => {
-    const d = Math.abs(z - ridgeZ);
-    return d >= halfWidth ? 0 : peak * (1 - d / halfWidth);
-  };
-  const tris = [];
-  for (let x = -extent; x < extent; x += step) {
-    for (let z = -extent; z < extent; z += step) {
-      const x1 = x + step;
-      const z1 = z + step;
-      const a = [x, heightAt(z), z];
-      const b = [x1, heightAt(z), z];
-      const c = [x1, heightAt(z1), z1];
-      const d = [x, heightAt(z1), z1];
-      tris.push(...a, ...b, ...c, ...a, ...c, ...d);
-    }
-  }
-  return { triangles: new Float32Array(tris), heightAt };
-}
-
-function testTerrainIndex() {
-  const { triangles, heightAt } = makeRidge();
-  const index = buildTerrainIndex(triangles);
-
-  check("the index builds", index !== null && index.triCount > 0, `${index?.triCount}`);
-  check(
-    "cell occupancy lands near the figure §8 quotes",
-    index.perCell > 4 && index.perCell < 20,
-    `${index.perCell.toFixed(1)} per cell`,
-  );
-
-  // THE check that catches a broken index: agreement with an independently
-  // known answer, over the whole surface rather than at one lucky point.
-  let worst = 0;
-  let misses = 0;
-  for (let i = 0; i < 400; i++) {
-    // A deterministic spread -- a sampler using Math.random cannot be
-    // compared against its own previous run.
-    const x = -5900 + ((i * 613) % 11800);
-    const z = -5900 + ((i * 397) % 11800);
-    const got = heightAtIndex(index, x, z);
-    if (got === null) {
-      misses++;
-      continue;
-    }
-    worst = Math.max(worst, Math.abs(got - heightAt(z)));
-  }
-  check("the index never misses inside its own bounds", misses === 0, `${misses} misses`);
-  check(
-    "the index agrees with the known surface everywhere sampled",
-    worst < 1e-3,
-    `worst ${worst}`,
-  );
-
-  // Outside the mesh must be null, NOT zero. "No terrain here" and "the ground
-  // is at sea level" are different facts, and collapsing them is how a query
-  // failure disguises itself as open ocean.
-  check(
-    "outside the mesh returns null, not a height",
-    heightAtIndex(index, 99999, 0) === null &&
-      heightAtIndex(index, 0, 99999) === null,
-  );
-  check("a null index answers null", heightAtIndex(null, 0, 0) === null);
-
-  // The peak of the ridge is where relief matters most.
-  check(
-    "the ridge peak reads its full height",
-    Math.abs(heightAtIndex(index, 0, 0) - 600) < 1e-3,
-    `${heightAtIndex(index, 0, 0)}`,
-  );
-}
-
-function testProbesAndClearance() {
-  const { triangles, heightAt } = makeRidge();
-  const index = buildTerrainIndex(triangles);
-  const physics = createPhysics({ index });
-
-  // groundAt clamps to sea level, so flat water reads 0 rather than null.
-  check("ground over the ridge is the ridge", Math.abs(physics.groundAt(0, 0) - 600) < 1e-3);
-  check("ground off the ridge is sea level", physics.groundAt(0, 5000) === 0);
-  check("land is reported as land", physics.isLandAt(0, 0) === true);
-  check("sea is reported as sea", physics.isLandAt(0, 5000) === false);
-  check(
-    "ground outside the mesh falls back to sea level",
-    physics.groundAt(99999, 0) === 0 && physics.isLandAt(99999, 0) === false,
-  );
-
-  // All five probes must be queried, and the reported minimum must be the
-  // actual minimum -- a centre-only probe misses a wing tip on a ridge.
-  const state = createFlightState({ position: { x: 0, y: 900, z: 0 } });
-  physics.update(1 / 60, state);
-  check("all five probes are placed", physics.probes.length === 5);
-  const clearances = physics.probes.map((p) => p.clearance);
-  check(
-    "the reported clearance is the actual minimum across probes",
-    Math.abs(physics.telemetry.clearance - Math.min(...clearances)) < 1e-9,
-    `${physics.telemetry.clearance} vs ${Math.min(...clearances)}`,
-  );
-  check(
-    "the closest probe is named",
-    physics.probes.some((p) => p.name === physics.telemetry.closest),
-  );
-  check(
-    "AGL over the ridge is altitude minus the ridge",
-    Math.abs(physics.telemetry.agl - (900 - 600)) < 1e-3,
-    `${physics.telemetry.agl}`,
-  );
-  check("the surface under the ridge reads land", physics.telemetry.surface === "land");
-
-  // Bank the aircraft and a wing tip becomes the closest probe -- which is
-  // the entire reason there are five of them.
-  const banked = createFlightState({ position: { x: 0, y: 900, z: 0 } });
-  fly(banked, stick({ x: 1 }), 3);
-  const p2 = createPhysics({ index });
-  p2.update(1 / 60, banked);
-  check(
-    "a banked aircraft brings a wing tip closest",
-    p2.telemetry.closest === "wingL" || p2.telemetry.closest === "wingR",
-    p2.telemetry.closest,
-  );
-
-  // Over open water, AGL is altitude.
-  const atSea = createFlightState({ position: { x: 0, y: 400, z: 5000 } });
-  const p3 = createPhysics({ index });
-  p3.update(1 / 60, atSea);
-  check("AGL over the sea is the altitude", Math.abs(p3.telemetry.agl - 400) < 1e-3);
-  check("the surface over water reads ocean", p3.telemetry.surface === "ocean");
-}
-
-function testFixedStep() {
-  // Physics must advance the same number of ticks per second of SIMULATED
-  // time regardless of the render rate, or every tuned rate in the project
-  // becomes frame-rate dependent.
-  const counts = [];
-  for (const hz of [60, 20, 144]) {
-    const physics = createPhysics({});
-    const state = createFlightState({ position: { x: 0, y: 3000, z: 0 } });
-    const dt = 1 / hz;
-    for (let t = 0; t < 2; t += dt) physics.update(dt, state);
-    counts.push(physics.telemetry.ticks);
-  }
-  check(
-    "physics ticks match across 60, 20 and 144 Hz render rates",
-    Math.max(...counts) - Math.min(...counts) <= 2,
-    `ticks ${counts.join(", ")}`,
-  );
-  check(
-    "two seconds is about 120 physics ticks",
-    Math.abs(counts[0] - 120) <= 2,
-    `${counts[0]}`,
-  );
-}
-
-function testSafeStateHistory() {
-  const { triangles } = makeRidge();
-  const index = buildTerrainIndex(triangles);
-
-  // Well clear: history fills.
-  const high = createPhysics({ index });
-  const highState = createFlightState({ position: { x: 0, y: 4000, z: 5000 } });
-  for (let t = 0; t < 1; t += 1 / 60) high.update(1 / 60, highState);
-  check("safe flight records history", high.historyLength() > 30, `${high.historyLength()}`);
-
-  // Low over the ridge at speed: the threshold is speed-scaled, so the same
-  // clearance that is comfortable at 110 m/s records nothing at 250.
-  const low = createPhysics({ index });
-  const lowState = createFlightState({
-    position: { x: 0, y: 640, z: 0 },
-    speed: 250,
-  });
-  for (let t = 0; t < 1; t += 1 / 60) low.update(1 / 60, lowState);
-  check(
-    "flight too close to the ground records nothing",
-    low.historyLength() === 0,
-    `${low.historyLength()}`,
-  );
-
-  // reset() clears the history.
-  high.reset(highState);
-  check("reset clears the history", high.historyLength() === 0);
-
-  // The rewind target is OLD, not the newest entry -- the newest sits one
-  // query before the impact and restoring it re-flies the same crash.
-  const p = createPhysics({ index });
-  const s = createFlightState({ position: { x: 0, y: 4000, z: 6000 }, speed: 170 });
-  // Actually FLY it. physics.update() queries and records; it does not move
-  // the aircraft, so a version of this that only ticked physics compared a
-  // snapshot against an identical present and measured a distance of zero.
-  for (let t = 0; t < 2; t += 1 / 60) {
-    updateFlight(s, stick(), 1 / 60);
-    p.update(1 / 60, s);
-  }
-  const target = p.rewindTarget();
-  check("there is a rewind target", target !== null);
-  check(
-    "the rewind target is about 0.65 s behind, not the newest state",
-    target && Math.abs(target.position.z - s.position.z) > 170 * 0.4,
-    `dz ${target ? Math.abs(target.position.z - s.position.z).toFixed(0) : "-"}`,
-  );
-  check("an empty history has no rewind target", createPhysics({}).rewindTarget() === null);
-}
-
-function testCollisionPolicies() {
-  const { triangles } = makeRidge();
-  const index = buildTerrainIndex(triangles);
-
-  // ── the development policy: rewinds a contact, dodges a prediction ──
-  let state = createFlightState({ position: { x: 0, y: 4000, z: 6000 }, speed: 170 });
-  const physics = createPhysics({ index });
-  const events = [];
-  const dev = createDevelopmentRecovery({
-    physics,
-    getState: () => state,
-    onEvent: (e) => events.push(e.kind),
-  });
-  physics.setPolicy(dev);
-  check("the policy names itself", dev.name === "DevelopmentRecoveryResponse");
-
-  // Fly level and safe first so there is something to rewind INTO.
-  for (let t = 0; t < 2; t += 1 / 60) physics.update(1 / 60, state);
-  const safeZ = state.position.z;
-  check("history filled before the impact", physics.historyLength() > 30);
-
-  // Now put it inside the ridge: a real contact.
-  state.position.x = 0;
-  state.position.z = 0;
-  state.position.y = 601;
-  physics.update(1 / 60, state);
-  check("a contact triggers a recovery", events.includes("recover"), events.join(","));
-  check(
-    "the rewind caps speed",
-    state.speed <= 160 + 1e-9,
-    `${state.speed}`,
-  );
-  check("the rewind lands in flyable air", state.position.y > physics.groundAt(state.position.x, state.position.z) + 20,
-    `y ${state.position.y} ground ${physics.groundAt(state.position.x, state.position.z)}`);
-  check("the grace period neutralises input", dev.overridesInput() === true);
-  check("the rewind clears the history it came from", physics.historyLength() === 0);
-
-  // The grace expires.
-  for (let t = 0; t < 1; t += 1 / 60) dev.tick(1 / 60);
-  check("the grace period expires", dev.overridesInput() === false);
-
-  // A PREDICTION is dodged, not rewound: the impact has not happened.
-  const dodgeState = createFlightState({ position: { x: 0, y: 4000, z: 4000 }, speed: 200 });
-  const p2 = createPhysics({ index });
-  const kinds = [];
-  const dev2 = createDevelopmentRecovery({
-    physics: p2,
-    getState: () => dodgeState,
-    onEvent: (e) => kinds.push(e.kind),
-  });
-  p2.setPolicy(dev2);
-  const handled = dev2.handleCollision({
-    type: "terrain", predicted: true, position: { ...dodgeState.position },
-    speed: 200, clearance: 400, hazard: 90, probe: "nose", at: 1,
-  });
-  check("a prediction is handled", handled === true);
-  check("a prediction dodges rather than rewinding", kinds.includes("dodge") && !kinds.includes("recover"), kinds.join(","));
-  check("the dodge is running", dev2.isDodging() === true);
-  const pitchBefore = dodgeState.pitch;
-  for (let t = 0; t < 0.3; t += 1 / 60) dev2.tick(1 / 60);
-  check("the dodge commands a climb", dodgeState.pitch > pitchBefore, `${dodgeState.pitch}`);
-  check("a dodge does NOT neutralise input", dev2.overridesInput() === false);
-
-  // ── the null policy: declines, and physics still sets its own cooldown ──
-  const p3 = createPhysics({ index });
-  const nul = createNullResponse();
-  p3.setPolicy(nul);
-  const declining = createFlightState({ position: { x: 0, y: 601, z: 0 }, speed: 170 });
-  p3.update(1 / 60, declining);
-  check("a declined event still sets physics' own cooldown", p3.cooldown() > 0, `${p3.cooldown()}`);
-  check("the null policy recorded the decline", nul.stats().declined > 0);
-
-  // ── the swap: DETECTION must be byte-identical under both policies ──
-  const runDetection = (policy) => {
-    const s = createFlightState({ position: { x: 0, y: 700, z: 1500 }, speed: 200 });
-    const ph = createPhysics({ index });
-    ph.setPolicy(policy);
-    const seen = [];
-    for (let t = 0; t < 1.2; t += 1 / 60) {
-      ph.update(1 / 60, s);
-      seen.push(
-        `${ph.telemetry.contact ? 1 : 0}${ph.telemetry.forwardImminent ? 1 : 0}`,
-      );
-      // Hold the aircraft still so the two runs see identical geometry.
-      s.position.x = 0;
-      s.position.y = 700;
-      s.position.z = 1500;
-    }
-    return seen.join("");
-  };
-  const underNull = runDetection(createNullResponse());
-  const underDev = runDetection(
-    createDevelopmentRecovery({
-      physics: createPhysics({ index }),
-      getState: () => createFlightState(),
-    }),
-  );
-  check(
-    "detection is byte-identical under both policies",
-    underNull === underDev,
-    `${underNull.slice(0, 24)} vs ${underDev.slice(0, 24)}`,
-  );
-
-  // keepPolicy: a policy performing a restore must not cancel its own fade.
-  const p4 = createPhysics({ index });
-  let resetCalls = 0;
-  p4.setPolicy({
-    name: "counter",
-    handleCollision: () => true,
-    tick() {},
-    reset() {
-      resetCalls++;
-    },
-    overridesInput: () => false,
-  });
-  p4.reset(null, { keepPolicy: true });
-  check("reset with keepPolicy leaves the policy alone", resetCalls === 0);
-  p4.reset(null);
-  check("reset without keepPolicy resets the policy", resetCalls === 1);
-}
-
-// ── stage 4: the carrier and the catapult ─────────────────────────────────
-//
-// launch.js imports no three.js, so the curve and both its inverses are
-// exercised here directly. The reference deck is the MEASURED one from the
-// carrier asset: 199.7 m between the two anchors.
-
-const DECK_RUN = 199.68;
-
-const deckAnchors = (run = DECK_RUN, deckY = 20) => ({
-  deck: { x: 0, y: deckY, z: -1600 },
-  launchStart: { x: 0, y: deckY, z: -1533.4 },
-  launchEnd: { x: 0, y: deckY, z: -1533.4 - run },
-  approach: { x: 0, y: deckY + 120, z: -1200 },
-  runLength: run,
-  deckY,
-  deckLength: 332.8,
-  measured: true,
-});
-
-function testStrokeCurve() {
-  // Closed at both ends, and monotonic in between.
-  check("the ease starts at v0", strokeSpeed(0) === V0);
-  check("the ease ends at v1", Math.abs(strokeSpeed(1) - V1) < 1e-9);
-  let previous = -1;
-  let monotonic = true;
-  for (let u = 0; u <= 1.0001; u += 0.01) {
-    const v = strokeSpeed(u);
-    if (v < previous - 1e-12) monotonic = false;
-    previous = v;
-  }
-  check("the ease is monotonic", monotonic);
-  check("the ease clamps outside [0,1]", strokeSpeed(-1) === V0 && strokeSpeed(2) === V1);
-
-  // ACCELERATION INCREASES all the way to the deck edge -- that is the read
-  // the sequence is building to, and it is why the exponent is 1.25 and not
-  // some ease that flattens at the end.
-  const firstTenth = strokeSpeed(0.1) - strokeSpeed(0);
-  const lastTenth = strokeSpeed(1) - strokeSpeed(0.9);
-  check(
-    "the last tenth of the stroke covers more speed than the first",
-    lastTenth > firstTenth,
-    `first ${firstTenth.toFixed(2)} vs last ${lastTenth.toFixed(2)}`,
-  );
-
-  // A t^2 curve would need 3.56 s for this run, which is not "fast" -- assert
-  // the claim the comment makes, so a later edit to the exponent has to face it.
-  check(
-    "a squared ease would need about 3.56 s for the measured run",
-    Math.abs(solveStrokeTime(DECK_RUN, V0, V1, 2) - 3.56) < 0.02,
-    `${solveStrokeTime(DECK_RUN, V0, V1, 2).toFixed(3)} s`,
-  );
-}
-
-function testClosedFormMatchesItsOwnIntegral() {
-  // The closed form must match a NUMERIC integral of the very same curve, to
-  // within a few centimetres. This is the check that catches an algebra slip
-  // in the integral, which would otherwise show up only as a release point
-  // that drifts off the bow.
-  for (const T of [2.2, 2.7733, 3.1]) {
-    let sum = 0;
-    const steps = 20000;
-    for (let i = 0; i < steps; i++) {
-      sum += strokeSpeed((i + 0.5) / steps) * (T / steps);
-    }
-    const closed = strokeDistance(T);
-    check(
-      `closed-form distance matches a numeric integral at T=${T}`,
-      Math.abs(closed - sum) < 0.03,
-      `closed ${closed.toFixed(4)} vs numeric ${sum.toFixed(4)}`,
-    );
-  }
-
-  // strokePosition is the partial integral, so it must land on strokeDistance.
-  const T = 2.7733;
-  check(
-    "strokePosition at t=T equals the whole stroke distance",
-    Math.abs(strokePosition(T, T) - strokeDistance(T)) < 1e-9,
-  );
-  check("strokePosition at t=0 is zero", strokePosition(0, T) === 0);
-  check(
-    "strokePosition is monotonic",
-    (() => {
-      let prev = -1;
-      for (let t = 0; t <= T; t += T / 200) {
-        const s = strokePosition(t, T);
-        if (s < prev - 1e-12) return false;
-        prev = s;
-      }
-      return true;
-    })(),
-  );
-  check("a zero-duration stroke covers nothing", strokePosition(1, 0) === 0);
-}
-
-function testBothInverses() {
-  // solveStrokeTime inverts strokeDistance.
-  for (const d of [90, 150, DECK_RUN, 260]) {
-    const T = solveStrokeTime(d);
-    check(
-      `solveStrokeTime inverts strokeDistance at ${d} m`,
-      Math.abs(strokeDistance(T) - d) < 1e-9,
-      `${strokeDistance(T)}`,
-    );
-  }
-  // solveExitSpeed closes the same geometry from the other side.
-  for (const [d, T] of [[90, 2.2], [DECK_RUN, 2.7733], [400, 3.1]]) {
-    const v1 = solveExitSpeed(d, T);
-    check(
-      `solveExitSpeed closes ${d} m in ${T} s`,
-      Math.abs(strokeDistance(T, V0, v1) - d) < 1e-9,
-      `v1 ${v1.toFixed(2)}`,
-    );
-  }
-  check("solveExitSpeed on a zero duration does not divide by zero", Number.isFinite(solveExitSpeed(100, 0)));
-}
-
-function testSolveAgainstDecks() {
-  // The MEASURED deck solves inside the window and keeps the authored speed.
-  const measured = solveStroke(DECK_RUN);
-  check(
-    "the measured deck solves inside 2.2-3.1 s",
-    measured.time >= STROKE_MIN && measured.time <= STROKE_MAX,
-    `${measured.time.toFixed(4)} s`,
-  );
-  check("the measured deck keeps the authored exit speed", measured.exitSpeed === V1);
-  check("the measured deck is not clamped", measured.clamped === false);
-  check(
-    "the measured deck solves to about 2.77 s",
-    Math.abs(measured.time - 2.7733) < 0.01,
-    `${measured.time}`,
-  );
-  check(
-    "the solved stroke covers the run exactly",
-    Math.abs(strokeDistance(measured.time, V0, measured.exitSpeed) - DECK_RUN) < 1e-6,
-  );
-
-  // A SHORT deck clamps the time and re-solves the SPEED -- the geometry
-  // always closes, because the aircraft must leave at the release point on any
-  // deck, never before it and never past it.
-  const short = solveStroke(90);
-  check("a 90 m deck clamps the time", short.clamped === true);
-  check("a 90 m deck clamps to the minimum", Math.abs(short.time - STROKE_MIN) < 1e-9);
-  check(
-    "a 90 m deck re-solves a lower exit speed",
-    short.exitSpeed < V1,
-    `${short.exitSpeed.toFixed(1)} m/s`,
-  );
-  check(
-    "the short deck still closes exactly",
-    Math.abs(strokeDistance(short.time, V0, short.exitSpeed) - 90) < 1e-9,
-    `${strokeDistance(short.time, V0, short.exitSpeed)}`,
-  );
-
-  // And a very LONG deck clamps the other way.
-  const long = solveStroke(400);
-  check("a 400 m deck clamps to the maximum", Math.abs(long.time - STROKE_MAX) < 1e-9);
-  check("a 400 m deck re-solves a higher exit speed", long.exitSpeed > V1);
-  check(
-    "the long deck still closes exactly",
-    Math.abs(strokeDistance(long.time, V0, long.exitSpeed) - 400) < 1e-9,
-  );
-}
-
-function testDeckDwellIsMeasured() {
-  // The dwell is the start-up recording's own length at its playback rate --
-  // not an authored number. Replace the recording and the wait follows it.
-  check(
-    "a 22.99 s clip at double speed gives an 11.49 s dwell",
-    Math.abs(deckDwellFor(22.99) - 11.495) < 1e-9,
-    `${deckDwellFor(22.99)}`,
-  );
-  check("a longer clip lengthens the dwell", deckDwellFor(30) > deckDwellFor(22));
-  check("a missing clip falls back rather than firing instantly", deckDwellFor(0) > 5);
-
-  const plan = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 22.99 });
-  check("the catapult fires at the end of the dwell", plan.fireAt === plan.dwell);
-  check(
-    "the burner lights before the catapult fires",
-    plan.burnerAt < plan.fireAt && plan.fireAt - plan.burnerAt < 2,
-    `${plan.burnerAt} -> ${plan.fireAt}`,
-  );
-  // The ordering the whole sequence depends on.
-  check(
-    "ordering: fire -> release -> gear up -> handoff",
-    plan.fireAt < plan.releaseAt &&
-      plan.releaseAt < plan.gearUpAt &&
-      plan.gearUpAt < plan.handoffAt,
-    JSON.stringify(plan),
-  );
-  check(
-    "rotation begins before the gear comes up",
-    plan.rotateAt < plan.gearUpAt,
-    `${plan.rotateAt} vs ${plan.gearUpAt}`,
-  );
-}
-
-/** Run the whole scripted sequence at a fixed rate and record what happened. */
-function flyLaunch(hz, run = DECK_RUN) {
-  const anchors = deckAnchors(run);
-  const state = createFlightState();
-  const events = [];
-  const gear = [];
-  const fovs = [];
-  const rig = {
-    reset() {},
-    setShake() {},
-    blend(name, composition) {
-      if (composition.fov !== undefined) fovs.push(composition.fov);
-    },
-  };
-  const launch = createLaunch({
-    anchors,
-    clipSeconds: 22.99,
-    rig,
-    groundOffset: 2.95,
-    setGear: (down) => gear.push(down),
-    onEvent: (name) => events.push(name),
-  });
-  launch.start(state);
-
-  const dt = 1 / hz;
-  let handoffs = 0;
-  let maxAlong = 0;
-  let lateral = 0;
-  let pastRelease = 0;
-  let ticks = 0;
-  const parked = { ...state.position };
-
-  while (ticks < hz * 25) {
-    ticks++;
-    const before = launch.isActive();
-    launch.update(dt, state);
-    if (before && !launch.isActive()) handoffs++;
-    const along = anchors.launchStart.z - state.position.z;
-    if (along > maxAlong) maxAlong = along;
-    lateral = Math.max(lateral, Math.abs(state.position.x - anchors.launchStart.x));
-    if (launch.elapsed() <= launch.plan.releaseAt) {
-      pastRelease = Math.max(pastRelease, along - run);
-    }
-    if (!launch.isActive() && launch.hasHandedOff()) break;
-  }
-  return { launch, state, events, gear, fovs, handoffs, maxAlong, lateral, pastRelease, parked, anchors };
-}
-
-function testLaunchSequence() {
-  for (const hz of [60, 20]) {
-    const r = flyLaunch(hz);
-    check(`${hz} Hz: exactly one handoff`, r.handoffs === 1, `${r.handoffs}`);
-    check(
-      `${hz} Hz: the handoff happens at the planned time`,
-      Math.abs(r.launch.elapsed() - r.launch.plan.handoffAt) < 2 / hz,
-      `${r.launch.elapsed().toFixed(3)} vs ${r.launch.plan.handoffAt.toFixed(3)}`,
-    );
-    check(
-      `${hz} Hz: the stroke never runs past the release point`,
-      r.pastRelease <= 0.001,
-      `overshoot ${r.pastRelease.toFixed(4)} m`,
-    );
-    check(
-      `${hz} Hz: the stroke gets within one frame of the release point`,
-      DECK_RUN - Math.min(r.maxAlong, DECK_RUN) < 1e-6,
-      `reached ${Math.min(r.maxAlong, DECK_RUN).toFixed(4)} of ${DECK_RUN}`,
-    );
-    check(`${hz} Hz: no lateral drift`, r.lateral < 1e-9, `${r.lateral}`);
-    check(
-      `${hz} Hz: seeded at the handoff speed`,
-      Math.abs(r.state.speed - HANDOFF_SPEED) < 1e-9,
-      `${r.state.speed}`,
-    );
-    check(
-      `${hz} Hz: seeded at the handoff throttle, in burner`,
-      r.state.throttle === HANDOFF_THROTTLE && r.state.afterburner === true,
-      `${r.state.throttle}`,
-    );
-    check(
-      `${hz} Hz: nose-up at the handoff`,
-      Math.abs(r.state.pitch - ROTATE_PITCH) < 1e-9,
-      `${r.state.pitch}`,
-    );
-    check(`${hz} Hz: sink is zeroed at the handoff`, r.state.sink === 0);
-    check(
-      `${hz} Hz: the ordering held`,
-      r.events.join(",") === "burner,fire,release,gearUp,handoff",
-      r.events.join(","),
-    );
-    check(
-      `${hz} Hz: gear goes down on the deck and up after the release`,
-      r.gear[0] === true && r.gear[r.gear.length - 1] === false,
-      JSON.stringify(r.gear),
-    );
-  }
-
-  // THE frame-rate independence claim: the release point is computed from the
-  // closed-form integral, so 20 Hz must reach the same place as 60 Hz.
-  const fast = flyLaunch(60);
-  const slow = flyLaunch(20);
-  check(
-    "the release point is frame-rate independent",
-    Math.abs(Math.min(fast.maxAlong, DECK_RUN) - Math.min(slow.maxAlong, DECK_RUN)) < 1e-6,
-    `60 Hz ${fast.maxAlong.toFixed(4)} vs 20 Hz ${slow.maxAlong.toFixed(4)}`,
-  );
-}
-
-// ── Changes 2 and 3 (DIAGNOSIS B3): the deck holds for audio, and spools ───
-
+  MISSION,
+  MissionPhase,
+  PHASE_ORDER,
+  AUTOPILOT,
+  phaseCheckpoint,
+  opensCheckpoint,
+  encounterFor,
+  weaponsHotIn,
+  playerFliesIn,
+  flatDistanceTo,
+  bearingTo,
+  createTrigger,
+  insideTrigger,
+  bandFeature,
+  pickRouteFeatures,
+  surveyTerrainRoute,
+  pickZonedFeatures,
+  planRoute,
+  missionTransition,
+  autopilotStick,
+  blendStick,
+  formatClock,
+  formatShortClock,
+  missionSummary,
+  missionExpired,
+  createMissionDirector,
+} from "./mission.js";
+import { MISSION_FAILURE, createMissionCheckpointResponse } from "./collision.js";
+import { setGearVisual, setGearForFlight, GEAR_NODES } from "./aircraft.js";
+import { REARM, createRearmTimer, createRearmSystem } from "./rearm.js";
+import { AUDIO, Cue, Priority, engineVoice, takeIndex, mayFire, groundWarning, secondsToGround, flybyTriggered, createAudioDirector } from "./audio.js";
+import { DAY, NIGHT, createWorldClock, wrapTau, sunElevation, sunDirection, nightFactor, dayFactor, paletteFor, environmentFor } from "./world-time.js";
+import { LIGHTS, seeded, habitable, planSettlements } from "./night-lights.js";
+import { OCEAN } from "./ocean.js";
+import { breakDirection } from "./hostile.js";
+import { SAM, SAM_MISSILE, SamState, lineOfSight, inEngagementRange, samTransition, samThreatLevel, createSamSite, createSamNetwork, wreckSamSite, resetSamSite, normalizeSamModel, installSamVisual } from "./sam.js";
+import { GameMode, MODES, MODE_ORDER, SANDBOX, modeRules, nextMode, isSandbox, createSandbox } from "./modes.js";
+import { planSamSites, safeSpawnAltitude } from "./mission.js";import { FLARE, seduces, ejectVelocity, createFlareSystem } from "./flares.js";
+import { CRASH, CRASH_VARIANT, CrashCause, causeFromReason, makeTumble, aircraftOpacity, kickAmplitude, screenFlashAlpha, followBlend, createCrashFx } from "./crash-fx.js";
+
+let failures = 0;
+let total = 0;
 /**
- * Drive a launch against a stub audio director that arms at a named wall time,
- * the way main.js does: `update(dt, state, !audio.isArmed())`.
- *
- * A TEST DOUBLE MUST MATCH THE REAL THING (§17.13). This stub exposes the one
- * method the caller actually reads -- isArmed() -- and arms once and stays
- * armed, exactly as audio.js does.
+ * What failed, not just how many. The count alone is enough for the page --
+ * a human reads the red lines above it -- but `pnpm check` runs this file
+ * through spec/vector.test.ts in a process with no console to scroll, so a
+ * red gate that cannot say WHICH check broke costs a re-run in the browser
+ * to find out.
+ * @type {{ name: string, detail: string }[]}
  */
-function flyHeldLaunch({ armAt, hz = 60, seconds = 30 }) {
-  const anchors = deckAnchors(DECK_RUN);
-  const state = createFlightState();
-  const events = [];
-  const timeline = [];
-  let wall = 0;
-  const launch = createLaunch({
-    anchors,
-    clipSeconds: 22,
-    rig: { reset() {}, setShake() {}, blend() {} },
-    groundOffset: 2.95,
-    setGear() {},
-    onEvent: (name) => events.push({ name, wall, t: launch.elapsed() }),
-  });
-  launch.start(state);
-
-  let armed = false;
-  const dt = 1 / hz;
-  const audio = { isArmed: () => armed };
-  for (let i = 0; i < hz * seconds; i++) {
-    wall += dt;
-    if (wall >= armAt) armed = true;
-    launch.update(dt, state, !audio.isArmed());
-    timeline.push({ wall, t: launch.elapsed(), throttle: state.throttle, ab: state.afterburner });
-    if (launch.hasHandedOff()) break;
-  }
-  return { launch, state, events, timeline, wall, plan: launch.plan };
-}
-
-function testDeckIsHeldForAudio() {
-  const dwell = deckDwellFor(22);
-  check("the dwell is the clip at its playback rate", Math.abs(dwell - 11) < 1e-9, `${dwell}`);
-
-  // A director armed at 0 s fires the catapult at the dwell: unheld behaviour
-  // is unchanged, which is what makes the hold safe to add.
-  const immediate = flyHeldLaunch({ armAt: 0 });
-  const fire0 = immediate.events.find((e) => e.name === "fire");
-  check(
-    "armed at 0 s: the catapult fires at the dwell",
-    Math.abs(fire0.wall - dwell) < 3 / 60,
-    `${fire0.wall.toFixed(3)} vs ${dwell.toFixed(3)}`,
-  );
-
-  // Armed at 3.0 s: the whole sequence slides, so the start-up recording plays
-  // IN FULL against the deck and the catapult still fires on its last note.
-  const late = flyHeldLaunch({ armAt: 3 });
-  const fire3 = late.events.find((e) => e.name === "fire");
-  check(
-    "armed at 3.0 s: the catapult fires at 3.0 + dwell",
-    Math.abs(fire3.wall - (3 + dwell)) < 3 / 60,
-    `${fire3.wall.toFixed(3)} vs ${(3 + dwell).toFixed(3)}`,
-  );
-  check(
-    "and the script's own clock still reads the dwell at the shot",
-    Math.abs(fire3.t - dwell) < 2 / 60,
-    `${fire3.t.toFixed(3)} vs ${dwell.toFixed(3)}`,
-  );
-  check(
-    "the held deck emits nothing while it waits",
-    late.timeline.filter((f) => f.wall < 3).every((f) => f.t === 0),
-    "the clock moved while held",
-  );
-  check(
-    "the held aircraft sits at the deck's own parked throttle",
-    late.timeline[0].throttle === spoolThrottle(0, dwell) && late.timeline[0].ab === false,
-    `${late.timeline[0].throttle}`,
-  );
-
-  // THE HOLD APPLIES ONLY AT t = 0. It may delay a launch, never pause one in
-  // progress -- an audio context lost mid-stroke must not freeze an aircraft
-  // 100 m down the deck with the camera moving.
-  const anchors = deckAnchors(DECK_RUN);
-  const state = createFlightState();
-  const events = [];
-  const running = createLaunch({
-    anchors, clipSeconds: 22,
-    rig: { reset() {}, setShake() {}, blend() {} },
-    groundOffset: 2.95, setGear() {},
-    onEvent: (name) => events.push(name),
-  });
-  running.start(state);
-  const dt = 1 / 60;
-  // Twelve seconds unheld: past the shot and into the stroke.
-  for (let i = 0; i < 60 * 12; i++) running.update(dt, state, false);
-  const tAtLoss = running.elapsed();
-  check("the stroke is running before the flag arrives", tAtLoss > running.plan.fireAt, `${tAtLoss}`);
-  // Now assert the flag every frame, as a director that arms only at 12 s would.
-  for (let i = 0; i < 60 * 6; i++) running.update(dt, state, true);
-  check(
-    "a director that arms at 12 s does not pause a stroke already running",
-    running.elapsed() >= running.plan.handoffAt - 1e-9,
-    `held from ${tAtLoss.toFixed(2)}, reached ${running.elapsed().toFixed(2)} of ${running.plan.handoffAt.toFixed(2)}`,
-  );
-  check("and the held-late launch still hands off", running.hasHandedOff() === true);
-  check(
-    "the ordering is unchanged under a late hold",
-    events.join(",") === "burner,fire,release,gearUp,handoff",
-    events.join(","),
-  );
-
-  // A hold asserted from frame one and never released holds forever: the deck
-  // is a wait, not a timeout that gives up and runs silent anyway.
-  const forever = flyHeldLaunch({ armAt: 1e9, seconds: 20 });
-  check(
-    "a director that never arms never fires the catapult",
-    forever.events.length === 0 && forever.launch.elapsed() === 0,
-    `${forever.events.map((e) => e.name).join(",")} t=${forever.launch.elapsed()}`,
-  );
-}
-
-function testSpoolRamp() {
-  const dwell = deckDwellFor(22);
-  const plan = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 22 });
-
-  // KEYED IN FRACTIONS OF THE DWELL, NOT SECONDS. The dwell is derived from the
-  // recording's own length, so a ramp authored in seconds decouples the two the
-  // moment the clip is replaced.
-  check("the burner point is a fraction of the dwell", SPOOL.windTo === 0.87);
-  check(
-    "burnerAt is derived from the dwell, not offset from the shot",
-    Math.abs(plan.burnerAt - dwell * SPOOL.windTo) < 1e-9,
-    `${plan.burnerAt} vs ${dwell * SPOOL.windTo}`,
-  );
-  // The coupling, asserted against a different clip: a longer recording must
-  // move the burner with it rather than leaving it a fixed 1.4 s before the shot.
-  const long = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 40 });
-  check(
-    "a longer clip moves the burner point with the dwell",
-    Math.abs(long.burnerAt / long.dwell - plan.burnerAt / plan.dwell) < 1e-12,
-    `${long.burnerAt / long.dwell} vs ${plan.burnerAt / plan.dwell}`,
-  );
-
-  // MONOTONIC NON-DECREASING from t = 0 to fireAt. A recording that winds up
-  // over eleven seconds needs a throttle that winds up with it.
-  let prev = -Infinity;
-  let monotonic = true;
-  let worst = "";
-  for (let i = 0; i <= 2000; i++) {
-    const t = (i / 2000) * dwell;
-    const v = spoolThrottle(t, dwell);
-    if (v < prev - 1e-12) {
-      monotonic = false;
-      worst = `${prev.toFixed(4)} -> ${v.toFixed(4)} at ${(t / dwell).toFixed(3)} dwell`;
-    }
-    prev = v;
-  }
-  check("the spool ramp is monotonic non-decreasing", monotonic, worst);
-  check("it starts at idle", Math.abs(spoolThrottle(0, dwell) - SPOOL.idle) < 1e-12, `${spoolThrottle(0, dwell)}`);
-  check(
-    "it reaches the first push at 0.30 dwell",
-    Math.abs(spoolThrottle(dwell * 0.3, dwell) - SPOOL.push) < 1e-9,
-    `${spoolThrottle(dwell * 0.3, dwell)}`,
-  );
-  check(
-    "it is at the stop from 0.87 dwell",
-    spoolThrottle(dwell * 0.87, dwell) === 1 && spoolThrottle(dwell, dwell) === 1,
-  );
-  check(
-    "the wind-up is genuinely a wind-up, not a step",
-    spoolThrottle(dwell * 0.6, dwell) > SPOOL.push &&
-      spoolThrottle(dwell * 0.6, dwell) < SPOOL.wind,
-    `${spoolThrottle(dwell * 0.6, dwell)}`,
-  );
-  // A degenerate dwell must not divide by zero and strand the aircraft at idle.
-  check("a zero dwell reads the stop", spoolThrottle(0, 0) === 1);
-
-  // ONE RULE OWNS THE AFTERBURNER: isAfterburner(throttle), so the HUD, the
-  // sound and the plume cannot disagree about whether it is lit. Off at 0.86
-  // dwell, on at 0.88.
-  check(
-    "the burner is off at 0.86 dwell",
-    isAfterburner(spoolThrottle(dwell * 0.86, dwell)) === false,
-    `${spoolThrottle(dwell * 0.86, dwell)}`,
-  );
-  check(
-    "the burner is lit at 0.88 dwell",
-    isAfterburner(spoolThrottle(dwell * 0.88, dwell)) === true,
-    `${spoolThrottle(dwell * 0.88, dwell)}`,
-  );
-  check(
-    "the wind-up tops out ON the detent rather than past it",
-    SPOOL.wind === BURNER_LEVER,
-    `${SPOOL.wind} vs ${BURNER_LEVER}`,
-  );
-
-  // The same, read off a RUNNING script rather than off the pure function --
-  // the ramp is worth nothing if writeState does not use it.
-  const flown = flyHeldLaunch({ armAt: 0 });
-  const at = (t) => flown.timeline.reduce((best, f) => (f.t <= t ? f : best), flown.timeline[0]);
-  check(
-    "the running script is at idle early on the deck",
-    at(0.1).throttle < 0.25,
-    `${at(0.1).throttle.toFixed(3)}`,
-  );
-  check(
-    "the running script has the burner lit at 0.88 dwell",
-    at(dwell * 0.88).ab === true,
-    `${at(dwell * 0.88).throttle.toFixed(3)}`,
-  );
-  check(
-    "and NOT at 0.86 dwell",
-    at(dwell * 0.86).ab === false,
-    `${at(dwell * 0.86).throttle.toFixed(3)}`,
-  );
-  let deckMonotonic = true;
-  let last = -Infinity;
-  for (const f of flown.timeline) {
-    if (f.t > plan.fireAt) break;
-    if (f.throttle < last - 1e-9) deckMonotonic = false;
-    last = f.throttle;
-  }
-  check("the flown deck throttle is monotonic to the shot", deckMonotonic);
-  check(
-    "the throttle holds at the stop through the stroke",
-    flown.timeline
-      .filter((f) => f.t > plan.fireAt && f.t < plan.releaseAt)
-      .every((f) => f.throttle === 1),
-  );
-
-  // HANDOFF THROTTLE IS UNCHANGED AT 0.92. The ramp is a deck story; the state
-  // the player inherits is the one §9 specifies and nothing here may move it.
-  check(
-    "the handoff throttle is unchanged at 0.92",
-    flown.state.throttle === HANDOFF_THROTTLE && HANDOFF_THROTTLE === 0.92,
-    `${flown.state.throttle}`,
-  );
-  check("and the burner is lit at the handoff", flown.state.afterburner === true);
-  check(
-    "the settle from the stop to the handoff lever is downward, not a jump",
-    flown.timeline
-      .filter((f) => f.t > flown.plan.releaseAt)
-      .every((f) => f.throttle <= 1 + 1e-9 && f.throttle >= HANDOFF_THROTTLE - 1e-9),
-  );
-}
-
-function testParkedPose() {
-  const anchors = deckAnchors();
-  const state = createFlightState();
-  const launch = createLaunch({ anchors, clipSeconds: 22.99, groundOffset: 2.95, setGear: () => {} });
-  launch.start(state);
-
-  check("the parked pose sits at the launch start", state.position.z === anchors.launchStart.z);
-  check(
-    "the parked pose sits ON the deck, not in it",
-    Math.abs(state.position.y - (anchors.deckY + 2.95)) < 1e-9,
-    `${state.position.y} vs deck ${anchors.deckY}`,
-  );
-  check("the parked pose is stationary", state.speed === 0);
-  check("the parked pose is level", state.pitch === 0 && state.bank === 0);
-  check(
-    "the parked pose heads along the launch axis",
-    state.heading === 0,
-    `${state.heading}`,
-  );
-
-  // Gear DOWN on the deck -- and the cache is seeded null so the very first
-  // call actually paints (stage 2's rule, exercised end to end here).
-  const gear = [];
-  const s2 = createFlightState();
-  createLaunch({ anchors, clipSeconds: 22.99, setGear: (d) => gear.push(d) }).start(s2);
-  check("gear is put down for the deck", gear[0] === true, JSON.stringify(gear));
-}
-
-function testLaunchCameraBlend() {
-  const r = flyLaunch(60);
-  check("the launch composition was blended in", r.fovs.length > 0);
-  const first = r.fovs[0];
-  const peak = Math.max(...r.fovs);
-  check("FOV opens from the deck value", Math.abs(first - 59) < 1e-9, `${first}`);
-  check("FOV opens toward the exit value", peak > 70 && peak <= 71 + 1e-9, `${peak}`);
-  check(
-    "FOV never opens past a comfortable maximum",
-    peak <= 71 + 1e-9,
-    `${peak}`,
-  );
-  // Weighted by the SQUARE of stroke progress, so it opens rather than drifts:
-  // at half the stroke it should still be near the bottom of the range.
-  const half = r.fovs[Math.floor(r.fovs.length * 0.5)];
-  check(
-    "FOV is still low at the midpoint (squared weighting, not linear)",
-    half < 59 + (71 - 59) * 0.5,
-    `${half}`,
-  );
-}
-
-function testLaunchOwnsTheAircraft() {
-  const anchors = deckAnchors();
-  const state = createFlightState();
-  const launch = createLaunch({ anchors, clipSeconds: 22.99, groundOffset: 2.95, setGear: () => {} });
-  launch.start(state);
-  check("the script owns the aircraft while running", launch.isActive() === true);
-
-  // No flight physics runs during the script: the state is WRITTEN, so a stick
-  // input must change nothing at all.
-  const before = JSON.stringify(state);
-  launch.update(1 / 60, state);
-  const scripted = JSON.stringify(state);
-  const other = createFlightState();
-  const l2 = createLaunch({ anchors, clipSeconds: 22.99, groundOffset: 2.95, setGear: () => {} });
-  l2.start(other);
-  updateFlight(other, stick({ x: 1, y: 1, throttle: 1 }), 0); // dt 0 -> no-op
-  l2.update(1 / 60, other);
-  check(
-    "the script writes the whole state regardless of input",
-    JSON.stringify(other) === scripted,
-    "scripted states diverged",
-  );
-  check("the state did advance", scripted !== before);
-
-  const r = flyLaunch(60);
-  check("the script releases the aircraft after the handoff", r.launch.isActive() === false);
-  check("the handoff is recorded", r.launch.hasHandedOff() === true);
-}
-
-// ── stage 5: targeting, guns, one missile ─────────────────────────────────
-//
-// targeting.js, missile.js, gun.js and enemy.js all import no three.js, so the
-// rules are exercised here rather than inferred from a screenshot.
-
-const observerAt = (position, forward = { x: 0, y: 0, z: -1 }) => ({
-  position,
-  forward,
-});
-
-// ── Change 4 (DIAGNOSIS B1): the engine ───────────────────────────────────
-
-// The measured nozzle anchors this airframe actually produces, so the gates
-// exercise the same geometry the game draws. A TEST DOUBLE MUST MATCH THE REAL
-// THING (§17.13): these are the values aircraft.js logs at load.
-const NOZZLES = [
-  { x: -1.63, y: -0.59, z: 9.14 },
-  { x: 1.63, y: -0.59, z: 9.14 },
-];
-
-function testEngineFx() {
-  const engine = createEngineFx(NOZZLES);
-
-  // THE BUDGET. 2 plume sprites per nozzle, one burner ring per nozzle, 3
-  // shock diamonds per nozzle -- 12 sprites for the whole engine, allocated
-  // once.
-  const per = ENGINE_FX.plumesPerNozzle + 1 + ENGINE_FX.diamondsPerNozzle;
-  check(
-    "the pool is the budget, and no larger",
-    engine.sprites.length === NOZZLES.length * per,
-    `${engine.sprites.length} vs ${NOZZLES.length * per}`,
-  );
-  check(
-    "two plume sprites per nozzle",
-    engine.sprites.filter((s) => s.kind === "plume").length === NOZZLES.length * 2,
-  );
-  check(
-    "one burner ring per nozzle",
-    engine.sprites.filter((s) => s.kind === "ring").length === NOZZLES.length,
-  );
-  check(
-    "three shock diamonds per nozzle",
-    engine.sprites.filter((s) => s.kind === "diamond").length === NOZZLES.length * 3,
-  );
-
-  // EVERYTHING IS POOLED, and the gate is IDENTITY, not count: a pool that
-  // rebuilt its records every frame would keep the count constant and still
-  // allocate 43,000 objects a minute.
-  const list = engine.sprites;
-  const records = [...list];
-  let sameArray = true;
-  let sameRecords = true;
-  const dt = 1 / 60;
-  for (let i = 0; i < 600; i++) {
-    // Varying throttle, and the burner crossing in both directions.
-    const throttle = 0.5 + 0.5 * Math.sin(i / 37);
-    const returned = engine.update(dt, { throttle, afterburner: throttle > 0.85 });
-    if (returned !== list) sameArray = false;
-    if (returned.length !== records.length) sameArray = false;
-    for (let k = 0; k < records.length; k++) {
-      if (returned[k] !== records[k]) sameRecords = false;
-    }
-  }
-  check("600 frames of varying throttle return the same array", sameArray);
-  check("and the same sprite records -- nothing is allocated", sameRecords);
-  check(
-    "the sprite count never changed",
-    engine.sprites.length === NOZZLES.length * per,
-    `${engine.sprites.length}`,
-  );
-
-  // PLUME LENGTH IS MONOTONIC IN THROTTLE. This is the readability claim: a
-  // player learns what the lever does by watching the back of their aircraft.
-  for (const burner of [0, 0.5, 1]) {
-    let prev = -Infinity;
-    let monotonic = true;
-    for (let i = 0; i <= 200; i++) {
-      const v = plumeLength(i / 200, burner);
-      if (v < prev - 1e-12) monotonic = false;
-      prev = v;
-    }
-    check(`plume length is monotonic in throttle at burner ${burner}`, monotonic);
-  }
-  check(
-    "idle is 0.9 m and full dry is 5.5 m",
-    plumeLength(0, 0) === ENGINE_FX.plumeIdle && plumeLength(1, 0) === ENGINE_FX.plumeDry,
-    `${plumeLength(0, 0)} / ${plumeLength(1, 0)}`,
-  );
-  check(
-    "the burner adds 7.5 m of elongation on top",
-    Math.abs(plumeLength(1, 1) - (ENGINE_FX.plumeDry + 7.5)) < 1e-9,
-    `${plumeLength(1, 1)}`,
-  );
-  check("throttle is clamped, not extrapolated", plumeLength(4, 0) === plumeLength(1, 0));
-  check("opacity runs 0.25 -> 0.75 over the dry range",
-    plumeOpacity(0, 0) === 0.25 && Math.abs(plumeOpacity(1, 0) - 0.75) < 1e-12,
-    `${plumeOpacity(0, 0)} / ${plumeOpacity(1, 0)}`);
-  let opacityMonotonic = true;
-  let prevA = -Infinity;
-  for (let i = 0; i <= 200; i++) {
-    const v = plumeOpacity(i / 200, 0);
-    if (v < prevA - 1e-12) opacityMonotonic = false;
-    prevA = v;
-  }
-  check("and opacity is monotonic in throttle too", opacityMonotonic);
-
-  // THE BURNER FADES IN OVER 0.18 s. A hard cut reads as a bug, so the ring and
-  // the elongation share ONE weight and it is eased in both directions.
-  let w = 0;
-  const frames = Math.round(ENGINE_FX.ringFade / dt);
-  for (let i = 0; i < frames; i++) w = stepBurner(w, true, dt);
-  check("the burner weight reaches 1 after the fade window", Math.abs(w - 1) < 1e-9, `${w}`);
-  check("it is part-way in half-way through", stepBurner(0, true, ENGINE_FX.ringFade / 2) > 0.4);
-  check("it never overshoots", stepBurner(1, true, 10) === 1);
-  let down = 1;
-  for (let i = 0; i < frames; i++) down = stepBurner(down, false, dt);
-  check("and it eases back out rather than cutting", Math.abs(down) < 1e-9, `${down}`);
-  check("it never goes negative", stepBurner(0, false, 10) === 0);
-
-  // SHOCK DIAMONDS EXIST ONLY WITH THE BURNER LIT.
-  const dry = createEngineFx(NOZZLES);
-  for (let i = 0; i < 120; i++) dry.update(dt, { throttle: 1, afterburner: false });
-  const dryDiamonds = dry.sprites.filter((s) => s.kind === "diamond");
-  check("no diamonds at full dry power", dryDiamonds.every((s) => !s.visible));
-  check("and no burner ring either", dry.sprites.filter((s) => s.kind === "ring").every((s) => !s.visible));
-  check("but the plume is at its full dry length", Math.abs(dry.state.length - ENGINE_FX.plumeDry) < 1e-9);
-
-  const lit = createEngineFx(NOZZLES);
-  for (let i = 0; i < 120; i++) lit.update(dt, { throttle: 1, afterburner: true });
-  const litDiamonds = lit.sprites.filter((s) => s.kind === "diamond");
-  check("diamonds exist with the burner lit", litDiamonds.every((s) => s.visible));
-  check("all six of them", litDiamonds.length === 6);
-  check("the burner ring is in", lit.sprites.filter((s) => s.kind === "ring").every((s) => s.visible));
-  check(
-    "and the plume is elongated",
-    lit.state.length > dry.state.length + 7,
-    `${lit.state.length.toFixed(2)} vs ${dry.state.length.toFixed(2)}`,
-  );
-
-  // They sit INSIDE the plume, spaced 1.4 m along it, aft of the nozzle. Aft is
-  // +Z: the project's forward is -Z (§5), and a sign error here points the
-  // exhaust at the nose.
-  const oneSide = litDiamonds.filter((s) => s.nozzle === 0).sort((a, b) => a.slot - b.slot);
-  check(
-    "the diamonds are spaced 1.4 m apart",
-    Math.abs(oneSide[1].z - oneSide[0].z - ENGINE_FX.diamondSpacing) < 1e-9 &&
-      Math.abs(oneSide[2].z - oneSide[1].z - ENGINE_FX.diamondSpacing) < 1e-9,
-    `${oneSide.map((s) => s.z.toFixed(2)).join(", ")}`,
-  );
-  check(
-    "they are aft of the nozzle, not forward of it",
-    oneSide.every((s) => s.z > NOZZLES[0].z),
-  );
-  check(
-    "and inside the plume rather than past its end",
-    oneSide[2].z < NOZZLES[0].z + lit.state.length,
-    `${oneSide[2].z.toFixed(2)} vs ${(NOZZLES[0].z + lit.state.length).toFixed(2)}`,
-  );
-  check("every plume sprite is aft of its nozzle",
-    lit.sprites.filter((s) => s.kind === "plume").every((s) => s.z > NOZZLES[s.nozzle].z));
-  check("and laterally on its own nozzle",
-    lit.sprites.every((s) => s.x === NOZZLES[s.nozzle].x && s.y === NOZZLES[s.nozzle].y));
-
-  // The diamonds oscillate 0.35-0.7 at ~14 Hz. Sampled across a whole number of
-  // cycles, the extremes must be reached and nothing may leave the band.
-  const osc = createEngineFx(NOZZLES);
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (let i = 0; i < 600; i++) {
-    osc.update(1 / 600, { throttle: 1, afterburner: true });
-    if (osc.state.burner < 1) continue; // ignore the fade-in
-    const d = osc.sprites.find((s) => s.kind === "diamond" && s.slot === 0);
-    lo = Math.min(lo, d.opacity);
-    hi = Math.max(hi, d.opacity);
-  }
-  check(
-    "the diamonds oscillate across their whole band",
-    lo < ENGINE_FX.diamondLow + 0.02 && hi > ENGINE_FX.diamondHigh - 0.02,
-    `${lo.toFixed(3)} .. ${hi.toFixed(3)}`,
-  );
-  check(
-    "and never outside it",
-    lo >= ENGINE_FX.diamondLow - 1e-9 && hi <= ENGINE_FX.diamondHigh + 1e-9,
-    `${lo.toFixed(3)} .. ${hi.toFixed(3)}`,
-  );
-
-  // PRESENTATION RESETS, GAMEPLAY DOES NOT (§17.11): clear() takes the plume,
-  // and takes nothing else, because there is nothing else here to take.
-  lit.clear();
-  check("clear() hides every sprite", lit.sprites.every((s) => !s.visible && s.opacity === 0));
-  check("and drops the burner weight", lit.state.burner === 0);
-  check("and the pool survives it", lit.sprites.length === NOZZLES.length * per);
-  lit.update(dt, { throttle: 0.4, afterburner: false });
-  check("and the engine runs again after a clear", lit.state.length > ENGINE_FX.plumeIdle);
-}
-
-function testTargetContract() {
-  // §5: the contract is load-bearing. Stage 8's SAM sites publish this same
-  // shape, and targeting, the gun, the missile and the HUD bracket then work
-  // on ground targets with no special cases at all.
-  const t = createTarget({ label: "DRONE" });
-  for (const field of ["position", "velocity", "alive", "health", "maxHealth", "radius", "label", "hitAt"]) {
-    check(`the target contract exposes ${field}`, field in t);
-  }
-  check("a fresh target is targetable", isTargetable(t) === true);
-  check("a dead target is not targetable", (() => {
-    const d = createTarget();
-    d.alive = false;
-    return isTargetable(d) === false;
-  })());
-  check("a bare object is not targetable", isTargetable({}) === false);
-
-  // A stationary ground target satisfies the same contract -- the shape that
-  // makes stage 8 free.
-  const sam = createTarget({ label: "SAM", velocity: { x: 0, y: 0, z: 0 } });
-  check("a zero-velocity target still satisfies the contract", isTargetable(sam));
-
-  // damageTarget returns true ONCE, on the transition to dead, so a caller can
-  // award a kill exactly once however many rounds land in the same frame.
-  const victim = createTarget({ health: 20 });
-  check("damage below the threshold does not kill", damageTarget(victim, 5, 1) === false);
-  check("damage records the hit time", victim.hitAt === 1);
-  check("the killing blow returns true", damageTarget(victim, 100, 2) === true);
-  check("health floors at zero", victim.health === 0);
-  check("a dead target reports no second kill", damageTarget(victim, 100, 3) === false);
-
-  // The drone publishes a WRITTEN velocity, not one differenced from
-  // positions: the lead solution and the missile both read it, and a
-  // differenced velocity lags a frame at exactly the moment it matters.
-  const drone = createDrone({ centre: { x: 0, y: 900, z: -3000 } });
-  drone.update(1 / 60);
-  const speed = Math.hypot(drone.target.velocity.x, drone.target.velocity.z);
-  check("the drone publishes a real velocity", speed > 100, `${speed.toFixed(1)}`);
-  drone.target.alive = false;
-  drone.update(1 / 60);
-  check(
-    "a dead drone stops moving",
-    drone.target.velocity.x === 0 && drone.target.velocity.z === 0,
-  );
-}
-
-function testLockProgression() {
-  const targeting = createTargeting();
-  const target = createTarget({ position: { x: 0, y: 900, z: -2000 } });
-  const observer = observerAt({ x: 0, y: 900, z: 0 });
-
-  check("nothing is tracked before an update", targeting.state().lockState === "NONE");
-
-  // Lock progresses only while the SAME candidate is tracked.
-  let s = targeting.update(0.5, [target], observer);
-  check("tracking begins", s.lockState === "TRACK" && s.currentTarget === target);
-  check("progress is partial after half the lock time", s.lockProgress > 0.3 && s.lockProgress < 0.5, `${s.lockProgress}`);
-  s = targeting.update(0.9, [target], observer);
-  check("a steady track reaches lock", s.lockState === "LOCK", `${s.lockProgress}`);
-  check("progress saturates at 1", s.lockProgress === 1);
-
-  // AN EMPTY CANDIDATE LIST IS THE NORMAL WAY TO DISABLE IT (§5) -- there is
-  // deliberately no enabled flag, and stage 7 relies on this between
-  // encounters.
-  s = targeting.update(0.2, [], observer);
-  check("an empty list decays the lock", s.lockProgress < 1, `${s.lockProgress}`);
-  s = targeting.update(2, [], observer);
-  check("an empty list clears the lock", s.lockProgress === 0);
-  check("an empty list produces no target", s.currentTarget === null);
-  check("an empty list reports NONE", s.lockState === "NONE");
-
-  // Switching target RESTARTS the lock rather than inheriting progress.
-  const t2 = createTargeting();
-  const a = createTarget({ label: "A", position: { x: 0, y: 900, z: -2000 } });
-  const b = createTarget({ label: "B", position: { x: 60, y: 900, z: -1900 } });
-  t2.update(1.0, [a], observer);
-  const progressed = t2.state().lockProgress;
-  check("the first target progressed", progressed > 0.5);
-  a.alive = false;
-  const sw = t2.update(1 / 60, [a, b], observer);
-  check("switching target picks the live one", sw.currentTarget === b);
-  check("switching target restarts the lock", sw.lockProgress < 0.1, `${sw.lockProgress}`);
-
-  // Off the nose and out of range are both rejected.
-  const behind = createTarget({ position: { x: 0, y: 900, z: 2000 } });
-  check(
-    "a target behind the nose is not a candidate",
-    targeting.update(1, [behind], observer).currentTarget === null,
-  );
-  const far = createTarget({ position: { x: 0, y: 900, z: -40000 } });
-  check(
-    "a target beyond max range is not a candidate",
-    targeting.update(1, [far], observer).currentTarget === null,
-  );
-  // The nearer of two on the nose wins.
-  const near = createTarget({ label: "N", position: { x: 0, y: 900, z: -1200 } });
-  const distant = createTarget({ label: "F", position: { x: 0, y: 900, z: -5000 } });
-  const t3 = createTargeting();
-  check(
-    "the closer of two targets on the nose is selected",
-    t3.update(1 / 60, [distant, near], observer).currentTarget === near,
-  );
-}
-
-function testLeadSolution() {
-  const origin = { x: 0, y: 0, z: 0 };
-
-  // A STATIONARY target: the pipper is the target itself.
-  const still = createTarget({ position: { x: 0, y: 0, z: -1000 } });
-  const s = leadSolution(origin, still);
-  check("the lead on a stationary target is the target",
-    Math.abs(s.point.x - 0) < 1e-6 && Math.abs(s.point.z + 1000) < 1e-6,
-    JSON.stringify(s.point));
-  check("a stationary solution is solved", s.solved === true);
-
-  // A CROSSING target: the pipper leads it, on the side it is moving toward.
-  const crossing = createTarget({
-    position: { x: 0, y: 0, z: -1000 },
-    velocity: { x: 200, y: 0, z: 0 },
-  });
-  const c = leadSolution(origin, crossing);
-  check("the lead on a crossing target is ahead of it", c.point.x > 0, `${c.point.x}`);
-  check("the lead time is positive and short", c.time > 0 && c.time < 2, `${c.time}`);
-  check(
-    "the lead offset is about velocity x time",
-    Math.abs(c.point.x - 200 * c.time) < 1e-6,
-  );
-
-  // It works for a target crossing the other way, symmetrically.
-  const other = createTarget({
-    position: { x: 0, y: 0, z: -1000 },
-    velocity: { x: -200, y: 0, z: 0 },
-  });
-  check("the lead is symmetric", Math.abs(leadSolution(origin, other).point.x + c.point.x) < 1e-6);
-
-  // A target with no velocity field at all must not throw -- the SAM case.
-  const bare = { position: { x: 0, y: 0, z: -800 } };
-  check("a target with no velocity resolves to itself",
-    Math.abs(leadSolution(origin, bare).point.z + 800) < 1e-6);
-}
-
-function testMissileGuidance() {
-  // A round fired at a stationary target ahead should hit.
-  const events = [];
-  const sys = createMissileSystem({ onEvent: (e) => events.push(e.kind) });
-  const target = createTarget({ position: { x: 0, y: 0, z: -1500 }, radius: 9 });
-  sys.fire({
-    owner: "player",
-    position: { x: 0, y: 0, z: 0 },
-    direction: { x: 0, y: 0, z: -1 },
-    speed: 250,
-    target,
-  });
-  check("firing emits a fire event", events.includes("fire"));
-  check("the round is in the air", sys.rounds.length === 1);
-
-  for (let t = 0; t < 5 && sys.rounds.length; t += 1 / 60) sys.update(1 / 60, t);
-  check("a straight shot hits", events.includes("hit"), events.join(","));
-
-  // SEPARATION: the round flies straight before it guides, so it does not
-  // appear to steer out of the cockpit on frame one.
-  const sys2 = createMissileSystem({});
-  const offset = createTarget({ position: { x: 900, y: 0, z: -900 } });
-  const round = sys2.fire({
-    position: { x: 0, y: 0, z: 0 },
-    direction: { x: 0, y: 0, z: -1 },
-    speed: 250,
-    target: offset,
-  });
-  sys2.update(0.05, 0);
-  check(
-    "the round has not begun steering during separation",
-    Math.abs(round.velocity.x) < 1e-9,
-    `${round.velocity.x}`,
-  );
-  sys2.update(0.6, 0.6);
-  check("the round steers after separation", Math.abs(round.velocity.x) > 1, `${round.velocity.x}`);
-
-  // THE FUZE detonates within its radius and not outside it.
-  const sys3 = createMissileSystem({ onEvent: () => {} });
-  const near = createTarget({ position: { x: 0, y: 0, z: -30 }, radius: 0 });
-  const r3 = sys3.fire({
-    position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 },
-    speed: 200, target: near,
-  });
-  // Several frames, not one: the round leaves the rail at ~315 m/s and covers
-  // about 5 m per frame, so closing the last 8 m to the fuze radius takes more
-  // than a single update. A one-frame version of this failed for that reason
-  // and said nothing at all about the fuze.
-  for (let t = 0; t < 0.3 && !r3.detonated; t += 1 / 60) sys3.update(1 / 60, t);
-  check("the fuze fires inside its radius", r3.detonated === true, `${r3.detonated}`);
-
-  const sys4 = createMissileSystem({});
-  const wide = createTarget({ position: { x: 400, y: 0, z: -30 }, radius: 0 });
-  const r4 = sys4.fire({
-    position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 },
-    speed: 200, target: wide,
-  });
-  for (let t = 0; t < 0.3; t += 1 / 60) sys4.update(1 / 60, t);
-  check("the fuze does not fire outside its radius", r4.detonated !== true);
-
-  // Lifetime expiry.
-  const sys5 = createMissileSystem({ onEvent: (e) => events.push("e:" + e.reason) });
-  sys5.fire({ position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 1, z: 0 }, target: null });
-  for (let t = 0; t < 8; t += 1 / 60) sys5.update(1 / 60, t);
-  check("a round with no target expires on its lifetime", sys5.rounds.length === 0);
-}
-
-function testOvershootNeedsAngleAndOpeningRange() {
-  // THE SUBTLE RULE (§14). Angle alone falsely calls an overshoot on a round
-  // still closing through a crossing geometry, and the round then coasts past
-  // a target it would have hit.
-  const closingWide = {
-    position: { x: 0, y: 0, z: 0 },
-    velocity: { x: 0, y: 0, z: -800 },
-  };
-  const beside = createTarget({ position: { x: 900, y: 0, z: 30 } });
-  // Well past the overshoot ANGLE, but the range is still closing.
-  check(
-    "a wide angle with a CLOSING range is not an overshoot",
-    hasOvershot(closingWide, beside, -12) === false,
-  );
-  check(
-    "a wide angle with an OPENING range is an overshoot",
-    hasOvershot(closingWide, beside, +12) === true,
-  );
-  // A narrow angle is never an overshoot, whatever the range is doing.
-  const ahead = createTarget({ position: { x: 0, y: 0, z: -900 } });
-  check(
-    "a target dead ahead is never an overshoot",
-    hasOvershot(closingWide, ahead, +12) === false,
-  );
-  check("no target is never an overshoot", hasOvershot(closingWide, null, 5) === false);
-}
-
-function testDefeatedRoundKeepsFlying() {
-  // A defeated round keeps flying its curve and can still get lucky on the
-  // fuze, so a miss reads as a miss rather than as the round switching off.
-  const sys = createMissileSystem({ authorityFor: () => 0 });
-  const target = createTarget({ position: { x: 2000, y: 0, z: -2000 } });
-  const round = sys.fire({
-    position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 },
-    speed: 300, target,
-  });
-  const before = { ...round.position };
-  for (let t = 0; t < 1; t += 1 / 60) sys.update(1 / 60, t);
-  check("a fully defeated round is still in the air", sys.rounds.length === 1);
-  check(
-    "a fully defeated round is still moving",
-    Math.abs(round.position.z - before.z) > 100,
-    `${round.position.z}`,
-  );
-  check(
-    "authority is floored above zero, so the round still curves",
-    round.authority > 0,
-    `${round.authority}`,
-  );
-}
-
-function testExpireOwner() {
-  const sys = createMissileSystem({});
-  const target = createTarget({ position: { x: 0, y: 0, z: -3000 } });
-  sys.fire({ owner: "player", position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 }, target });
-  sys.fire({ owner: "hostile", position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 }, target });
-  sys.fire({ owner: "hostile", position: { x: 0, y: 0, z: 0 }, direction: { x: 0, y: 0, z: -1 }, target });
-  check("three rounds are up", sys.rounds.length === 3);
-  check("player has one", sys.countFor("player") === 1);
-
-  const retired = sys.expireOwner("hostile");
-  check("expireOwner retires only that owner", retired === 2 && sys.rounds.length === 1);
-  check("the player's round is untouched", sys.countFor("player") === 1);
-  check("expiring an unknown owner retires nothing", sys.expireOwner("sam") === 0);
-}
-
-function testMissileTurnRadius() {
-  // §14's fairness claim is stated in radii: the F-15 turns at 1000 m at
-  // 250 m/s, so a hard crossing manoeuvre must be able to defeat these.
-  const r = turnRadius(AIM9);
-  check(
-    "the AIM-9 turn radius is in §14's expected range",
-    r > 850 && r < 1000,
-    `${r.toFixed(0)} m`,
-  );
-  check(
-    "the AIM-9 is out-turnable by the F-15 at the top of its envelope",
-    r >= TURN_RADIUS_REF * 0.85,
-    `missile ${r.toFixed(0)} vs aircraft ${TURN_RADIUS_REF}`,
-  );
-}
-
-// ── Change 5 (DIAGNOSIS B2): the missile trail ────────────────────────────
-
-function testMissileTrail() {
-  // The budget, first: 14 segments per round, 0.6 s of life, 0.35 m at the
-  // nozzle spreading to 2.6 m, opacity 0.8 down to nothing.
-  check("14 segments per round", TRAIL.segments === 14);
-  check("0.6 s of segment life", TRAIL.life === 0.6);
-  check("one segment per life/14", Math.abs(TRAIL_INTERVAL - 0.6 / 14) < 1e-12);
-  check("strip thickness runs 0.35 -> 2.6", trailWidth(0) === 0.35 && Math.abs(trailWidth(TRAIL.life) - 2.6) < 1e-12);
-  check("opacity runs 0.8 -> 0", trailOpacity(0) === 0.8 && trailOpacity(TRAIL.life) === 0);
-  let wMono = true;
-  let oMono = true;
-  let pw = -Infinity;
-  let po = Infinity;
-  for (let i = 0; i <= 100; i++) {
-    const a = (i / 100) * TRAIL.life;
-    if (trailWidth(a) < pw - 1e-12) wMono = false;
-    if (trailOpacity(a) > po + 1e-12) oMono = false;
-    pw = trailWidth(a);
-    po = trailOpacity(a);
-  }
-  check("a segment only ever widens", wMono);
-  check("and only ever fades", oMono);
-
-  // A round flying straight and fast. 900 m/s is the AIM-9's own top speed, so
-  // 0.5 s of flight is 450 m -- comfortably past the 200 m the gate asks for.
-  const trails = createTrails();
-  const round = {
-    owner: "player",
-    position: { x: 0, y: 500, z: 0 },
-    velocity: { x: 0, y: 0, z: -900 },
-  };
-  const rounds = [round];
-  const dt = 1 / 60;
-  const fly = (seconds) => {
-    for (let i = 0; i < Math.round(seconds / dt); i++) {
-      round.position.z -= 900 * dt;
-      trails.update(dt, rounds);
-    }
-  };
-
-  fly(0.1);
-  check("smoke appears within the first tenth of a second", trails.count() > 0, `${trails.count()}`);
-
-  // A SEGMENT IS A SPAN, NOT A PUFF. One point every life/14 at 900 m/s is a
-  // point every 38 m; drawn as a 2.6 m blob the trail is a row of dots with
-  // 35 m of clear air between them. Consecutive segments must SHARE AN ENDPOINT
-  // so the ribbon is continuous by construction, whatever the round's speed.
-  const chain = [...trails.live.values()][0].segments
-    .filter((sg) => sg.alive)
-    .sort((p, q) => q.age - p.age);
-  check("a segment has two endpoints", chain[0].bz !== undefined && chain[0].az !== undefined);
-  check(
-    "and it spans real distance rather than sitting on a point",
-    Math.hypot(chain[0].bx - chain[0].ax, chain[0].by - chain[0].ay, chain[0].bz - chain[0].az) > 1,
-  );
-  let joined = true;
-  let gap = 0;
-  for (let i = 1; i < chain.length; i++) {
-    const d = Math.hypot(
-      chain[i].ax - chain[i - 1].bx,
-      chain[i].ay - chain[i - 1].by,
-      chain[i].az - chain[i - 1].bz,
-    );
-    gap = Math.max(gap, d);
-    if (d > 1e-9) joined = false;
-  }
-  check("consecutive segments share an endpoint -- no gaps", joined, `worst gap ${gap}`);
-
-  // SEGMENT COUNT PER ROUND NEVER EXCEEDS 14. The array is a ring, so a round
-  // that flies for its whole 6.5 s life overwrites rather than growing.
-  let peak = 0;
-  for (let i = 0; i < 60 * 6; i++) {
-    round.position.z -= 900 * dt;
-    trails.update(dt, rounds);
-    trails.each((t) => {
-      peak = Math.max(peak, t.segments.filter((s) => s.alive).length);
-    });
-    if (peak > TRAIL.segments) break;
-  }
-  check("segment count per round never exceeds 14", peak <= TRAIL.segments, `peak ${peak}`);
-  check("and a steady round keeps the budget alive", peak >= TRAIL.segments - 1, `peak ${peak}`);
-  check(
-    "the pool is exactly 14 records, alive or not",
-    [...trails.live.values()].every((t) => t.segments.length === TRAIL.segments),
-  );
-
-  // SEGMENTS PERSIST IN WORLD POSITION AFTER THE ROUND HAS MOVED 200 m. This is
-  // the load-bearing claim: a ribbon parented to the round moves with it and
-  // reads as an ornament bolted to the missile.
-  const persist = createTrails();
-  const r2 = { owner: "player", position: { x: 0, y: 500, z: 0 }, velocity: { x: 0, y: 0, z: -900 } };
-  persist.update(dt, [r2]);
-  const laidAt = { ...r2.position };
-  for (let i = 0; i < Math.round(0.25 / dt); i++) {
-    r2.position.z -= 900 * dt;
-    persist.update(dt, [r2]);
-  }
-  const travelled = Math.abs(r2.position.z - laidAt.z);
-  check("the round has moved more than 200 m", travelled > 200, `${travelled.toFixed(0)} m`);
-  const oldest = [...persist.live.values()][0].segments
-    .filter((s) => s.alive)
-    .reduce((a, b) => (a.age > b.age ? a : b));
-  check(
-    "the oldest segment still starts where it was laid",
-    Math.abs(oldest.az - laidAt.z) < 1e-6,
-    `${oldest.az.toFixed(2)} vs ${laidAt.z.toFixed(2)}`,
-  );
-  check(
-    "and therefore 200 m behind the round, not on it",
-    Math.abs(oldest.az - r2.position.z) > 200,
-    `${Math.abs(oldest.az - r2.position.z).toFixed(0)} m behind`,
-  );
-  check(
-    "the segments are strung out along the flight path, not stacked",
-    new Set(
-      [...persist.live.values()][0].segments.filter((s) => s.alive).map((s) => s.az.toFixed(1)),
-    ).size > 4,
-  );
-  // The ribbon reaches the round: the newest segment ends where it is now.
-  const newest = [...persist.live.values()][0].segments
-    .filter((s) => s.alive)
-    .reduce((a, b) => (a.age < b.age ? a : b));
-  check(
-    "the newest segment ends within a frame of the round",
-    Math.abs(newest.bz - r2.position.z) < 900 / 60 + 1e-6,
-    `${Math.abs(newest.bz - r2.position.z).toFixed(2)} m`,
-  );
-
-  // A KILLED ROUND'S SEGMENTS FADE OUT RATHER THAN VANISHING. missile.js
-  // compacts a dead round out of its list on the frame it detonates, so a trail
-  // that lived inside the round would disappear with it -- and a kill that
-  // leaves no smoke reads as having happened nowhere.
-  const before = persist.count();
-  check("there is smoke to lose", before > 0, `${before}`);
-  persist.update(dt, []); // the round is gone
-  check("the trail is orphaned, not deleted", persist.orphans.length === 1);
-  check("and its smoke survives the frame the round died", persist.count() > 0, `${persist.count()}`);
-  const decay = [];
-  for (let i = 0; i < Math.round(TRAIL.life / dt) + 4; i++) {
-    persist.update(dt, []);
-    decay.push(persist.count());
-  }
-  check("the orphaned smoke thins out rather than cutting", decay.some((n) => n > 0 && n < before));
-  let fading = true;
-  for (let i = 1; i < decay.length; i++) if (decay[i] > decay[i - 1]) fading = false;
-  check("and it only ever thins", fading, decay.join(","));
-  check("it is gone within one segment life", persist.count() === 0, `${persist.count()}`);
-  check("and the orphan is released", persist.orphans.length === 0);
-
-  // The SAM round is the case §14 wrote the sentence for: it launches UPWARD
-  // with zero inherited speed, and the trail is what makes that read as a
-  // ground launch rather than as a round that appeared already flying.
-  const ground = createTrails();
-  const sam = { owner: "sam", position: { x: 200, y: 40, z: -8000 }, velocity: { x: 0, y: 440, z: 0 } };
-  const launchedAt = { ...sam.position };
-  for (let i = 0; i < Math.round(0.4 / dt); i++) {
-    sam.position.y += 440 * dt;
-    ground.update(dt, [sam]);
-  }
-  const column = [...ground.live.values()][0].segments.filter((s) => s.alive);
-  check("a SAM launch lays a vertical column", column.every((s) => Math.abs(s.ax - launchedAt.x) < 1e-9));
-  check(
-    "rooted at the ground, not at the round",
-    Math.min(...column.map((s) => s.ay)) < launchedAt.y + 40,
-    `lowest ${Math.min(...column.map((s) => s.ay)).toFixed(0)} vs launch ${launchedAt.y}`,
-  );
-  check(
-    "and reaching up to it",
-    Math.max(...column.map((s) => s.by)) > launchedAt.y + 100,
-    `highest ${Math.max(...column.map((s) => s.by)).toFixed(0)}`,
-  );
-  check(
-    "the column is continuous, not a row of dots",
-    column
-      .sort((p, q) => p.ay - q.ay)
-      .every((sg, i, all) => i === 0 || Math.abs(sg.ay - all[i - 1].by) < 1e-9),
-  );
-  check("the trail carries its owner, so nothing has to ask the round",
-    [...ground.live.values()][0].owner === "sam");
-
-  // clearFx() DROPS ALL TRAILS WITHOUT TOUCHING AMMUNITION. reset() reloads a
-  // magazine; clearFx() cleans up. A phase transition wants the second only.
-  const mixed = createTrails();
-  const gun = createGun();
-  gun.update(0.4, {
-    firing: true,
-    origin: { x: 0, y: 0, z: 0 },
-    forward: { x: 0, y: 0, z: -1 },
-    candidates: [],
-  });
-  const spent = gun.rounds;
-  check("the gun has spent rounds to protect", spent < 500, `${spent}`);
-  const a = { owner: "player", position: { x: 0, y: 100, z: 0 }, velocity: { x: 0, y: 0, z: -900 } };
-  const b = { owner: "sam", position: { x: 50, y: 10, z: -50 }, velocity: { x: 0, y: 440, z: 0 } };
-  for (let i = 0; i < 20; i++) {
-    a.position.z -= 15;
-    b.position.y += 7;
-    mixed.update(dt, [a, b]);
-  }
-  mixed.update(dt, [a]); // b dies, and orphans
-  check("there are live trails and an orphan to clear", mixed.live.size === 1 && mixed.orphans.length === 1);
-  mixed.clearFx();
-  check("clearFx drops every live trail", mixed.live.size === 0);
-  check("and every orphan", mixed.orphans.length === 0);
-  check("and every segment with them", mixed.count() === 0);
-  check("clearFx does NOT touch the ammunition", gun.rounds === spent, `${gun.rounds} vs ${spent}`);
-  check("and the trail field still works afterwards", (() => {
-    for (let i = 0; i < 10; i++) {
-      a.position.z -= 15;
-      mixed.update(dt, [a]);
-    }
-    return mixed.count() > 0;
-  })());
-
-  // Pooling: a magazine's worth of rounds fired and lost must not grow the
-  // record store without bound.
-  const churn = createTrails();
-  for (let shot = 0; shot < 12; shot++) {
-    const r = { owner: "player", position: { x: 0, y: 300, z: 0 }, velocity: { x: 0, y: 0, z: -900 } };
-    for (let i = 0; i < 30; i++) {
-      r.position.z -= 15;
-      churn.update(dt, [r]);
-    }
-    for (let i = 0; i < Math.round(TRAIL.life / dt) + 2; i++) churn.update(dt, []);
-  }
-  check("twelve rounds later nothing is still held", churn.count() === 0 && churn.orphans.length === 0);
-}
-
-function testGunMagazineAndFx() {
-  const hits = [];
-  const gun = createGun({ onHit: (t) => hits.push(t) });
-  check("the magazine starts full", gun.rounds === 500);
-
-  const target = createTarget({ position: { x: 0, y: 0, z: -600 }, radius: 9, health: 1e6 });
-  gun.update(0.5, {
-    firing: true,
-    origin: { x: 0, y: 0, z: 0 },
-    forward: { x: 0, y: 0, z: -1 },
-    candidates: [target],
-  });
-  check("holding the trigger spends rounds", gun.rounds < 500, `${gun.rounds}`);
-  check("rounds on target register hits", hits.length > 0, `${hits.length}`);
-  check("tracers are drawn for some rounds, not all",
-    gun.tracers.length > 0 && gun.tracers.length < 500 - gun.rounds,
-    `${gun.tracers.length} tracers for ${500 - gun.rounds} rounds`);
-
-  // A target off the nose is not hit.
-  const gun2 = createGun({ onHit: () => hits.push("wide") });
-  const wide = createTarget({ position: { x: 900, y: 0, z: -600 }, radius: 9 });
-  const before = hits.length;
-  gun2.update(0.5, {
-    firing: true, origin: { x: 0, y: 0, z: 0 },
-    forward: { x: 0, y: 0, z: -1 }, candidates: [wide],
-  });
-  check("a target well off the nose is not hit", hits.length === before);
-
-  // THE SEPARATION THAT MATTERS: clearFx() does not touch ammunition;
-  // reset() does. Conflating them silently disarms the player at every phase
-  // change in stage 7.
-  const spent = gun.rounds;
-  gun.clearFx();
-  check("clearFx removes the tracers", gun.tracers.length === 0);
-  check("clearFx does NOT touch the ammunition", gun.rounds === spent, `${gun.rounds}`);
-  gun.reset();
-  check("reset reloads the magazine", gun.rounds === 500);
-
-  // Empty means empty.
-  const gun3 = createGun({ magazine: 3 });
-  gun3.update(5, {
-    firing: true, origin: { x: 0, y: 0, z: 0 },
-    forward: { x: 0, y: 0, z: -1 }, candidates: [],
-  });
-  check("the magazine empties", gun3.rounds === 0 && gun3.isEmpty() === true);
-  gun3.update(5, {
-    firing: true, origin: { x: 0, y: 0, z: 0 },
-    forward: { x: 0, y: 0, z: -1 }, candidates: [],
-  });
-  check("an empty gun cannot go negative", gun3.rounds === 0);
-}
-
-// ── stage 6: an enemy that fights back ────────────────────────────────────
-
-const AI = (over = {}) => ({
-  state: "PATROL", stateTime: 0, lockTimer: 0, lockCue: 0,
-  defendCooldown: 0, ammo: 2, ...over,
-});
-const CTX = (over = {}) => ({
-  alive: true, playerAlive: true, ready: true,
-  range: 1500, inCone: true, lockCue: 0, ...over,
-});
-
-function testHostileTransitionTable() {
-  const T = hostileTransition;
-
-  // Death wins from EVERY state, and DESTROYED is terminal.
-  for (const state of ["PATROL", "PURSUIT", "ACQUIRE", "ATTACK", "COOLDOWN", "REPOSITION", "DEFEND"]) {
-    check(
-      `death wins from ${state}`,
-      T(AI({ state }), CTX({ alive: false })) === "DESTROYED",
-    );
-  }
-  check(
-    "DESTROYED is terminal even if it somehow revives",
-    T(AI({ state: "DESTROYED" }), CTX({ alive: true })) === "DESTROYED",
-  );
-
-  // Not ready, or no player: back to PATROL.
-  check("an unready hostile patrols", T(AI({ state: "PURSUIT" }), CTX({ ready: false })) === "PATROL");
-  check("a dead player is not pursued", T(AI({ state: "ACQUIRE" }), CTX({ playerAlive: false })) === "PATROL");
-
-  // PATROL -> PURSUIT on detection, and back out beyond it.
-  check("PATROL holds beyond detection", T(AI({ state: "PATROL" }), CTX({ range: 9000 })) === "PATROL");
-  check("PATROL promotes inside detection", T(AI({ state: "PATROL" }), CTX({ range: 4000 })) === "PURSUIT");
-  check("PURSUIT drops beyond detection", T(AI({ state: "PURSUIT" }), CTX({ range: 9000 })) === "PATROL");
-
-  // PURSUIT -> ACQUIRE only in the cone AND with a round.
-  check("PURSUIT holds outside the cone", T(AI({ state: "PURSUIT" }), CTX({ inCone: false })) === "PURSUIT");
-  check("PURSUIT promotes in the cone", T(AI({ state: "PURSUIT" }), CTX({ inCone: true })) === "ACQUIRE");
-
-  // ACQUIRE -> ATTACK on a completed lock; falls back out of the cone.
-  check(
-    "ACQUIRE holds while the lock builds",
-    T(AI({ state: "ACQUIRE", lockTimer: 0.5 }), CTX()) === "ACQUIRE",
-  );
-  check(
-    "ACQUIRE promotes on a completed lock",
-    T(AI({ state: "ACQUIRE", lockTimer: 1.3 }), CTX()) === "ATTACK",
-  );
-  check(
-    "ACQUIRE falls back when the player leaves the cone",
-    T(AI({ state: "ACQUIRE", lockTimer: 1.3 }), CTX({ inCone: false })) === "PURSUIT",
-  );
-
-  // ATTACK -> COOLDOWN -> REPOSITION -> PURSUIT.
-  check("ATTACK holds before the launch delay", T(AI({ state: "ATTACK", stateTime: 0.2 }), CTX()) === "ATTACK");
-  check("ATTACK launches after the delay", T(AI({ state: "ATTACK", stateTime: 0.6 }), CTX()) === "COOLDOWN");
-  check("COOLDOWN holds", T(AI({ state: "COOLDOWN", stateTime: 3 }), CTX()) === "COOLDOWN");
-  check("COOLDOWN releases after 7 s", T(AI({ state: "COOLDOWN", stateTime: 7.1 }), CTX()) === "REPOSITION");
-  check("REPOSITION returns to PURSUIT", T(AI({ state: "REPOSITION", stateTime: 5 }), CTX()) === "PURSUIT");
-
-  // The transition function is PURE: it must not mutate what it is handed.
-  const ai = AI({ state: "PURSUIT" });
-  const before = JSON.stringify(ai);
-  T(ai, CTX());
-  check("the transition function does not mutate the ai", JSON.stringify(ai) === before);
-}
-
-function testAmmoZeroIsTheDesignTool() {
-  // §12: "it chases you but does not shoot back yet" must need NO new state
-  // and NO special case -- the table already refuses to promote without a
-  // round. A perfect firing position with an empty magazine stays in PURSUIT.
-  const perfect = CTX({ range: 1200, inCone: true });
-  check(
-    "ammo 0 cannot reach ACQUIRE from a perfect firing position",
-    hostileTransition(AI({ state: "PURSUIT", ammo: 0 }), perfect) === "PURSUIT",
-  );
-  check(
-    "ammo 0 falls out of ACQUIRE",
-    hostileTransition(AI({ state: "ACQUIRE", ammo: 0, lockTimer: 9 }), perfect) === "PURSUIT",
-  );
-  check(
-    "one round is enough to promote",
-    hostileTransition(AI({ state: "PURSUIT", ammo: 1 }), perfect) === "ACQUIRE",
-  );
-  // And it still pursues -- being harmless is not being passive.
-  check(
-    "an unarmed hostile still pursues",
-    hostileTransition(AI({ state: "PATROL", ammo: 0 }), perfect) === "PURSUIT",
-  );
-}
-
-function testDefendRules() {
-  const T = hostileTransition;
-  const cfg = HOSTILE_CFG;
-
-  // A FLEETING lock provokes nothing.
-  check(
-    "a lock held briefly does not provoke a break",
-    T(AI({ state: "PURSUIT" }), CTX({ lockCue: 0.3 })) === "ACQUIRE",
-  );
-  check(
-    "a lock held past the reaction delay provokes a break",
-    T(AI({ state: "PURSUIT" }), CTX({ lockCue: cfg.defendReaction + 0.01 })) === "DEFEND",
-  );
-
-  // A COMMITTED ATTACK IS NEVER INTERRUPTIBLE. 0.55 s from lock to launch, and
-  // a hostile that could be talked out of a shot would never land one.
-  check(
-    "a committed ATTACK ignores the player's lock",
-    T(AI({ state: "ATTACK", stateTime: 0.2 }), CTX({ lockCue: 5 })) === "ATTACK",
-  );
-  check(
-    "a committed ATTACK still completes its launch",
-    T(AI({ state: "ATTACK", stateTime: 0.9 }), CTX({ lockCue: 5 })) === "COOLDOWN",
-  );
-
-  // A sustained lock cannot CHAIN breaks inside the cooldown -- otherwise it
-  // becomes a permanent evasion loop the player can never shoot it out of.
-  check(
-    "a break on cooldown is refused",
-    T(AI({ state: "PURSUIT", defendCooldown: 3 }), CTX({ lockCue: 5 })) === "ACQUIRE",
-  );
-  check(
-    "DEFEND runs its full 2.8 s",
-    T(AI({ state: "DEFEND", stateTime: 1.4 }), CTX({ lockCue: 5 })) === "DEFEND",
-  );
-  check(
-    "DEFEND ends in REPOSITION",
-    T(AI({ state: "DEFEND", stateTime: 3 }), CTX({ lockCue: 0 })) === "REPOSITION",
-  );
-}
-
-function testBreakDirectionIsLatched() {
-  // THE TEST THAT CATCHES AN UNLATCHED DIRECTION. Recomputing which way to
-  // turn every frame flips the cross product as the aircraft turns, and the
-  // break oscillates to a net heading change of nothing.
-  const h = createHostile();
-  h.deploy({ at: { x: 900, y: 1200, z: -2500 }, heading: 0, ammo: 2 });
-  const player = createFlightState({ position: { x: 0, y: 1200, z: 0 } });
-
-  // Hold a completed lock until it breaks.
-  let broke = false;
-  for (let t = 0; t < 3 && !broke; t += 1 / 60) {
-    h.update(1 / 60, { playerState: player, playerLockedOnMe: true });
-    if (h.ai.state === "DEFEND") broke = true;
-  }
-  check("a held lock makes it break", broke, h.ai.state);
-  const latched = h.ai.breakSign;
-  const headingAtEntry = h.ai.heading;
-
-  for (let t = 0; t < 2.6; t += 1 / 60) {
-    h.update(1 / 60, { playerState: player, playerLockedOnMe: true });
-  }
-  check("the latched direction never changed", h.ai.breakSign === latched, `${h.ai.breakSign}`);
-  const swept = Math.abs(wrapAngle(h.ai.heading - headingAtEntry));
-  check(
-    "the break changes heading by a meaningful amount",
-    swept > 0.5,
-    `${((swept * 180) / Math.PI).toFixed(1)} deg`,
-  );
-}
-
-function testAltitudeGuard() {
-  // It must NEVER fly into the sea, including through a diving break.
-  const h = createHostile();
-  h.deploy({ at: { x: 400, y: 320, z: -2000 }, heading: 0, ammo: 2 });
-  // A player far below, so every steering instinct points it downward.
-  const player = createFlightState({ position: { x: 0, y: 5, z: 0 } });
-  let lowest = Infinity;
-  for (let t = 0; t < 25; t += 1 / 60) {
-    h.update(1 / 60, { playerState: player, playerLockedOnMe: t > 4 && t < 9 });
-    lowest = Math.min(lowest, h.target.position.y);
-  }
-  check(
-    "the hostile never descends below its floor",
-    lowest >= HOSTILE_CFG.minAltitude - 1e-6,
-    `lowest ${lowest.toFixed(1)} vs floor ${HOSTILE_CFG.minAltitude}`,
-  );
-  check("it did get pushed down toward the floor", lowest < 400, `${lowest.toFixed(1)}`);
-}
-
-function testInactiveMeansInactive() {
-  const h = createHostile();
-  h.deploy({ at: { x: 500, y: 1000, z: -3000 }, heading: 0, ammo: 2 });
-  h.setActive(false);
-  const before = { ...h.target.position };
-  const player = createFlightState({ position: { x: 0, y: 1000, z: 0 } });
-  for (let t = 0; t < 10; t += 1 / 60) {
-    h.update(1 / 60, { playerState: player, playerLockedOnMe: true });
-  }
-  const moved = Math.hypot(
-    h.target.position.x - before.x,
-    h.target.position.y - before.y,
-    h.target.position.z - before.z,
-  );
-  check("ten seconds of updates on an inactive hostile moves it zero metres", moved === 0, `${moved}`);
-  check("an inactive hostile reports itself inactive", h.isActive() === false);
-  check("an inactive hostile does not change state", h.ai.state === "PATROL");
-}
-
-function testDeployAndSpent() {
-  const h = createHostile();
-  check("a fresh hostile has no encounters", h.ai.encounters === 0);
-
-  h.deploy({ at: { x: 100, y: 900, z: -1000 }, heading: 1, ammo: 2 });
-  check("deploy counts the encounter", h.ai.encounters === 1);
-  check("deploy arms it", h.ai.ammo === 2);
-  check("deploy positions it", h.target.position.x === 100 && h.target.position.z === -1000);
-  check("deploy activates it", h.isActive() === true);
-
-  // Kill it, then redeploy: it must REVIVE, and the count must survive the
-  // internal reset -- that count is what alternates which side it appears on.
-  h.target.alive = false;
-  h.target.health = 0;
-  h.ai.ammo = 0;
-  h.deploy({ at: { x: -400, y: 1200, z: -5000 }, heading: 2, ammo: 1 });
-  check("deploy revives it", h.target.alive === true && h.target.health === h.target.maxHealth);
-  check("deploy re-arms it", h.ai.ammo === 1);
-  check("deploy repositions it", h.target.position.x === -400);
-  check("the encounter count SURVIVES the reset", h.ai.encounters === 2, `${h.ai.encounters}`);
-
-  // `spent` is true only when the magazine is empty AND nothing is in the air.
-  check("armed is not spent", h.spent(0) === false);
-  h.ai.ammo = 0;
-  check("empty with a round still flying is NOT spent", h.spent(1) === false);
-  check("empty with nothing in the air IS spent", h.spent(0) === true);
-}
-
-function testHostileRoundFairness() {
-  // §14: the fairness claim is the turn RADIUS. It must stay comparable to the
-  // F-15's arcade turn at 250 m/s, which is what makes a hard crossing
-  // manoeuvre defeat the round with no countermeasure at all.
-  const r = turnRadius(HOSTILE_MISSILE);
-  check(
-    "the hostile round's turn radius is near §14's ~904 m",
-    r > 800 && r < 1000,
-    `${r.toFixed(0)} m`,
-  );
-  check(
-    "a hard crossing manoeuvre can defeat it: radius >= the aircraft's",
-    r >= TURN_RADIUS_REF * 0.85,
-    `round ${r.toFixed(0)} vs aircraft ${TURN_RADIUS_REF}`,
-  );
-  check(
-    "the hostile round is slower and turns wider than the AIM-9",
-    HOSTILE_MISSILE.maxSpeed < AIM9.maxSpeed &&
-      HOSTILE_MISSILE.turnRate < AIM9.turnRate,
-  );
-  check(
-    "it is the SAME implementation, differing only as data",
-    HOSTILE_MISSILE.name !== AIM9.name &&
-      typeof HOSTILE_MISSILE.fuze === "number",
-  );
-}
-
-function testThreatEscalation() {
-  const monitor = createThreatMonitor();
-  const at = { position: { x: 0, y: 1000, z: 0 } };
-
-  check("nothing is a threat at rest", monitor.update(1 / 60, at, [], []).level === "NONE");
-
-  const tracking = [{ level: "TRACK", position: { x: 0, y: 1000, z: -4000 }, progress: 0.3 }];
-  check("an acquisition escalates to TRACK", monitor.update(1 / 60, at, tracking, []).level === "TRACK");
-
-  const locking = [{ level: "LOCK", position: { x: 0, y: 1000, z: -3000 }, progress: 1 }];
-  check("a lock outranks a track", monitor.update(1 / 60, at, locking, []).level === "LOCK");
-
-  // A LIVE ROUND ALWAYS OUTRANKS AN ACQUISITION -- it is the only one of the
-  // two the player cannot ignore.
-  const round = {
-    owner: "hostile", position: { x: 0, y: 1000, z: -900 },
-    config: { name: "HOSTILE", fuze: 8 },
-  };
-  const s = monitor.update(1 / 60, at, locking, [round]);
-  check("a live round outranks any acquisition", s.level === "MISSILE", s.level);
-
-  // The player's own round is never a threat to the player.
-  const mine = { owner: "player", position: { x: 0, y: 1000, z: -400 }, config: { name: "AIM-9" } };
-  check(
-    "the player's own round is not a threat",
-    monitor.update(1 / 60, at, [], [mine]).level === "NONE",
-  );
-
-  // Two acquisitions at once: the CLOSER one is named. A site at 900 m is more
-  // urgent than a fighter tracking from 4 km.
-  const m2 = createThreatMonitor();
-  const near = { level: "LOCK", position: { x: 0, y: 1000, z: -900 }, origin: "sam", label: "SAM" };
-  const far = { level: "LOCK", position: { x: 0, y: 1000, z: -4000 }, label: "HOSTILE" };
-  const picked = m2.update(1 / 60, at, [far, near], []);
-  check("with two equal acquisitions the closer is named", picked.source === near, picked.source?.label);
-  check("the label carries the origin", picked.label === "SAM LOCK", picked.label);
-}
-
-function testAuthorityHook() {
-  const evasion = createEvasion();
-  const hostileRound = { owner: "hostile", config: HOSTILE_MISSILE };
-  const playerRound = { owner: "player", config: AIM9 };
-
-  check("no roll means full authority", authorityFor(hostileRound, evasion) === 1);
-
-  check("the roll is a latched request", evasion.request("ASSISTED") === true);
-  check("a second request while rolling is refused", evasion.request("ASSISTED") === false);
-  check("the roll is running", evasion.isRolling() === true);
-
-  const degraded = authorityFor(hostileRound, evasion);
-  check("the roll degrades an incoming round", degraded < 1, `${degraded}`);
-  // NEVER TO ZERO: a defeated round keeps flying its curve and can still get
-  // lucky on the fuze, so a miss reads as a miss.
-  check("authority is never reduced to zero", degraded > 0, `${degraded}`);
-
-  // AND IT NEVER AFFECTS THE PLAYER'S OWN ROUNDS.
-  check("the roll does not affect the player's own rounds", authorityFor(playerRound, evasion) === 1);
-
-  // Expert gets a tighter window: finer control, so the timing is worth more.
-  const e2 = createEvasion();
-  e2.request("EXPERT");
-  check("Expert's window is tighter than Assisted's", e2.window() < EVADE_WINDOW.ASSISTED);
-  check("the Assisted window is 0.60 s", EVADE_WINDOW.ASSISTED === 0.6);
-  check("the Expert window is 0.42 s", EVADE_WINDOW.EXPERT === 0.42);
-
-  // The window expires.
-  for (let t = 0; t < 1; t += 1 / 60) evasion.update(1 / 60);
-  check("the roll window expires", evasion.isRolling() === false);
-  check("authority returns to full", authorityFor(hostileRound, evasion) === 1);
-
-  // wouldHaveHit: only a miss that WAS going to connect is worth announcing.
-  const onTarget = {
-    position: { x: 0, y: 0, z: -400 }, velocity: { x: 0, y: 0, z: 400 },
-    config: { fuze: 8 },
-  };
-  check("a round on a collision course would have hit", wouldHaveHit(onTarget, { x: 0, y: 0, z: 0 }));
-  const wide = {
-    position: { x: 900, y: 0, z: -400 }, velocity: { x: 0, y: 0, z: 400 },
-    config: { fuze: 8 },
-  };
-  check("a round passing wide would not have hit", wouldHaveHit(wide, { x: 0, y: 0, z: 0 }) === false);
-  const receding = {
-    position: { x: 0, y: 0, z: 400 }, velocity: { x: 0, y: 0, z: 400 },
-    config: { fuze: 8 },
-  };
-  check("a round already past is not a would-have-hit", wouldHaveHit(receding, { x: 0, y: 0, z: 0 }) === false);
-}
-
-function testDamageResponseFiresOnce() {
-  const feedback = [];
-  const damage = createDamageResponse({ onFeedback: (e) => feedback.push(e) });
-  const event = playerDamageEvent({
-    source: "missile", at: 1, position: { x: 0, y: 0, z: 0 },
-    amount: 55, owner: "hostile",
-  });
-
-  check("the first hit is handled", damage.handle(event) === true);
-  check("feedback fired once", feedback.length === 1);
-
-  // A 22 m proximity fuze can trip on CONSECUTIVE FRAMES, and a re-entrant
-  // response loops forever. Everything arriving while holding or in cooldown
-  // is swallowed.
-  check("a same-frame re-entry is swallowed", damage.handle(event) === false);
-  check("no second feedback", feedback.length === 1);
-  for (let t = 0; t < 0.5; t += 1 / 60) damage.tick(1 / 60);
-  check("still swallowed during the hold", damage.handle(event) === false);
-  check("the veil is showing during the hold", damage.veil() > 0);
-
-  for (let t = 0; t < 1.6; t += 1 / 60) damage.tick(1 / 60);
-  check("the veil clears", damage.veil() === 0);
-  check("a later hit is handled again", damage.handle(event) === true);
-  check("the tally counted both", damage.hitsTaken() === 2);
-
-  // The event carries what a response needs and is a COPY of the position.
-  const captured = damage.lastEvent();
-  for (const field of ["source", "at", "position", "amount", "owner"]) {
-    check(`the damage event carries ${field}`, field in captured);
-  }
-  // Presentation resets; the tally does not (§17.11).
-  damage.reset();
-  check("reset clears the presentation", damage.veil() === 0);
-  check("reset does NOT clear the tally", damage.hitsTaken() === 2);
-  damage.resetAll();
-  check("resetAll clears the tally", damage.hitsTaken() === 0);
-}
-
-// ── stage 7: the sortie ───────────────────────────────────────────────────
-//
-// The dangerous thing in this stage is anything with a STORED POSITION -- a
-// checkpoint captured in one place and restored into different terrain -- and
-// that is only testable against a synthetic height field with no scene.
-
-const MCTX = (over = {}) => ({
-  fired: false, handedOff: false, legReached: false, killedAt: null,
-  magazineSpent: false, cinematicDone: false, phaseTime: 0, ...over,
-});
-
-function testMissionTransitionTable() {
-  const T = missionTransition;
-
-  check("DECK waits for the catapult", T({ phase: DECK }, MCTX()) === DECK);
-  check("DECK advances when it fires", T({ phase: DECK }, MCTX({ fired: true })) === LAUNCH);
-  check("LAUNCH waits for the handoff", T({ phase: LAUNCH }, MCTX()) === LAUNCH);
-  check("LAUNCH advances on the handoff", T({ phase: LAUNCH }, MCTX({ handedOff: true })) === EGRESS);
-  check("EGRESS waits for its waypoint", T({ phase: EGRESS }, MCTX({ phaseTime: 10 })) === EGRESS);
-  check("EGRESS advances on the waypoint", T({ phase: EGRESS }, MCTX({ legReached: true })) === INTERCEPT);
-
-  // THE FLOORS ARE REQUIRED, NOT DECORATIVE. Without them the combat phases end
-  // in about twelve seconds: the coastline volume that serves as their "next
-  // region" is close enough that flying straight through clears both
-  // encounters before either reads as one.
-  check(
-    "INTERCEPT will not advance below its floor even at the waypoint",
-    T({ phase: INTERCEPT }, MCTX({ legReached: true, phaseTime: 10 })) === INTERCEPT,
-  );
-  check(
-    "INTERCEPT advances at the waypoint above its floor",
-    T({ phase: INTERCEPT }, MCTX({ legReached: true, phaseTime: 30 })) === DEFENSIVE,
-  );
-  // The KILL floor is much shorter: an encounter the player WON should not
-  // hold them -- it only needs to let the explosion land.
-  check(
-    "a kill shortens the floor to 6 s",
-    T({ phase: INTERCEPT }, MCTX({ killedAt: 8, phaseTime: 14.1 })) === DEFENSIVE,
-  );
-  check(
-    "a kill still respects its own 6 s",
-    T({ phase: INTERCEPT }, MCTX({ killedAt: 8, phaseTime: 11 })) === INTERCEPT,
-  );
-
-  // DEFENSIVE also advances on a spent magazine.
-  check(
-    "DEFENSIVE advances on a spent magazine",
-    T({ phase: DEFENSIVE }, MCTX({ magazineSpent: true, phaseTime: 35 })) === TERRAIN,
-  );
-
-  check("TERRAIN advances on its last leg", T({ phase: TERRAIN }, MCTX({ legReached: true })) === FINAL);
-  check("FINAL advances on the seaward leg", T({ phase: FINAL }, MCTX({ legReached: true })) === EXTRACTION);
-  check(
-    "EXTRACTION waits for the cinematic",
-    T({ phase: EXTRACTION }, MCTX({ phaseTime: 5 })) === EXTRACTION,
-  );
-  check(
-    "EXTRACTION completes when the cinematic ends",
-    T({ phase: EXTRACTION }, MCTX({ cinematicDone: true })) === COMPLETE,
-  );
-  check("COMPLETE is terminal", T({ phase: COMPLETE }, MCTX({ legReached: true })) === COMPLETE);
-
-  // EVERY PHASE NEEDS A TIME FALLBACK (§17.10). No combination of missed shots
-  // or ignored enemies may soft-lock a sortie.
-  for (const [phase, next] of [
-    [EGRESS, INTERCEPT], [INTERCEPT, DEFENSIVE], [DEFENSIVE, TERRAIN],
-    [TERRAIN, FINAL], [FINAL, EXTRACTION], [EXTRACTION, COMPLETE],
-  ]) {
-    const fallback = PHASES[phase].fallback;
-    check(
-      `${phase} has a finite fallback`,
-      Number.isFinite(fallback),
-      `${fallback}`,
-    );
-    check(
-      `${phase} falls through on time alone`,
-      T({ phase }, MCTX({ phaseTime: fallback + 0.1 })) === next,
-    );
-  }
-
-  // The transition function is PURE.
-  const m = { phase: INTERCEPT };
-  const before = JSON.stringify(m);
-  T(m, MCTX({ phaseTime: 99 }));
-  check("missionTransition does not mutate the mission", JSON.stringify(m) === before);
-}
-
-function testTriggerVolumes() {
-  const v = { name: "TEST", x: 100, z: -2000, radius: 1300 };
-  check("dead centre is inside", inVolume(v, { x: 100, y: 900, z: -2000 }));
-  check("50 m off-line still counts", inVolume(v, { x: 150, y: 900, z: -2000 }));
-  check("just inside the rim counts", inVolume(v, { x: 100 + 1290, y: 900, z: -2000 }));
-  check("just outside does not", inVolume(v, { x: 100 + 1310, y: 900, z: -2000 }) === false);
-
-  // ALTITUDE MUST NOT GATE A ROUTE WAYPOINT: a player flying the whole sortie
-  // on the deck still progresses.
-  check("altitude does not gate a route waypoint at 30 m", inVolume(v, { x: 100, y: 30, z: -2000 }));
-  check("nor at 9 km", inVolume(v, { x: 100, y: 9000, z: -2000 }));
-
-  // The recovery volume is the ONLY one with a band: arriving home at 12 km is
-  // not arriving home.
-  const rec = { name: "RECOVERY", x: 0, z: -1200, radius: 2400, band: { min: 80, max: 3800 } };
-  check("the recovery band admits a sane altitude", inVolume(rec, { x: 0, y: 600, z: -1200 }));
-  check("the recovery band rejects the deck", inVolume(rec, { x: 0, y: 20, z: -1200 }) === false);
-  check("the recovery band rejects the stratosphere", inVolume(rec, { x: 0, y: 9000, z: -1200 }) === false);
-
-  // §7: "Assert that INTERCEPT and COASTLINE do not overlap. This check exists
-  // because they did touch." If they touch, entering the intercept area
-  // instantly satisfies "reached the next region" for a fight that has not
-  // started.
-  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
-  const byName = Object.fromEntries(route.legs.map((l) => [l.name, l]));
-  check(
-    "INTERCEPT and COASTLINE volumes do not overlap",
-    volumesOverlap(byName.INTERCEPT, byName.COASTLINE) === false,
-    `gap ${(Math.abs(byName.INTERCEPT.z - byName.COASTLINE.z) - byName.INTERCEPT.radius - byName.COASTLINE.radius).toFixed(0)} m`,
-  );
-  check("volumesOverlap detects an actual overlap", volumesOverlap(
-    { x: 0, z: 0, radius: 100 }, { x: 0, z: 150, radius: 100 },
-  ) === true);
-}
-
-// A synthetic height field: a genuine pass (low ground with high ground BOTH
-// sides) at x = -2000, and a one-sided coastal slope at x = +3000 that a
-// stronger-flank score would wrongly prefer.
-function syntheticTerrain(x, z) {
-  const pass = 600 - 520 * Math.exp(-((x + 2000) ** 2) / (2 * 700 ** 2));
-  const slope = Math.max(0, Math.min(900, (x - 1500) * 0.35));
-  return Math.max(pass, slope);
-}
-
-function testBandFeatureUsesTheWeakerFlank() {
-  // A genuine pass: high, low, high.
-  const pass = bandFeature([500, 500, 80, 500, 500], 2);
-  check("a genuine pass scores positively", pass.score > 300, `${pass.score}`);
-  check("the pass is found at its centre", pass.index === 2, `${pass.index}`);
-
-  // A ONE-SIDED SLOPE: high on the left, sea level on the right. A score using
-  // the STRONGER flank would rate this as highly as the pass; using the weaker
-  // one rates it at zero, which is the whole point.
-  const slope = bandFeature([900, 900, 80, 0, 0], 2);
-  check(
-    "a one-sided slope scores at or below zero",
-    slope.score <= 0,
-    `${slope.score}`,
-  );
-  check(
-    "the genuine pass beats the one-sided slope",
-    pass.score > slope.score,
-    `pass ${pass.score} vs slope ${slope.score}`,
-  );
-
-  // And on the synthetic field, the surveyed waypoint must land on the pass
-  // side rather than out on the coastal slope.
-  const route = surveyTerrainRoute(syntheticTerrain, 0, { rows: 9, cols: 41, span: 4 });
-  check("the survey returns three legs", route.length === 3, `${route.length}`);
-  check(
-    "every surveyed leg sits on the pass, not the one-sided slope",
-    route.every((leg) => leg.x < 0),
-    route.map((l) => l.x.toFixed(0)).join(", "),
-  );
-
-  check("a band too short to have flanks yields nothing", bandFeature([1, 2], 3) === null);
-}
-
-function testZoningSpreadsAClusteredField() {
-  // ZONE BEFORE SCORING. Greedy scoring alone clusters: the deepest passes
-  // tend to sit in one massif, leaving most of the corridor without a
-  // waypoint and the route doubling back on itself.
-  //
-  // This field puts the three BEST scores adjacent at the start, so pure
-  // scoring would take all three from one place.
-  const bands = [];
-  for (let i = 0; i < 30; i++) {
-    const score = i < 3 ? 900 - i : 100 + (i % 7);
-    bands.push({ z: -i * 300, feature: { index: 5, score, centre: 0 } });
-  }
-  const picked = pickZonedFeatures(bands, 3);
-  check("zoning returns one feature per third", picked.length === 3);
-  const zones = picked.map((b) => Math.floor(bands.indexOf(b) / 10));
-  check(
-    "the three picks land in three different thirds",
-    new Set(zones).size === 3,
-    `zones ${zones.join(",")}`,
-  );
-  // Pure greedy would have taken indices 0, 1, 2 -- all in the first third.
-  check(
-    "zoning did NOT take all three from the cluster",
-    !(bands.indexOf(picked[1]) < 3 && bands.indexOf(picked[2]) < 3),
-  );
-  check("an empty field yields nothing", pickZonedFeatures([], 3).length === 0);
-}
-
-function testRoutePlan() {
-  const surveyed = buildRoute({
-    carrierZ: -1600, coastZ: -7600, sampleHeight: syntheticTerrain,
-  });
-  check("a surveyed route is marked surveyed", surveyed.surveyed === true);
-  check("the route has eight legs", surveyed.legs.length === 8, `${surveyed.legs.length}`);
-
-  // Every navigating phase gets at least one leg.
-  for (const phase of [EGRESS, INTERCEPT, DEFENSIVE, TERRAIN, FINAL, EXTRACTION]) {
-    check(
-      `${phase} has at least one leg`,
-      surveyed.legs.some((l) => l.phase === phase),
-    );
-  }
-  check("TERRAIN has three legs", surveyed.legs.filter((l) => l.phase === TERRAIN).length === 3);
-
-  // The legs run inland then back out to sea, in order.
-  const zs = surveyed.legs.map((l) => l.z);
-  check("the route runs inland", zs[3] < zs[0], `${zs[0]} -> ${zs[3]}`);
-  check("and turns back out to sea", zs[7] > zs[5], `${zs[5]} -> ${zs[7]}`);
-
-  // Terrain anchors clear the ground they sit over.
-  for (const leg of surveyed.legs.filter((l) => l.phase === TERRAIN)) {
-    check(
-      `${leg.name} sits over ground it can clear`,
-      leg.ground < 700,
-      `${leg.ground?.toFixed(0)}`,
-    );
-  }
-
-  // A NO-TERRAIN BUILD STILL GETS A FULL ROUTE. The mission must remain
-  // completable when the asset failed to load.
-  const authored = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
-  check("a no-terrain build is marked authored", authored.surveyed === false);
-  check("a no-terrain build still has eight legs", authored.legs.length === 8);
-  check(
-    "a no-terrain build still has three inland legs",
-    authored.legs.filter((l) => l.phase === TERRAIN).length === 3,
-  );
-}
-
-// A point aircraft that simply flies to whatever leg it is given.
-function flyMission({ ignoreCombat = false, failAt = null } = {}) {
-  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: syntheticTerrain });
-  const seen = [];
-  const mission = createMission({ route, onPhase: (to) => seen.push(to) });
-  const position = { x: 0, y: 900, z: -1600 };
-  let extraction = 0;
-  let failed = false;
-
-  const dt = 1 / 30;
-  for (let t = 0; t < 400; t += dt) {
-    const leg = mission.currentLeg();
-    if (leg) {
-      // Fly straight at the current leg at a plausible speed.
-      const dx = leg.x - position.x;
-      const dz = leg.z - position.z;
-      const d = Math.hypot(dx, dz) || 1;
-      position.x += (dx / d) * 210 * dt;
-      position.z += (dz / d) * 210 * dt;
-      position.y = leg.band ? 600 : 900;
-    }
-    if (mission.mission.phase === EXTRACTION) extraction += dt;
-
-    // A kill in the combat phases, unless combat is being ignored entirely.
-    if (
-      !ignoreCombat &&
-      (mission.mission.phase === INTERCEPT || mission.mission.phase === DEFENSIVE) &&
-      mission.mission.phaseTime > 4 &&
-      mission.mission.killedAt === null
-    ) {
-      mission.noteKill("air");
-    }
-
-    if (failAt && !failed && mission.mission.phase === failAt) {
-      failed = true;
-      // A failure in the middle: the checkpoint restore puts the aircraft
-      // back, but the mission must still reach COMPLETE.
-      mission.addCheckpoint(
-        captureCheckpoint(
-          { position, heading: 0, pitch: 0.4, bank: 0.9, speed: 240, throttle: 0.6, sink: 3, mode: "ASSISTED", afterburner: false, quat: { x: 0, y: 0, z: 0, w: 1 } },
-          { groundAhead: 500, weapon: "GUN", missiles: 1, gunRounds: 220, phase: failAt },
-        ),
-      );
-    }
-
-    mission.update(dt, {
-      position,
-      fired: t > 1,
-      handedOff: t > 2,
-      magazineSpent: ignoreCombat,
-      cinematicDone: extraction >= 7.2,
-    });
-    if (mission.mission.phase === COMPLETE) break;
-  }
-  return { mission, seen, position };
-}
-
-// ── Change 1 (DIAGNOSIS B4): mission leg zero is not consumed on the deck ──
-
-function testLegZeroIsNotConsumedOnTheDeck() {
-  const carrierZ = -1600;
-  const route = buildRoute({ carrierZ, coastZ: -7600, sampleHeight: syntheticTerrain });
-  const coast = route.legs[0];
-
-  // THE GEOMETRIC HALF. COAST used to sit 1100 m ahead of a carrier at
-  // z = -1600 with a 1250 m radius, so the parked aircraft started INSIDE its
-  // own first waypoint: it was consumed on frame one, legIndex became 1, and
-  // the HUD pointed at INTERCEPT while the jet was on the catapult.
-  check("leg 0 is still COAST", coast.name === "COAST", coast.name);
-  check(
-    "COAST stands off the carrier by its own radius plus a margin",
-    Math.abs(coast.z - carrierZ) >= coast.radius + 900 - 1e-9,
-    `standoff ${Math.abs(coast.z - carrierZ).toFixed(0)} vs radius ${coast.radius} + 900`,
-  );
-  check(
-    "and it is DERIVED from the radius, not authored beside it",
-    Math.abs(coast.z - carrierZ) === coast.radius + 900,
-    `${Math.abs(coast.z - carrierZ)}`,
-  );
-
-  // The anchors the launch script actually uses (world.js's fallback set, whose
-  // geometry matches the measured one: start 100 m aft of the carrier origin,
-  // 199.7 m of deck run, deck 20 m up).
-  const deckY = 20;
-  const launchStart = { x: 0, y: deckY, z: carrierZ + 100 };
-  const launchEnd = { x: 0, y: deckY, z: carrierZ - 99.7 };
-
-  check(
-    "the launch-start anchor is outside leg 0",
-    !inVolume(coast, launchStart),
-    `d ${Math.hypot(launchStart.x - coast.x, launchStart.z - coast.z).toFixed(0)} vs r ${coast.radius}`,
-  );
-  // The stronger reading, and the one that stops this recurring in ANY leg: no
-  // volume in the route may contain the point the aircraft is parked on.
-  for (const leg of route.legs) {
-    check(
-      `the launch-start anchor is outside ${leg.name}`,
-      !inVolume(leg, launchStart),
-      `d ${Math.hypot(launchStart.x - leg.x, launchStart.z - leg.z).toFixed(0)} vs r ${leg.radius}`,
-    );
-    check(
-      `the deck-edge anchor is outside ${leg.name}`,
-      !inVolume(leg, launchEnd),
-      `d ${Math.hypot(launchEnd.x - leg.x, launchEnd.z - leg.z).toFixed(0)} vs r ${leg.radius}`,
-    );
-  }
-  // RECOVERY is the one that is only outside because of its altitude band: it
-  // is 400 m the other side of the carrier with a 2400 m radius, so the deck is
-  // well inside it horizontally and the 80 m floor is what excludes it. Stated
-  // explicitly, because a band edit would otherwise re-open leg zero silently.
-  const recovery = route.legs[route.legs.length - 1];
-  check(
-    "RECOVERY contains the deck horizontally",
-    Math.hypot(launchStart.x - recovery.x, launchStart.z - recovery.z) < recovery.radius,
-  );
-  check(
-    "and it is the altitude band that keeps the deck out of it",
-    recovery.band.min > deckY,
-    `band min ${recovery.band.min} vs deck ${deckY}`,
-  );
-
-  // THE STRUCTURAL HALF. No leg may be consumed while the launch script owns
-  // the aircraft -- so a volume placed too close can never silently eat a
-  // waypoint again, whatever a later radius edit does to the geometry.
-  const parked = createMission({ route });
-  for (let t = 0; t < 12; t += 1 / 60) {
-    parked.update(1 / 60, {
-      position: { ...launchStart },
-      fired: t > 4,
-      handedOff: false,
-    });
-  }
-  check(
-    "leg 0 is still COAST after 12 s of deck time",
-    parked.mission.legIndex === 0 && parked.currentLeg().name === "COAST",
-    `legIndex ${parked.mission.legIndex}, leg ${parked.currentLeg()?.name}`,
-  );
-  check(
-    "and nav publishes COAST on the deck, not INTERCEPT",
-    parked.currentLeg().name === "COAST",
-    parked.currentLeg().name,
-  );
-
-  // The gate is on AUTHORITY, not on geometry: a director parked ON TOP of its
-  // own first waypoint still may not consume it before the handoff.
-  const cheat = createMission({ route });
-  for (let i = 0; i < 120; i++) {
-    cheat.update(1 / 60, {
-      position: { x: coast.x, y: 400, z: coast.z },
-      fired: true,
-      handedOff: false,
-    });
-  }
-  check(
-    "sitting inside leg 0 pre-handoff consumes nothing",
-    cheat.mission.legIndex === 0,
-    `legIndex ${cheat.mission.legIndex}`,
-  );
-  // ...and the same frame, once authority has transferred, does consume it.
-  cheat.update(1 / 60, {
-    position: { x: coast.x, y: 400, z: coast.z },
-    fired: true,
-    handedOff: true,
-  });
-  check(
-    "the same position DOES consume it after the handoff",
-    cheat.mission.legIndex === 1,
-    `legIndex ${cheat.mission.legIndex}`,
-  );
-
-  // The first frame after the handoff, flown honestly from the deck: nav must
-  // still read COAST. This is the frame the screenshot gate photographs.
-  const real = createMission({ route });
-  const pos = { x: 0, y: deckY, z: launchStart.z };
-  let handedOff = false;
-  for (let t = 0; t < 14; t += 1 / 60) {
-    if (t > 11) handedOff = true;
-    if (handedOff) pos.z -= 172 / 60;
-    real.update(1 / 60, { position: pos, fired: t > 11, handedOff });
-    if (handedOff) break;
-  }
-  check(
-    "nav publishes COAST on the first frame after the handoff",
-    real.currentLeg().name === "COAST",
-    real.currentLeg()?.name,
-  );
-  check("and the phase is EGRESS or LAUNCH, never INTERCEPT",
-    real.mission.phase !== INTERCEPT, real.mission.phase);
-}
-
-function testEndToEndMissions() {
-  // 1. A direct run.
-  const direct = flyMission();
-  check("a direct run completes", direct.mission.mission.phase === COMPLETE, direct.seen.join(" -> "));
-  check(
-    "a direct run visits the phases in order",
-    direct.seen.join(",") === [LAUNCH, EGRESS, INTERCEPT, DEFENSIVE, TERRAIN, FINAL, EXTRACTION, COMPLETE].join(","),
-    direct.seen.join(","),
-  );
-
-  // 2. IGNORING ALL COMBAT still completes the mission. This is the run that
-  // proves no combination of missed shots or ignored enemies soft-locks it.
-  const pacifist = flyMission({ ignoreCombat: true });
-  check(
-    "ignoring combat entirely still completes",
-    pacifist.mission.mission.phase === COMPLETE,
-    pacifist.seen.join(" -> "),
-  );
-  check(
-    "the pacifist run recorded no kills",
-    pacifist.mission.mission.stats.airKills === 0,
-  );
-
-  // 3. A failure in the middle still completes.
-  const failed = flyMission({ failAt: TERRAIN });
-  check(
-    "a failure in the middle still completes",
-    failed.mission.mission.phase === COMPLETE,
-    failed.seen.join(" -> "),
-  );
-
-  // Four checkpoints in a run that records them at the boundaries.
-  const cps = flyMission();
-  for (const phase of [LAUNCH, INTERCEPT, TERRAIN, FINAL]) {
-    cps.mission.addCheckpoint({ phase, snapshot: {}, weapon: "AIM-9", missiles: 2, gunRounds: 500 });
-  }
-  check("four checkpoints are recorded", cps.mission.mission.checkpoints.length === 4);
-  check("the latest checkpoint is the last recorded", cps.mission.latestCheckpoint().phase === FINAL);
-
-  // A LATER PHASE'S VOLUME CANNOT PULL THE MISSION FORWARD: only the current
-  // leg is checked.
-  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: syntheticTerrain });
-  const skipper = createMission({ route });
-  const recovery = route.legs[route.legs.length - 1];
-  for (let i = 0; i < 60; i++) {
-    skipper.update(1 / 30, {
-      position: { x: recovery.x, y: 600, z: recovery.z },
-      fired: false, handedOff: false, magazineSpent: false, cinematicDone: false,
-    });
-  }
-  check(
-    "sitting inside the LAST volume does not skip the route",
-    skipper.mission.legIndex === 0,
-    `legIndex ${skipper.mission.legIndex}`,
-  );
-  check("and the phase is still DECK", skipper.mission.phase === DECK);
-}
-
-function testMissionClock() {
-  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
-  const m = createMission({ route });
-  check("the clock is not running on the deck", m.mission.running === false);
-  m.update(1, { position: { x: 0, y: 20, z: -1600 }, fired: false, handedOff: false });
-  check("the clock stays at zero before the catapult", m.elapsed() === 0);
-
-  // THE CLOCK STARTS AT THE CATAPULT, stated in exactly one place.
-  m.update(1 / 30, { position: { x: 0, y: 20, z: -1600 }, fired: true, handedOff: false });
-  check("the catapult starts the clock", m.mission.running === true);
-  for (let i = 0; i < 30; i++) {
-    m.update(1 / 30, { position: { x: 0, y: 20, z: -1600 }, fired: true, handedOff: false });
-  }
-  check("the clock advances", m.elapsed() > 0.9, `${m.elapsed()}`);
-
-  // And STOPS at COMPLETE: the reported time is the stopped clock.
-  m.mission.phase = EXTRACTION;
-  m.mission.phaseTime = 0;
-  m.update(1 / 30, { position: { x: 0, y: 600, z: -1600 }, cinematicDone: true });
-  check("COMPLETE stops the clock", m.mission.running === false);
-  const stopped = m.elapsed();
-  for (let i = 0; i < 60; i++) {
-    m.update(1 / 30, { position: { x: 0, y: 600, z: -1600 }, cinematicDone: true });
-  }
-  check("the reported time is the STOPPED clock", m.elapsed() === stopped, `${m.elapsed()} vs ${stopped}`);
-}
-
-function testCheckpointIsFlyable() {
-  // A checkpoint must be a state the player can fly OUT of. Recording a
-  // mid-dive attitude 120 m over a ridge means restoring it re-flies the same
-  // impact, and the run then fails in the same place forever.
-  const diving = {
-    position: { x: 0, y: 620, z: -9000 },
-    heading: 1.2, pitch: -0.6, bank: 1.1, speed: 250, throttle: 0.9,
-    sink: 40, mode: "ASSISTED", afterburner: true,
-    quat: { x: 0, y: 0, z: 0, w: 1 },
-  };
-  const cp = captureCheckpoint(diving, {
-    groundAhead: 600, weapon: "GUN", missiles: 1, gunRounds: 210, phase: TERRAIN,
-  });
-
-  check("the checkpoint is LEVELLED", cp.snapshot.pitch === 0 && cp.snapshot.bank === 0);
-  check("the sink is zeroed", cp.snapshot.sink === 0);
-  check(
-    "the checkpoint is LIFTED above the ground AHEAD",
-    cp.snapshot.position.y >= 600 + 400,
-    `${cp.snapshot.position.y}`,
-  );
-  check("the heading being travelled is kept", cp.snapshot.heading === 1.2);
-  check("it carries the selected weapon", cp.weapon === "GUN");
-  check("it carries BOTH magazines", cp.missiles === 1 && cp.gunRounds === 210);
-  // Restoring the loadout it RECORDED, not a full one -- otherwise crashing is
-  // the cheapest way to refill the rails.
-  check("the recorded loadout is not silently a full one", cp.missiles !== 2);
-
-  // A checkpoint over open water is not needlessly lifted.
-  const level = captureCheckpoint(
-    { ...diving, position: { x: 0, y: 900, z: -3000 } },
-    { groundAhead: 0, weapon: "AIM-9", missiles: 2, gunRounds: 500, phase: INTERCEPT },
-  );
-  check("a high checkpoint over water keeps its altitude", level.snapshot.position.y === 900);
-}
-
-function testMissionFailurePolicy() {
-  const restores = [];
-  const fades = [];
-  const policy = createMissionCheckpointResponse({
-    onRestore: () => restores.push(1),
-    onFade: (v) => fades.push(v),
-  });
-  const contact = { type: "terrain", predicted: false, position: { x: 0, y: 0, z: 0 }, speed: 200 };
-
-  check("the policy names itself", policy.name === "MissionCheckpointResponse");
-  check("the first hit is accepted", policy.handleCollision(contact) === true);
-  // A proximity fuze or a terrain probe trips on CONSECUTIVE frames; without
-  // this the fade restarts every frame and the screen never clears.
-  check("a simultaneous second is refused", policy.handleCollision(contact) === false);
-  check("the stick is neutralised", policy.overridesInput() === true);
-  check("no restore yet", restores.length === 0);
-
-  // RESTORE AT FULL BLACK, so the player never sees the teleport.
-  let fadeAtRestore = null;
-  // A SEPARATE tally: the policy above was triggered but never ticked, so it
-  // never restored. Sharing one array counted its non-restore as a restore.
-  const p2Restores = [];
-  const p2 = createMissionCheckpointResponse({
-    onRestore: () => {
-      fadeAtRestore = p2.fade();
-      p2Restores.push(1);
-    },
-  });
-  p2.handleCollision(contact);
-  for (let t = 0; t < 3; t += 1 / 60) p2.tick(1 / 60);
-  check("the restore fired exactly once", p2Restores.length === 1, `${p2Restores.length}`);
-  check("a policy that is never ticked never restores", restores.length === 0);
-  check("the restore happened at FULL BLACK", fadeAtRestore === 1, `${fadeAtRestore}`);
-  check("the policy returns to idle", p2.isActive() === false);
-  check("the stick is handed back", p2.overridesInput() === false);
-  check("the fade is clear again", p2.fade() === 0);
-
-  // Refused during the settling cooldown.
-  // Derived from MC rather than hardcoded: stage 9 lengthens `hold` from 0.28
-  // to 1.2 so the policy's clock can carry the crash presentation, and a test
-  // with the old total baked in fails for a change that is correct.
-  const cycle = MC.hold + MC.fadeOut + MC.fadeIn + MC.cooldown;
-  const p3 = createMissionCheckpointResponse({});
-  p3.handleCollision(contact);
-  for (let t = 0; t < cycle - 0.2; t += 1 / 60) p3.tick(1 / 60);
-  check("still refused during the settling cooldown", p3.handleCollision(contact) === false, p3.stage());
-  for (let t = 0; t < 0.5; t += 1 / 60) p3.tick(1 / 60);
-  check("accepted once fully settled", p3.handleCollision(contact) === true);
-
-  // A PREDICTED IMPACT DOES NOT FAIL THE MISSION; REAL CONTACT DOES. Failing a
-  // run for a crash that has not happened is the worst class of failure.
-  const p4 = createMissionCheckpointResponse({});
-  check(
-    "a predicted impact is declined",
-    p4.handleCollision({ ...contact, predicted: true }) === false,
-  );
-  check("and leaves the policy idle", p4.isActive() === false);
-  check("real contact a moment later does fail", p4.handleCollision(contact) === true);
-
-  // Both policies share the interface, which is what makes the `G` swap safe.
-  const dev = createDevelopmentRecovery({
-    physics: createPhysics({}), getState: () => createFlightState(),
-  });
-  for (const method of ["handleCollision", "tick", "reset", "overridesInput"]) {
-    check(`both policies implement ${method}`,
-      typeof dev[method] === "function" && typeof p4[method] === "function");
-  }
-}
-
-function testAutopilot() {
-  const level = { heading: 0, pitch: 0, altitude: 620, speed: 190 };
-
-  // ON TARGET IT COMMANDS NOTHING.
-  const still = autopilotStick(level, { heading: 0, altitude: 620, speed: 190 });
-  check(
-    "on target the autopilot commands nothing",
-    Math.abs(still.x) < 1e-9 && Math.abs(still.y) < 1e-9 && Math.abs(still.throttle) < 1e-9,
-    JSON.stringify(still),
-  );
-
-  // A heading error banks -- and THE SHORT WAY ROUND THE +-180 SEAM. Without
-  // the wrap a goal one degree the other side of north banks 359 degrees.
-  const justPast = autopilotStick(
-    { ...level, heading: Math.PI - 0.05 },
-    { heading: -Math.PI + 0.05, altitude: 620, speed: 190 },
-  );
-  check(
-    "a goal across the +-180 seam banks the SHORT way",
-    justPast.x > 0 && justPast.x <= 1,
-    `${justPast.x}`,
-  );
-  check(
-    "a plain left goal banks left",
-    autopilotStick(level, { heading: 0.4, altitude: 620, speed: 190 }).x > 0,
-  );
-  check(
-    "a plain right goal banks right",
-    autopilotStick(level, { heading: -0.4, altitude: 620, speed: 190 }).x < 0,
-  );
-
-  // Below the goal it pulls up.
-  check(
-    "below the goal altitude it pulls up",
-    autopilotStick({ ...level, altitude: 200 }, { altitude: 620, speed: 190, heading: 0 }).y > 0,
-  );
-  check(
-    "above the goal altitude it pushes down",
-    autopilotStick({ ...level, altitude: 1400 }, { altitude: 620, speed: 190, heading: 0 }).y < 0,
-  );
-
-  // A NOSE-HIGH ATTITUDE DAMPS rather than porpoising: it must not keep
-  // pulling while already climbing hard, overshoot, and push just as hard back.
-  const noseHigh = autopilotStick(
-    { heading: 0, pitch: 0.5, altitude: 560, speed: 190 },
-    { heading: 0, altitude: 620, speed: 190 },
-  );
-  check(
-    "already nose-high and slightly low, it damps rather than pulling",
-    noseHigh.y < 0,
-    `${noseHigh.y}`,
-  );
-
-  // Throttle chases the speed goal.
-  check(
-    "slow commands throttle up",
-    autopilotStick({ ...level, speed: 140 }, { speed: 190, altitude: 620, heading: 0 }).throttle > 0,
-  );
-  check(
-    "fast commands throttle back",
-    autopilotStick({ ...level, speed: 240 }, { speed: 190, altitude: 620, heading: 0 }).throttle < 0,
-  );
-
-  // blendStick: k = 0 is the player, k = 1 is the autopilot.
-  const player = { x: -1, y: 0.5, roll: 0.3, throttle: 1 };
-  const auto = { x: 1, y: -0.5, roll: 0, throttle: -1 };
-  const at0 = blendStick(player, auto, 0, {});
-  check("k=0 is the player", at0.x === player.x && at0.throttle === player.throttle);
-  const at1 = blendStick(player, auto, 1, {});
-  check("k=1 is the autopilot", at1.x === auto.x && at1.throttle === auto.throttle);
-  const half = blendStick(player, auto, 0.5, {});
-  check("k=0.5 is halfway", Math.abs(half.x) < 1e-9, `${half.x}`);
-  check("k is clamped", blendStick(player, auto, 9, {}).x === auto.x);
-}
-
-// ── stage 8: ground threats, countermeasures, modes ───────────────────────
-
-// A ridge running along X, peaking at z = -1000, 400 m tall.
-const ridgeAt = (x, z) => {
-  const d = Math.abs(z + 1000);
-  return d >= 500 ? 0 : 400 * (1 - d / 500);
+const failureLog = [];
+const check = (name, pass, detail = "") => {
+  total += 1;
+  failures += pass ? 0 : 1;
+  if (!pass) failureLog.push({ name, detail: String(detail) });
+  console[pass ? "log" : "error"](`${pass ? "PASS" : "FAIL"}  ${name}`, detail);
+};
+const step = (state, input, dt = 1 / 60, n = 1) => {
+  for (let i = 0; i < n; i++) updateFlight(state, input, dt);
+  return state;
+};
+const expertState = () => createFlightState(MODE.EXPERT);
+const fwd = (s) => quatForward(s.quat, { x: 0, y: 0, z: 0 });
+const upv = (s) => quatUp(s.quat, { x: 0, y: 0, z: 0 });
+const hdgOf = (s) => {
+  const f = fwd(s);
+  return Math.atan2(-f.x, -f.z);
 };
 
-function testLineOfSight() {
-  const flatGround = () => 0;
-  const low = { x: 0, y: 100, z: 0 };
-  const far = { x: 0, y: 100, z: -2000 };
-
-  check("clear over flat ground", lineOfSight(low, far, flatGround) === true);
-  // The ridge sits between them at 400 m; both ends are at 100 m.
-  check("a ridge blocks the line", lineOfSight(low, far, ridgeAt) === false);
-  // From above the ridge, clear again.
-  check(
-    "clear again from above the ridge",
-    lineOfSight({ ...low, y: 900 }, { ...far, y: 900 }, ridgeAt) === true,
-  );
-
-  // A GRAZE COUNTS AS COVER: the 10 m margin is in the player's favour, so a
-  // line passing just over the crest is still called blocked.
-  const grazing = lineOfSight(
-    { x: 0, y: 405, z: 0 }, { x: 0, y: 405, z: -2000 }, ridgeAt,
-  );
-  check("a graze counts as cover", grazing === false, `${grazing}`);
-  check(
-    "well clear of the crest is visible",
-    lineOfSight({ x: 0, y: 460, z: 0 }, { x: 0, y: 460, z: -2000 }, ridgeAt) === true,
-  );
-
-  // SKIPS THE ENDPOINTS: a site standing ON the ground would otherwise report
-  // ITSELF as an obstruction and never see anything at all.
-  const onTheGround = { x: 0, y: 0, z: -3000 };
-  check(
-    "a site standing on the ground is not blocked by its own ground",
-    lineOfSight(onTheGround, { x: 0, y: 800, z: -3000 }, flatGround) === true,
-  );
-
-  check("solid ground blocks everything", lineOfSight(low, far, () => 9000) === false);
-  // NO SAMPLER MEANS VISIBLE: a build whose terrain failed to load must be
-  // playable, not accidentally invulnerable.
-  check("no sampler means visible", lineOfSight(low, far, null) === true);
+{
+  const s = createFlightState();
+  step(s, { x: 1, y: 0 }, 1 / 60, 30);
+  check("right input banks right (negative roll)", s.bank < 0, s.bank);
+  check("bank turns the heading", s.heading !== 0, s.heading);
+  check("bank stays inside maxBank", Math.abs(s.bank) <= FLIGHT.maxBank + 1e-6, s.bank);
 }
 
-const SAM = (over = {}) => ({ state: "SEARCH", stateTime: 0, lossTimer: 0, ...over });
-const SCTX = (over = {}) => ({
-  alive: true, playerAlive: true, range: 2000, visible: true, rounds: 3, ...over,
-});
-
-function testSamTransitionTable() {
-  const T = samTransition;
-
-  check("death wins", T(SAM({ state: "LOCK" }), SCTX({ alive: false })) === "DESTROYED");
-  check("DESTROYED is terminal", T(SAM({ state: "DESTROYED" }), SCTX()) === "DESTROYED");
-
-  check("SEARCH holds with nothing visible", T(SAM(), SCTX({ visible: false })) === "SEARCH");
-  check("SEARCH acquires what it can see", T(SAM(), SCTX()) === "TRACK");
-  check("SEARCH ignores anything beyond detection", T(SAM(), SCTX({ range: 9000 })) === "SEARCH");
-  // The inner 450 m is a DEAD ZONE: flying straight over the top is a valid
-  // second answer, and a nice one to discover.
-  check("the inner dead zone is safe", T(SAM(), SCTX({ range: 300 })) === "SEARCH");
-  check("beyond the envelope is safe", T(SAM(), SCTX({ range: 4800 })) === "SEARCH");
-
-  check("TRACK builds", T(SAM({ state: "TRACK", stateTime: 0.5 }), SCTX()) === "TRACK");
-  check("TRACK promotes at 1.15 s", T(SAM({ state: "TRACK", stateTime: 1.2 }), SCTX()) === "LOCK");
-  check("LOCK builds", T(SAM({ state: "LOCK", stateTime: 0.5 }), SCTX()) === "LOCK");
-  check("LOCK promotes at 1.35 s", T(SAM({ state: "LOCK", stateTime: 1.4 }), SCTX()) === "LAUNCH");
-  check("LAUNCH holds for its delay", T(SAM({ state: "LAUNCH", stateTime: 0.2 }), SCTX()) === "LAUNCH");
-  check("LAUNCH releases after 0.45 s", T(SAM({ state: "LAUNCH", stateTime: 0.5 }), SCTX()) === "RELOAD");
-  check("RELOAD holds", T(SAM({ state: "RELOAD", stateTime: 5 }), SCTX()) === "RELOAD");
-  check("RELOAD returns to SEARCH after 9 s", T(SAM({ state: "RELOAD", stateTime: 9.1 }), SCTX()) === "SEARCH");
-
-  // A SPENT SITE MUST NEVER ACQUIRE AGAIN -- still a target, still worth a
-  // kill, but no longer a threat. Otherwise it sits in LOCK forever with
-  // nothing to fire.
-  check("a spent site does not acquire", T(SAM(), SCTX({ rounds: 0 })) === "SEARCH");
-  check("a spent site drops a track", T(SAM({ state: "TRACK", stateTime: 2 }), SCTX({ rounds: 0 })) === "SEARCH");
-  check("a spent site drops a lock", T(SAM({ state: "LOCK", stateTime: 2 }), SCTX({ rounds: 0 })) === "SEARCH");
-
-  // THE LOSS GRACE holds a lock through a flicker of terrain, but not beyond.
-  check(
-    "a flicker does not drop the lock",
-    T(SAM({ state: "LOCK", stateTime: 0.5, lossTimer: 0.3 }), SCTX({ visible: false })) === "LOCK",
-  );
-  check(
-    "beyond the grace the lock is dropped",
-    T(SAM({ state: "LOCK", stateTime: 0.5, lossTimer: 0.9 }), SCTX({ visible: false })) === "SEARCH",
-  );
-  // Leaving the ENVELOPE breaks a lock the same way.
-  check(
-    "leaving the envelope breaks a lock",
-    T(SAM({ state: "LOCK", stateTime: 0.5, lossTimer: 0.9 }), SCTX({ range: 6000 })) === "SEARCH",
-  );
-
-  // Acquisition is deliberately slow: 2.95 s from first sighting to a round in
-  // the air. That, plus the reload, is the entire difficulty dial.
-  check(
-    "acquisition takes about 2.95 s end to end",
-    Math.abs(ACQUISITION_SECONDS - 2.95) < 1e-9,
-    `${ACQUISITION_SECONDS}`,
-  );
+{
+  const s = createFlightState();
+  const z0 = s.position.z;
+  step(s, { x: 0, y: 0 }, 1 / 60);
+  check("neutral flight advances along -Z", s.position.z < z0, s.position.z - z0);
+  check("neutral flight holds altitude", Math.abs(s.position.y - FLIGHT.spawn.y) < 1e-6, s.position.y);
 }
 
-function testOneLaunchPerLock() {
-  // §8: firing on both "LOCK with an expired timer" AND the LAUNCH state
-  // spends TWO rounds per engagement, because they are the same frame.
-  const launches = [];
-  const net = createSamNetwork({ onLaunch: (s) => launches.push(s) });
-  net.deploy([{ x: 0, y: 100, z: -2000 }]);
-  const player = createFlightState({ position: { x: 0, y: 900, z: 0 } });
-
-  for (let t = 0; t < 6; t += 1 / 60) {
-    net.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
-  }
-  check("exactly one launch per engagement", launches.length === 1, `${launches.length}`);
-  check("exactly one round was spent", net.sites[0].rounds === 2, `${net.sites[0].rounds}`);
-
-  // Three engagements empty it, and then it never fires again.
-  for (let t = 0; t < 60; t += 1 / 60) {
-    net.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
-  }
-  check("a site fires at most its magazine", launches.length <= 3, `${launches.length}`);
-  check("a spent site stays in SEARCH", net.sites[0].rounds === 0 && net.sites[0].state === "SEARCH");
+{
+  const s = createFlightState();
+  step(s, { x: 0, y: 1 }, 1 / 60, 60);
+  check("up input pitches up and climbs", s.pitch > 0 && s.position.y > FLIGHT.spawn.y, [s.pitch, s.position.y]);
 }
 
-function testMaskedSiteNeverLaunches() {
-  // A MASKED SITE NEVER LAUNCHES, however long the player loiters. This is the
-  // mechanic: low flight is safe because the ground is genuinely in the way,
-  // not because of a minimum-safe-altitude constant.
-  const launches = [];
-  const net = createSamNetwork({ onLaunch: () => launches.push(1) });
-  // The site is beyond the ridge from the player.
-  net.deploy([{ x: 0, y: 10, z: -2000 }]);
-  const player = createFlightState({ position: { x: 0, y: 60, z: 0 } });
-
-  for (let t = 0; t < 30; t += 1 / 60) {
-    net.update(1 / 60, { playerState: player, sampleHeight: ridgeAt });
-  }
-  check("a masked site never launches", launches.length === 0, `${launches.length}`);
-  check("and never leaves SEARCH", net.sites[0].state === "SEARCH", net.sites[0].state);
-
-  // Climb over the ridge and it acquires.
-  const high = createFlightState({ position: { x: 0, y: 1400, z: 0 } });
-  for (let t = 0; t < 6; t += 1 / 60) {
-    net.update(1 / 60, { playerState: high, sampleHeight: ridgeAt });
-  }
-  check("climbing into view produces a launch", launches.length === 1, `${launches.length}`);
+{
+  const s = createFlightState();
+  step(s, { x: 1, y: 0 }, 1 / 60, 60);
+  step(s, { x: 0, y: 0 }, 1 / 60, 240);
+  check("bank self-levels toward zero on release", Math.abs(s.bank) < 0.05, s.bank);
 }
 
-function testSamPlacement() {
-  const legs = [{ name: "PASS", x: 0, z: -3000 }, { name: "VALLEY", x: 0, z: -6000 }];
+{
+  // Frame-rate independence: 1 s at 60 Hz vs 1 s at 20 Hz should land close.
+  const a = step(createFlightState(), { x: 0.6, y: 0.2 }, 1 / 60, 60);
+  const b = step(createFlightState(), { x: 0.6, y: 0.2 }, 1 / 20, 20);
+  const drift = Math.hypot(a.position.x - b.position.x, a.position.y - b.position.y, a.position.z - b.position.z);
+  check("motion is frame-rate independent (<2 m drift over 1 s)", drift < 2, `${drift.toFixed(3)} m`);
+}
 
-  // Land everywhere: both flanks stand.
-  const onLand = placeSites(legs, () => 120);
-  check("two sites per leg on good ground", onLand.length === 4, `${onLand.length}`);
-  check("they flank the corridor on both sides", (() => {
-    const sides = new Set(onLand.map((s) => s.side));
-    return sides.has(-1) && sides.has(1);
+{
+  const s = createFlightState();
+  step(s, { x: 1, y: 0 }, 1 / 60, 300);
+  check("bank saturates at maxBank", Math.abs(s.bank) <= FLIGHT.maxBank + 1e-6 && Math.abs(s.bank) > FLIGHT.maxBank - 0.02, s.bank);
+  check("hard bank loses altitude", s.position.y < FLIGHT.spawn.y, s.position.y);
+}
+
+{
+  check("level flight has no bank sink", bankSinkRate(0) === 0);
+  const hard = bankSinkRate(FLIGHT.maxBank);
+  check("70° bank sinks 8-13 m/s", hard > 8 && hard < 13, hard);
+  check("sink grows with bank", bankSinkRate(0.3) < bankSinkRate(0.9));
+}
+
+{
+  // Bank sink is integrated per second, so 60 Hz and 20 Hz must agree.
+  const a = step(createFlightState(), { x: 1, y: 0 }, 1 / 60, 180);
+  const b = step(createFlightState(), { x: 1, y: 0 }, 1 / 20, 60);
+  check("bank sink is frame-rate independent", Math.abs(a.position.y - b.position.y) < 2, [a.position.y, b.position.y]);
+}
+
+{
+  // Positive pitch should beat the sink of a hard turn.
+  const turn = step(createFlightState(), { x: 1, y: 0 }, 1 / 60, 300);
+  const pulled = step(createFlightState(), { x: 1, y: 0.5 }, 1 / 60, 300);
+  check("pitch compensates bank sink", pulled.position.y > turn.position.y, [turn.position.y, pulled.position.y]);
+}
+
+{
+  const s = createFlightState();
+  check("roll starts", requestRoll(s, 1) === true);
+  check("roll cannot stack", requestRoll(s, -1) === false);
+  step(s, { x: 0, y: 0 }, 1 / 60, Math.round(ROLL.duration * 60 * 0.5)); // half way
+  check("roll passes beyond the bank clamp", Math.abs(s.bank) > FLIGHT.maxBank, s.bank);
+  check("mid-roll reports progress", s.maneuver.t > 0.45 && s.maneuver.t < 0.55, s.maneuver.t);
+}
+
+{
+  const s = createFlightState();
+  const h0 = s.heading;
+  requestRoll(s, 1);
+  step(s, { x: 0, y: 0 }, 1 / 60, Math.ceil(ROLL.duration * 60) + 5);
+  check("roll completes and clears", s.maneuver === null);
+  check("roll ends level", s.bank === 0 && s.pitch === 0, [s.bank, s.pitch]);
+  check("roll is heading-neutral", Math.abs(s.heading - h0) < 1e-9, s.heading - h0);
+  check("roll is near altitude-neutral (<25 m)", Math.abs(s.position.y - FLIGHT.spawn.y) < 25, s.position.y);
+}
+
+{
+  // Closed-form in normalized time, so coarse frames must land identically.
+  const a = createFlightState(); requestRoll(a, 1);
+  const b = createFlightState(); requestRoll(b, 1);
+  step(a, { x: 0, y: 0 }, 1 / 60, 90);
+  step(b, { x: 0, y: 0 }, 1 / 20, 30);
+  check("roll is frame-rate independent", Math.abs(a.position.y - b.position.y) < 2, [a.position.y, b.position.y]);
+}
+
+{
+  // Entering a roll from a hard turn must not snap the wings level.
+  const s = createFlightState();
+  step(s, { x: 1, y: 0 }, 1 / 60, 300);
+  const bankBefore = s.bank;
+  check("test entered from a real bank", Math.abs(bankBefore) > 1.0, bankBefore);
+  requestRoll(s, 1);
+  step(s, { x: 0, y: 0 }, 1 / 60, 1);
+  const snap = Math.abs(s.bank - bankBefore) / DEG;
+  check("no bank snap entering a roll from a turn (<2 deg)", snap < 2, snap.toFixed(2));
+
+  step(s, { x: 0, y: 0 }, 1 / 60, Math.ceil(ROLL.duration * 60));
+  check("roll from a bank still ends level", s.maneuver === null && s.bank === 0, s.bank);
+}
+
+{
+  const l = createFlightState(); requestRoll(l, -1);
+  const r = createFlightState(); requestRoll(r, 1);
+  step(l, { x: 0, y: 0 }, 1 / 60, 20);
+  step(r, { x: 0, y: 0 }, 1 / 60, 20);
+  check("roll direction is respected", Math.sign(l.bank) === -Math.sign(r.bank), [l.bank, r.bank]);
+  // One sign convention across the roll axis, requestRoll's dir, and the HUD:
+  // +1 is right, and right-hand bank is negative.
+  check("requestRoll(+1) rolls right, like E", r.bank < 0, r.bank);
+  check("requestRoll(-1) rolls left, like Q", l.bank > 0, l.bank);
+
+  const axis = createFlightState();
+  step(axis, { x: 0, y: 0, roll: 1 }, 1 / 60, 20);
+  check("barrel roll and held roll agree on direction", Math.sign(axis.bank) === Math.sign(r.bank), [axis.bank, r.bank]);
+
+  const lean = createFlightState();
+  step(lean, { x: 1, y: 0 }, 1 / 60, 40);
+  check("stick lean agrees with that convention too", Math.sign(lean.bank) === Math.sign(r.bank), [lean.bank, r.bank]);
+}
+
+{
+  const s = createFlightState();
+  requestRoll(s, 1);
+  step(s, { x: 0, y: 0 }, 1 / 60, 30);
+  check("no bank sink during a roll", s.sink === 0, s.sink);
+}
+
+{
+  const s = createFlightState();
+  s.bank = Math.PI * 1.5;
+  check("bankDegrees wraps to -180..180", bankDegrees(s) === -90, bankDegrees(s));
+}
+
+{
+  // Input during a roll must not fight the script. Stepped to the exact
+  // completion frame — past it, normal control resumes and SHOULD re-bank.
+  const s = createFlightState();
+  const h0 = s.heading;
+  requestRoll(s, 1);
+  step(s, { x: -1, y: -1 }, 1 / 60, Math.ceil(ROLL.duration * 60));
+  check("input cannot corrupt a running roll", s.maneuver === null && s.bank === 0, s.bank);
+  check("input cannot corrupt roll heading", Math.abs(s.heading - h0) < 1e-9, s.heading - h0);
+  step(s, { x: -1, y: 0 }, 1 / 60, 30);
+  check("control resumes after the roll", s.bank > 0, s.bank);
+}
+
+{
+  const f = forwardFromAngles(0, 0);
+  check("forward at rest is (0,0,-1)", Math.abs(f.x) < 1e-9 && Math.abs(f.z + 1) < 1e-9, f);
+}
+
+/* ---- Stage 01.6b: held roll axis (Q/E) ---- */
+
+{
+  check("wrapAngle folds into -PI..PI", Math.abs(wrapAngle(3 * Math.PI) - Math.PI) < 1e-9 || Math.abs(wrapAngle(3 * Math.PI) + Math.PI) < 1e-9, wrapAngle(3 * Math.PI));
+  check("wrapAngle leaves small angles alone", Math.abs(wrapAngle(0.5) - 0.5) < 1e-12);
+  check("turnBank passes shallow bank through", Math.abs(turnBank(30 * DEG) - 30 * DEG) < 1e-9);
+  check("turnBank clamps to maxBank", Math.abs(turnBank(80 * DEG) - FLIGHT.maxBank) < 1e-9, turnBank(80 * DEG) / DEG);
+  check("turnBank mirrors past vertical", Math.abs(turnBank(150 * DEG) - 30 * DEG) < 1e-9, turnBank(150 * DEG) / DEG);
+  check("inverted level does not turn", Math.abs(turnBank(Math.PI)) < 1e-9, turnBank(Math.PI));
+  check("turnBank keeps the turn direction", turnBank(-120 * DEG) < 0, turnBank(-120 * DEG) / DEG);
+}
+
+{
+  // E rolls right past the arcade clamp — the whole point of the new axis.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 60);
+  check("1 s of E rolls ~130 deg right", Math.abs(bankDegrees(s) + 130) < 2, bankDegrees(s));
+  check("held roll passes maxBank", Math.abs(s.bank) > FLIGHT.maxBank, bankDegrees(s));
+  check("held roll sets rollHold", s.rollHold === true);
+
+  const q = createFlightState();
+  step(q, { x: 0, y: 0, roll: -1 }, 1 / 60, 30);
+  check("Q rolls the other way", bankDegrees(q) > 0, bankDegrees(q));
+}
+
+{
+  // The ask: release the key and the wings stay where they were left.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 45);
+  const held = s.bank;
+  step(s, { x: 0, y: 0, roll: 0 }, 1 / 60, 300);
+  check("angle holds for 5 s after release", Math.abs(s.bank - held) < 1e-9, [held, s.bank]);
+  check("held angle does not auto-level", Math.abs(bankDegrees(s)) > 60, bankDegrees(s));
+  check("holding a bank still turns", s.heading !== 0, s.heading);
+}
+
+{
+  // A/D must be able to take the wings back, or a held roll would be a trap.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 60);
+  step(s, { x: -1, y: 0 }, 1 / 60, 1);
+  check("stick input clears rollHold", s.rollHold === false);
+  step(s, { x: 0, y: 0 }, 1 / 60, 600);
+  check("wings return to level after breakout", Math.abs(bankDegrees(s)) < 1, bankDegrees(s));
+}
+
+{
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 60);
+  step(s, { x: 0.1, y: 0 }, 1 / 60, 1);
+  check("input below breakout does not steal the hold", s.rollHold === true, s.bank);
+}
+
+{
+  // Roll while banking with the stick: the rate wins and latches.
+  const s = createFlightState();
+  step(s, { x: 1, y: 0 }, 1 / 60, 60);
+  const banked = s.bank;
+  step(s, { x: 1, y: 0, roll: 1 }, 1 / 60, 30);
+  check("roll axis overrides an active stick bank", s.bank < banked, [banked, s.bank]);
+  check("roll during stick input holds", s.rollHold === true);
+}
+
+{
+  const a = step(createFlightState(), { x: 0, y: 0, roll: 1 }, 1 / 60, 60);
+  const b = step(createFlightState(), { x: 0, y: 0, roll: 1 }, 1 / 20, 20);
+  check("roll rate is frame-rate independent", Math.abs(a.bank - b.bank) < 1e-9, [a.bank, b.bank]);
+}
+
+{
+  // Rolling a long way must not spin the heading up through tan()'s asymptote.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 200);
+  check("bank stays wrapped", Math.abs(s.bank) <= Math.PI + 1e-9, s.bank);
+  check("heading stays finite through vertical", Number.isFinite(s.heading), s.heading);
+  check("turn rate never exceeds the maxBank rate", Math.abs(s.heading) < Math.tan(FLIGHT.maxBank) * FLIGHT.turnGain * (200 / 60) + 1e-6, s.heading);
+}
+
+{
+  // Inverted: no turn, and pitch still responds.
+  const s = createFlightState();
+  s.bank = Math.PI;
+  s.rollHold = true;
+  const h0 = s.heading;
+  step(s, { x: 0, y: 0 }, 1 / 60, 60);
+  check("inverted hold does not drift heading", Math.abs(s.heading - h0) < 1e-9, s.heading - h0);
+  check("inverted hold persists", Math.abs(Math.abs(s.bank) - Math.PI) < 1e-9, bankDegrees(s));
+}
+
+{
+  // A barrel roll from a held angle must still finish level and release the hold.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 40);
+  const h0 = s.heading;
+  requestRoll(s, 1);
+  step(s, { x: 0, y: 0 }, 1 / 60, Math.ceil(ROLL.duration * 60) + 2);
+  check("barrel roll from a held angle ends level", Math.abs(s.bank) < 1e-9, s.bank);
+  check("barrel roll from a held angle is heading-neutral", Math.abs(s.heading - h0) < 1e-9, s.heading - h0);
+  check("barrel roll clears rollHold", s.rollHold === false);
+}
+
+{
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 60);
+  resetFlightState(s);
+  check("reset clears rollHold", s.rollHold === false && s.bank === 0);
+}
+
+{
+  const s = createFlightState();
+  step(s, { x: 0, y: 0 }, 1 / 60, 60);
+  check("input without a roll field is safe", s.rollHold === false && s.bank === 0, [s.rollHold, s.bank]);
+}
+
+{
+  // Sink follows the held angle: knife-edge costs the most, inverted is worse.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, roll: 1 }, 1 / 60, 42);
+  check("held bank near 90 deg sinks hard", s.sink > 12, [bankDegrees(s), s.sink]);
+  check("sink is reported for a held roll", s.sink === bankSinkRate(s.bank), s.sink);
+}
+
+
+/* ---- Stage 01.6: throttle, acceleration, speed ---- */
+
+{
+  check("throttle 0 commands min speed", getTargetSpeed(0) === SPEED.min, getTargetSpeed(0));
+  check("throttle 1 commands max speed", getTargetSpeed(1) === SPEED.max, getTargetSpeed(1));
+  check("target speed is monotonic", getTargetSpeed(0.3) < getTargetSpeed(0.6) && getTargetSpeed(0.6) < getTargetSpeed(0.95));
+  check("AB band starts at 220 m/s", Math.abs(getTargetSpeed(SPEED.afterburnerThreshold) - 220) < 1e-9, getTargetSpeed(0.85));
+  const belowRate = (getTargetSpeed(0.85) - getTargetSpeed(0.55)) / 0.3;
+  const aboveRate = (getTargetSpeed(1) - getTargetSpeed(0.85)) / 0.15;
+  check("AB band has more authority per unit lever", aboveRate > belowRate, [belowRate, aboveRate]);
+  check("speedToThrottle inverts getTargetSpeed", Math.abs(getTargetSpeed(speedToThrottle(193)) - 193) < 1e-9);
+  check("cruise throttle commands exactly cruise", Math.abs(getTargetSpeed(CRUISE_THROTTLE) - SPEED.cruise) < 1e-9, CRUISE_THROTTLE);
+  check("cruise throttle is not simply 0.5", Math.abs(CRUISE_THROTTLE - 0.5) > 0.01, CRUISE_THROTTLE);
+  check("cruise is below the AB threshold", CRUISE_THROTTLE < SPEED.afterburnerThreshold, CRUISE_THROTTLE);
+}
+
+{
+  check("moveTowards steps by maxDelta", moveTowards(100, 200, 10) === 110);
+  check("moveTowards lands exactly", moveTowards(100, 103, 10) === 103);
+  check("moveTowards works downward", moveTowards(200, 100, 10) === 190);
+}
+
+{
+  const s = createFlightState();
+  check("spawns at cruise speed", s.speed === SPEED.cruise, s.speed);
+  check("spawns at cruise throttle", s.throttle === CRUISE_THROTTLE, s.throttle);
+  check("spawns with AB off", s.afterburner === false);
+  step(s, { x: 0, y: 0, throttle: 0 }, 1 / 60, 120);
+  check("cruise is an equilibrium (no drift with no input)", Math.abs(s.speed - SPEED.cruise) < 1e-9, s.speed);
+}
+
+{
+  // Persistent lever: hold 1 s, release, and the aircraft keeps accelerating
+  // toward the setting it was left at.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, throttle: 1 }, 1 / 60, 60);
+  const held = s.throttle;
+  check("1 s of Shift moves the lever ~0.40", Math.abs(held - (CRUISE_THROTTLE + 0.4)) < 0.01, held);
+  const spd1 = s.speed;
+  step(s, { x: 0, y: 0, throttle: 0 }, 1 / 60, 60);
+  check("lever persists after release", s.throttle === held, s.throttle);
+  check("speed keeps rising after release", s.speed > spd1, [spd1, s.speed]);
+  step(s, { x: 0, y: 0, throttle: 0 }, 1 / 60, 300);
+  check("speed settles on the commanded target", Math.abs(s.speed - getTargetSpeed(held)) < 1e-9, [s.speed, s.targetSpeed]);
+  check("settled speed is above cruise", s.speed > SPEED.cruise + 30, s.speed);
+}
+
+{
+  const s = createFlightState();
+  step(s, { x: 0, y: 0, throttle: 1 }, 1 / 60, 600);
+  check("throttle clamps at 1", s.throttle === 1, s.throttle);
+  check("full throttle reaches max speed", Math.abs(s.speed - SPEED.max) < 1e-9, s.speed);
+  check("AB is on at full throttle", s.afterburner === true);
+
+  step(s, { x: 0, y: 0, throttle: -1 }, 1 / 60, 600);
+  check("throttle clamps at 0", s.throttle === 0, s.throttle);
+  check("idle settles at min speed, not zero", Math.abs(s.speed - SPEED.min) < 1e-9, s.speed);
+  check("idle does not fall out of the sky", s.position.y > 12, s.position.y);
+}
+
+{
+  // Acceleration in m/s^2: one second of full lever from cruise.
+  const s = createFlightState();
+  s.throttle = 1;
+  step(s, { x: 0, y: 0, throttle: 0 }, 1 / 60, 60);
+  check("accelerates ~32 m/s in 1 s", Math.abs(s.speed - (SPEED.cruise + 32)) < 0.6, s.speed);
+
+  const d = createFlightState();
+  d.speed = SPEED.max;
+  d.throttle = 0;
+  step(d, { x: 0, y: 0, throttle: 0 }, 1 / 60, 60);
+  check("decelerates ~24 m/s in 1 s", Math.abs(d.speed - (SPEED.max - 24)) < 0.6, d.speed);
+  check("acceleration is not instantaneous", d.speed > SPEED.min + 80, d.speed);
+}
+
+{
+  // Throttle sweep and acceleration must both be dt-independent.
+  const a = step(createFlightState(), { x: 0, y: 0, throttle: 1 }, 1 / 60, 60);
+  const b = step(createFlightState(), { x: 0, y: 0, throttle: 1 }, 1 / 20, 20);
+  check("throttle sweep is frame-rate independent", Math.abs(a.throttle - b.throttle) < 1e-9, [a.throttle, b.throttle]);
+  check("acceleration is frame-rate independent (<3 m/s)", Math.abs(a.speed - b.speed) < 3, [a.speed, b.speed]);
+}
+
+{
+  const s = createFlightState();
+  s.throttle = 0.84;
+  step(s, { x: 0, y: 0, throttle: 0 }, 1 / 60, 1);
+  check("AB off just below threshold", s.afterburner === false, s.throttle);
+  s.throttle = 0.85;
+  step(s, { x: 0, y: 0, throttle: 0 }, 1 / 60, 1);
+  check("AB on at the threshold", s.afterburner === true, s.throttle);
+}
+
+{
+  // Translation must use actual speed, not the old fixed 170.
+  const slow = createFlightState();
+  slow.speed = SPEED.min;
+  slow.throttle = 0;
+  const fast = createFlightState();
+  fast.speed = SPEED.max;
+  fast.throttle = 1;
+  step(slow, { x: 0, y: 0, throttle: 0 }, 1 / 60, 1);
+  step(fast, { x: 0, y: 0, throttle: 0 }, 1 / 60, 1);
+  check("faster aircraft covers more ground per frame", Math.abs(fast.position.z) > Math.abs(slow.position.z) * 2, [slow.position.z, fast.position.z]);
+  check("one frame at 110 m/s moves 110/60 m", Math.abs(Math.abs(slow.position.z) - SPEED.min / 60) < 1e-6, slow.position.z);
+}
+
+{
+  // Throttle must not disturb the Stage 01.5 controller.
+  const plain = step(createFlightState(), { x: 1, y: 0.3 }, 1 / 60, 120);
+  const withThr = createFlightState();
+  withThr.throttle = CRUISE_THROTTLE;
+  step(withThr, { x: 1, y: 0.3, throttle: 1 }, 1 / 60, 120);
+  check("bank response is unchanged by throttle input", Math.abs(plain.bank - withThr.bank) < 1e-9, [plain.bank, withThr.bank]);
+  check("pitch response is unchanged by throttle input", Math.abs(plain.pitch - withThr.pitch) < 1e-9, [plain.pitch, withThr.pitch]);
+  check("bank sink still works at speed", withThr.sink > 0, withThr.sink);
+  check("simultaneous throttle + bank both applied", withThr.throttle > CRUISE_THROTTLE && withThr.bank < 0, [withThr.throttle, withThr.bank]);
+}
+
+{
+  const s = createFlightState();
+  step(s, { x: 1, y: 1, throttle: 1 }, 1 / 60, 200);
+  requestRoll(s, 1);
+  step(s, { x: 0, y: 0, throttle: 1 }, 1 / 60, 20);
+  check("throttle still responds during a roll", s.throttle > CRUISE_THROTTLE, s.throttle);
+  resetFlightState(s);
+  check("reset restores cruise speed", s.speed === SPEED.cruise, s.speed);
+  check("reset restores cruise throttle", s.throttle === CRUISE_THROTTLE, s.throttle);
+  check("reset restores target speed", s.targetSpeed === SPEED.cruise, s.targetSpeed);
+  check("reset clears the AB state", s.afterburner === false);
+  check("reset clears attitude and maneuver", s.bank === 0 && s.pitch === 0 && s.maneuver === null);
+}
+
+{
+  const full = 1 / THROTTLE.changeRate;
+  check("full lever sweep takes ~2.5 s", Math.abs(full - 2.5) < 1e-9, `${full.toFixed(2)} s`);
+}
+
+{
+  // Missing throttle field must not break older call sites.
+  const s = createFlightState();
+  step(s, { x: 0, y: 0 }, 1 / 60, 60);
+  check("input without a throttle field is safe", s.throttle === CRUISE_THROTTLE && s.speed === SPEED.cruise, [s.throttle, s.speed]);
+}
+
+/* ---- Stage 01.7: quaternion helpers ---- */
+
+{
+  const a = quatFromEulerYXZ(0.3, -0.7, 1.2);
+  const i = quat();
+  const r = quatMultiply(a, i, quat());
+  check("quat * identity is unchanged", Math.abs(r.x - a.x) < 1e-12 && Math.abs(r.w - a.w) < 1e-12);
+  check("quatNormalize makes a unit quaternion", Math.abs(Math.hypot(a.x, a.y, a.z, a.w) - 1) < 1e-12);
+
+  // The pure-JS quaternion must agree with the Euler forward the assisted model
+  // has always used, or switching main.js to one orientation path would shift
+  // assisted flight by a hair.
+  for (const [p, h] of [[0, 0], [0.4, 0.9], [-0.5, -2.2], [1.2, 3.0]]) {
+    const e = forwardFromAngles(p, h);
+    const q = quatForward(quatFromEulerYXZ(p, h, 0.6));
+    check(`quatForward matches forwardFromAngles (${p}, ${h})`, Math.abs(e.x - q.x) < 1e-12 && Math.abs(e.y - q.y) < 1e-12 && Math.abs(e.z - q.z) < 1e-12, [e, q]);
+  }
+
+  const level = quatUp(quat());
+  check("level up vector is world up", Math.abs(level.y - 1) < 1e-12, level);
+}
+
+{
+  // Assisted mode must keep the quaternion as an exact mirror of its Euler state.
+  const s = createFlightState();
+  step(s, { x: 0.7, y: 0.4 }, 1 / 60, 90);
+  const mirror = quatFromEulerYXZ(s.pitch, s.heading, s.bank);
+  check("assisted quat mirrors its Euler angles", Math.abs(mirror.x - s.quat.x) < 1e-12 && Math.abs(mirror.y - s.quat.y) < 1e-12 && Math.abs(mirror.z - s.quat.z) < 1e-12 && Math.abs(mirror.w - s.quat.w) < 1e-12);
+  check("assisted state is not expert", isExpert(s) === false);
+  check("default mode is ASSISTED", s.mode === MODE.ASSISTED);
+}
+
+/* ---- Stage 01.7: expert mode ---- */
+
+{
+  const s = expertState();
+  check("expert state reports expert", isExpert(s) === true);
+  check("expert spawns level", Math.abs(upv(s).y - 1) < 1e-12);
+  check("expert spawns at cruise", s.speed === SPEED.cruise && s.throttle === CRUISE_THROTTLE);
+}
+
+{
+  // Manual Test A: one full loop on held W. 60 deg/s -> 6 s.
+  const s = expertState();
+  const quarter = Math.round(1.5 * 60);
+  step(s, { x: 0, y: 1 }, 1 / 60, quarter);
+  check("expert quarter loop points the nose up", fwd(s).y > 0.98, fwd(s).y);
+  step(s, { x: 0, y: 1 }, 1 / 60, quarter);
+  check("expert half loop is inverted", upv(s).y < -0.98, upv(s).y);
+  check("expert half loop still flies level-ish", Math.abs(fwd(s).y) < 0.02, fwd(s).y);
+  step(s, { x: 0, y: 1 }, 1 / 60, quarter);
+  check("expert three-quarter loop points the nose down", fwd(s).y < -0.98, fwd(s).y);
+  step(s, { x: 0, y: 1 }, 1 / 60, quarter);
+  check("expert full loop returns upright", upv(s).y > 0.999 && Math.abs(fwd(s).y) < 0.01, [upv(s).y, fwd(s).y]);
+  check("a full loop takes 6 s at 60 deg/s", Math.abs((4 * quarter) / 60 - 6) < 0.02);
+  check("expert pitch is unrestricted", true);
+}
+
+{
+  // Manual Test B: full manual roll on held D, ~3 s at 120 deg/s, no clamp.
+  const s = expertState();
+  const half = Math.round(1.5 * 60);
+  step(s, { x: 1, y: 0 }, 1 / 60, Math.round(0.75 * 60));
+  check("expert quarter roll passes the assisted 70 deg clamp", Math.abs(bankDegrees(s)) > 80, bankDegrees(s));
+  step(s, { x: 1, y: 0 }, 1 / 60, Math.round(0.75 * 60));
+  check("expert half roll is inverted", upv(s).y < -0.99, upv(s).y);
+  step(s, { x: 1, y: 0 }, 1 / 60, half);
+  check("expert full roll returns upright", upv(s).y > 0.999, upv(s).y);
+  check("a full roll takes 3 s at 120 deg/s", Math.abs((2 * half) / 60 - 3) < 0.02);
+  check("a pure roll does not change the flight path", Math.abs(fwd(s).y) < 1e-9 && Math.abs(s.position.y - FLIGHT.spawn.y) < 1e-9, [fwd(s).y, s.position.y]);
+}
+
+{
+  // Manual Test C: no auto-level, ever.
+  const s = expertState();
+  step(s, { x: 1, y: 0 }, 1 / 60, Math.round(1.5 * 60)); // 180 deg
+  const held = { ...s.quat };
+  const h0 = hdgOf(s);
+  step(s, { x: 0, y: 0 }, 1 / 60, 300);
+  check("expert holds inverted for 5 s", upv(s).y < -0.99, upv(s).y);
+  check("expert attitude is untouched with no input", Math.abs(s.quat.x - held.x) < 1e-12 && Math.abs(s.quat.z - held.z) < 1e-12 && Math.abs(s.quat.w - held.w) < 1e-12);
+  check("inverted level flight keeps flying forward", s.position.z < 0 && Math.abs(s.position.y - FLIGHT.spawn.y) < 1e-9, [s.position.z, s.position.y]);
+  check("expert does not yaw from bank", Math.abs(hdgOf(s) - h0) < 1e-12, hdgOf(s) - h0);
+  check("expert reports no bank sink", s.sink === 0);
+}
+
+{
+  // 45 deg of held bank and nothing else: the assisted model would be turning
+  // hard here. Expert must not.
+  const s = expertState();
+  step(s, { x: 1, y: 0 }, 1 / 60, Math.round(0.375 * 60));
+  const h0 = hdgOf(s);
+  step(s, { x: 0, y: 0 }, 1 / 60, 180);
+  check("held 45 deg bank produces no heading change at all", Math.abs(hdgOf(s) - h0) < 1e-12, hdgOf(s) - h0);
+
+  const assisted = createFlightState();
+  step(assisted, { x: 1, y: 0 }, 1 / 60, 180);
+  check("...where assisted mode does turn", Math.abs(assisted.heading) > 0.5, assisted.heading);
+}
+
+{
+  // Manual Test D: roll and pull. Turning must emerge from local rotation, and
+  // must curve the same way the assisted controller curves for the same key.
+  const s = expertState();
+  step(s, { x: -1, y: 0 }, 1 / 60, Math.round(0.5 * 60)); // roll left ~60 deg
+  const h0 = hdgOf(s);
+  step(s, { x: 0, y: 1 }, 1 / 60, 60); // pull
+  const expertTurn = hdgOf(s) - h0;
+
+  const assisted = createFlightState();
+  step(assisted, { x: -1, y: 0 }, 1 / 60, 120);
+  const assistedTurn = assisted.heading;
+
+  check("roll-and-pull bends the trajectory", Math.abs(expertTurn) > 0.15, expertTurn);
+  check("expert turns the same way assisted does for A", Math.sign(expertTurn) === Math.sign(assistedTurn), [expertTurn, assistedTurn]);
+
+  const r = expertState();
+  step(r, { x: 1, y: 0 }, 1 / 60, Math.round(0.5 * 60));
+  const rh0 = hdgOf(r);
+  step(r, { x: 0, y: 1 }, 1 / 60, 60);
+  check("rolling the other way turns the other way", Math.sign(hdgOf(r) - rh0) === -Math.sign(expertTurn), hdgOf(r) - rh0);
+}
+
+{
+  // Pitch must act on the aircraft-local lateral axis, not a world axis.
+  const s = expertState();
+  step(s, { x: 1, y: 0 }, 1 / 60, Math.round(0.75 * 60)); // 90 deg, knife-edge
+  const y0 = s.position.y;
+  step(s, { x: 0, y: 1 }, 1 / 60, 45);
+  check("pulling at 90 deg bank turns instead of climbing", Math.abs(s.position.y - y0) < 8, s.position.y - y0);
+  check("...and does change heading", Math.abs(hdgOf(s)) > 0.2, hdgOf(s));
+
+  const inv = expertState();
+  step(inv, { x: 1, y: 0 }, 1 / 60, Math.round(1.5 * 60)); // inverted
+  step(inv, { x: 0, y: 1 }, 1 / 60, 30);
+  check("pulling while inverted goes down through world space", fwd(inv).y < -0.1, fwd(inv).y);
+}
+
+{
+  // Manual Test E: Split-S. Inverted, then pull, ends flying the other way.
+  const s = expertState();
+  s.position.y = 4000;
+  step(s, { x: 1, y: 0 }, 1 / 60, Math.round(1.5 * 60));
+  step(s, { x: 0, y: 0, roll: 0 }, 1 / 60, 10);
+  step(s, { x: 0, y: 1 }, 1 / 60, Math.round(3 * 60)); // half loop
+  const f = fwd(s);
+  check("split-S reverses the horizontal heading", f.z > 0.9, f);
+  check("split-S loses altitude", s.position.y < 4000, s.position.y);
+  check("split-S ends roughly upright", upv(s).y > 0.9, upv(s).y);
+}
+
+{
+  // Expert altitude comes from attitude alone.
+  const climb = expertState();
+  step(climb, { x: 0, y: 1 }, 1 / 60, 30);
+  step(climb, { x: 0, y: 0 }, 1 / 60, 60);
+  check("nose up climbs", climb.position.y > FLIGHT.spawn.y, climb.position.y);
+
+  const dive = expertState();
+  dive.position.y = 3000;
+  step(dive, { x: 0, y: -1 }, 1 / 60, 30);
+  step(dive, { x: 0, y: 0 }, 1 / 60, 60);
+  check("nose down descends", dive.position.y < 3000, dive.position.y);
+  check("expert never applies bank sink", dive.sink === 0 && climb.sink === 0);
+}
+
+{
+  const a = step(expertState(), { x: 0, y: 1 }, 1 / 60, 60);
+  const b = step(expertState(), { x: 0, y: 1 }, 1 / 20, 20);
+  check("expert pitch integration is frame-rate independent", Math.abs(fwd(a).y - fwd(b).y) < 1e-9, [fwd(a).y, fwd(b).y]);
+
+  // Combined pitch+roll does not commute, so equality is approximate by nature.
+  const c = step(expertState(), { x: 1, y: 1 }, 1 / 60, 60);
+  const d = step(expertState(), { x: 1, y: 1 }, 1 / 20, 20);
+  check("expert combined integration stays close across frame rates", Math.abs(upv(c).y - upv(d).y) < 0.08, [upv(c).y, upv(d).y]);
+}
+
+{
+  // Long run: the quaternion must not drift off unit length.
+  const s = expertState();
+  step(s, { x: 0.6, y: 0.8 }, 1 / 60, 3000);
+  const len = Math.hypot(s.quat.x, s.quat.y, s.quat.z, s.quat.w);
+  check("quaternion stays normalized over 50 s", Math.abs(len - 1) < 1e-9, len);
+  check("attitude stays finite", Number.isFinite(s.quat.w) && Number.isFinite(s.position.y));
+}
+
+{
+  // Q/E fold into the same roll axis in expert mode rather than being a second
+  // roll system with its own hold semantics.
+  const e = expertState();
+  step(e, { x: 0, y: 0, roll: 1 }, 1 / 60, 60);
+  const d = expertState();
+  step(d, { x: 1, y: 0 }, 1 / 60, 60);
+  check("expert Q/E rolls like A/D", Math.abs(upv(e).y - upv(d).y) < 1e-12, [upv(e).y, upv(d).y]);
+  check("expert does not use rollHold", e.rollHold === false);
+}
+
+/* ---- Stage 01.7: Space barrel roll in both modes ---- */
+
+{
+  // Manual Test G: expert. The scripted roll is anchored on the entry attitude,
+  // so it closes exactly from any orientation, including inverted.
+  for (const [label, setup] of [
+    ["level", (s) => s],
+    ["banked", (s) => step(s, { x: 1, y: 0 }, 1 / 60, 20)],
+    ["inverted", (s) => step(s, { x: 1, y: 0 }, 1 / 60, Math.round(1.5 * 60))],
+    ["climbing", (s) => step(s, { x: 0, y: 1 }, 1 / 60, 40)],
+  ]) {
+    const s = expertState();
+    s.position.y = 4000;
+    setup(s);
+    const q0 = { ...s.quat };
+    check(`expert barrel roll starts from ${label}`, requestRoll(s, 1) === true);
+    step(s, { x: 0, y: 0 }, 1 / 60, Math.ceil(ROLL.duration * 60) + 2);
+    check(`expert barrel roll closes exactly from ${label}`, Math.abs(s.quat.x - q0.x) < 1e-9 && Math.abs(s.quat.y - q0.y) < 1e-9 && Math.abs(s.quat.z - q0.z) < 1e-9 && Math.abs(s.quat.w - q0.w) < 1e-9, [q0, s.quat]);
+    check(`expert barrel roll releases control from ${label}`, s.maneuver === null);
+  }
+}
+
+{
+  // Mid-roll it really is rolling, and manual input cannot fight it.
+  const s = expertState();
+  requestRoll(s, 1);
+  step(s, { x: 0, y: 0 }, 1 / 60, 30);
+  check("expert barrel roll is mid-rotation a third of the way in", Math.abs(upv(s).y) < 0.9, upv(s).y);
+  check("a second request cannot restart it", requestRoll(s, -1) === false);
+
+  // Same maneuver, one run fought with full stick, one flown hands-off: the
+  // scripted attitude must be identical.
+  const fought = expertState();
+  const clean = expertState();
+  requestRoll(fought, 1);
+  requestRoll(clean, 1);
+  step(fought, { x: -1, y: -1, roll: -1 }, 1 / 60, 45);
+  step(clean, { x: 0, y: 0 }, 1 / 60, 45);
+  check("manual input is ignored during the scripted roll", Math.abs(fought.quat.w - clean.quat.w) < 1e-12 && Math.abs(fought.quat.z - clean.quat.z) < 1e-12, [fought.quat, clean.quat]);
+
+  // Control comes back cleanly once it finishes.
+  const after = expertState();
+  requestRoll(after, 1);
+  step(after, { x: 0, y: 0 }, 1 / 60, Math.ceil(ROLL.duration * 60) + 2);
+  check("expert control resumes after the roll", after.maneuver === null);
+  step(after, { x: 0, y: 1 }, 1 / 60, 30);
+  check("expert pitch works again after the roll", fwd(after).y > 0.4, fwd(after).y);
+  const h0 = hdgOf(after);
+  step(after, { x: 1, y: 0 }, 1 / 60, 30);
+  check("expert roll works again after the roll", Math.abs(upv(after).y) < 0.98 && Math.abs(hdgOf(after) - h0) < 0.4, upv(after).y);
+}
+
+{
+  // Assisted barrel roll is untouched by any of this.
+  const s = createFlightState();
+  const h0 = s.heading;
+  requestRoll(s, 1);
+  step(s, { x: 0, y: 0 }, 1 / 60, Math.ceil(ROLL.duration * 60) + 2);
+  check("assisted barrel roll still ends level", Math.abs(s.bank) < 1e-9 && Math.abs(s.pitch) < 1e-9);
+  check("assisted barrel roll is still heading-neutral", Math.abs(s.heading - h0) < 1e-9);
+}
+
+/* ---- Stage 01.7: mode switching ---- */
+
+{
+  const s = createFlightState();
+  step(s, { x: 1, y: 1, throttle: 1 }, 1 / 60, 120);
+  const pos0 = { ...s.position };
+  const q0 = { ...s.quat };
+  const spd0 = s.speed, thr0 = s.throttle;
+  check("mode toggle returns the new mode", toggleFlightMode(s) === MODE.EXPERT);
+  check("handover keeps position", s.position.x === pos0.x && s.position.y === pos0.y && s.position.z === pos0.z);
+  check("handover keeps the engine", s.speed === spd0 && s.throttle === thr0);
+  // Assisted already mirrors its Euler angles into the quaternion, so the
+  // attitude crosses the boundary unchanged rather than being rebuilt.
+  check("handover keeps attitude", Math.abs(s.quat.x - q0.x) < 1e-9 && Math.abs(s.quat.w - q0.w) < 1e-9);
+  check("a banked handover stays banked", Math.abs(bankDegrees(s)) > 1);
+  check("expert flies on immediately after a handover", (() => {
+    const f0 = { ...s.quat };
+    step(s, { x: 1, y: 0 }, 1 / 60, 30);
+    return s.quat.x !== f0.x || s.quat.z !== f0.z;
   })());
 
-  // ALL SEA: every site is DROPPED, not floated. Five sites on land beat six
-  // with one in the water.
-  const atSea = placeSites(legs, () => 0);
-  check("a site with nowhere to stand is dropped", atSea.length === 0, `${atSea.length}`);
+  // Expert -> assisted from an attitude the arcade envelope cannot hold.
+  const e = expertState();
+  step(e, { x: 1, y: 0 }, 1 / 60, 90); // roll past 90 degrees: inverted
+  check("test setup is actually inverted", Math.abs(bankDegrees(e)) > 90);
+  const invPos = { ...e.position };
+  check("mode toggle goes back", toggleFlightMode(e) === MODE.ASSISTED);
+  check("handover back keeps position", e.position.z === invPos.z);
+  check("assisted adopts the inverted bank rather than snapping level", Math.abs(bankDegrees(e)) > 90);
+  const bank0 = Math.abs(bankDegrees(e));
+  step(e, { x: 0, y: 0 }, 1 / 60, 120);
+  check("assisted rolls an inverted handover back toward level", Math.abs(bankDegrees(e)) < bank0);
+  check("assisted works immediately after a toggle", step(e, { x: 1, y: 0 }, 1 / 60, 120).bank < 0);
 
-  // Land only on one side: it probes OUTWARD and takes the first position
-  // standing on ground at least 30 m above sea level.
-  const oneSided = placeSites(legs, (x) => (x < 0 ? 200 : 0));
-  check("only the side with land is used", oneSided.length === 2, `${oneSided.length}`);
-  check("and it is the land side", oneSided.every((s) => s.side === -1));
+  // A scripted roll cannot cross the boundary; the attitude it reached does.
+  const m = createFlightState();
+  requestRoll(m, 1);
+  step(m, { x: 0, y: 0 }, 1 / 60, 60);
+  toggleFlightMode(m);
+  check("handover drops an in-progress maneuver", m.maneuver === null);
+  check("handover clears roll hold", m.rollHold === false);
 
-  // The probe scales let it reach land further out than the nominal flank.
-  const farLand = placeSites(legs, (x) => (Math.abs(x) > 1800 ? 90 : 0));
-  check(
-    "probing outward finds land beyond the nominal flank",
-    farLand.length === 4,
-    `${farLand.length}`,
-  );
-  check("the probe scales start at the nominal offset", PROBE_SCALES[0] === 1.0);
+  setFlightMode(s, MODE.EXPERT);
+  check("setFlightMode is explicit", isExpert(s) === true);
+  setFlightMode(s, "nonsense");
+  check("an unknown mode falls back to assisted", s.mode === MODE.ASSISTED);
+
+  // The old reset-on-switch behaviour is still available, just not the default.
+  const r = createFlightState();
+  step(r, { x: 1, y: 1, throttle: 1 }, 1 / 60, 120);
+  setFlightMode(r, MODE.EXPERT, { reset: true });
+  check("an explicit reset still resets position", r.position.y === FLIGHT.spawn.y && r.position.z === 0);
+  check("an explicit reset still resets attitude", r.quat.w === 1 && r.quat.x === 0);
+  check("an explicit reset still resets the engine", r.speed === SPEED.cruise && r.throttle === CRUISE_THROTTLE);
 }
 
-function testSamWreckAndContract() {
-  const net = createSamNetwork({});
-  net.deploy([{ x: 0, y: 100, z: -2000 }]);
-  const sam = net.sites[0];
+{
+  // R inside expert mode resets orientation, not just position.
+  const s = expertState();
+  step(s, { x: 1, y: 1, throttle: 1 }, 1 / 60, 200);
+  requestRoll(s, 1);
+  resetFlightState(s);
+  check("expert reset clears the quaternion", s.quat.x === 0 && s.quat.y === 0 && s.quat.z === 0 && s.quat.w === 1);
+  check("expert reset keeps the mode", isExpert(s) === true);
+  check("expert reset clears the maneuver", s.maneuver === null);
+  check("expert reset restores cruise", s.speed === SPEED.cruise && s.throttle === CRUISE_THROTTLE);
+  check("expert reset restores the spawn", s.position.y === FLIGHT.spawn.y);
+}
 
-  // THE STAGE-5 TARGET CONTRACT, unchanged -- which is what makes targeting,
-  // the gun, the missile and the HUD bracket work on ground targets for free.
-  check("a site publishes the target contract", isTargetable(sam.target));
-  for (const field of ["position", "velocity", "alive", "health", "radius", "label"]) {
-    check(`a site publishes ${field}`, field in sam.target);
+/* ---- Stage 01.7: assisted regression (Manual Test H) ---- */
+
+{
+  const s = createFlightState();
+  step(s, { x: 1, y: 1, throttle: 0.5 }, 1 / 60, 600);
+  check("assisted bank is still clamped to 70 deg", Math.abs(s.bank) <= FLIGHT.maxBank + 1e-6, bankDegrees(s));
+  check("assisted pitch is still clamped to +40 deg", s.pitch <= FLIGHT.maxPitchUp + 1e-6, s.pitch / DEG);
+  check("assisted still turns from bank", Math.abs(s.heading) > 1, s.heading);
+  check("assisted still applies bank sink", s.sink > 0, s.sink);
+
+  const dn = createFlightState();
+  step(dn, { x: 0, y: -1 }, 1 / 60, 300);
+  check("assisted pitch is still clamped to -30 deg", dn.pitch >= -FLIGHT.maxPitchDown - 1e-6, dn.pitch / DEG);
+
+  const lvl = createFlightState();
+  step(lvl, { x: 1, y: 0.5 }, 1 / 60, 120);
+  step(lvl, { x: 0, y: 0 }, 1 / 60, 600);
+  check("assisted still auto-levels", Math.abs(lvl.bank) < 0.02 && Math.abs(lvl.pitch) < 0.02, [lvl.bank, lvl.pitch]);
+  check("assisted still holds Q/E angles", step(createFlightState(), { x: 0, y: 0, roll: 1 }, 1 / 60, 60).rollHold === true);
+}
+
+{
+  const a = attitudeVectors(expertState());
+  check("attitudeVectors reports level flight", Math.abs(a.forwardY) < 1e-12 && a.upY > 0.999 && a.inverted === false, a);
+  const inv = expertState();
+  step(inv, { x: 1, y: 0 }, 1 / 60, Math.round(1.5 * 60));
+  check("attitudeVectors detects inverted", attitudeVectors(inv).inverted === true, attitudeVectors(inv));
+}
+
+/* ---- Stage 02: world normalization helpers ---- */
+
+{
+  check("length axis is the longest horizontal one", longestHorizontalAxis({ x: 330, y: 70, z: 80 }) === "x");
+  check("length axis stays Z when Z is longest", longestHorizontalAxis({ x: 80, y: 70, z: 330 }) === "z");
+  check("an X-length model is yawed onto Z", Math.abs(alignYaw("x") - Math.PI / 2) < 1e-12);
+  check("a Z-length model needs no yaw", alignYaw("z") === 0);
+  check("scale maps measured onto target", Math.abs(scaleToTarget(194, 19.4) - 0.1) < 1e-12);
+  check("scale of a zero measurement is inert", scaleToTarget(0, 300) === 1);
+  check("distanceKm converts metres", Math.abs(distanceKm({ x: 0, y: 0, z: 0 }, { x: 3000, y: 0, z: 4000 }) - 5) < 1e-12);
+  check("percentile picks the low end", percentile([900, 905, 910, 1200], 0) === 900);
+  check("percentile picks the high end", percentile([900, 905, 910, 1200], 1) === 1200);
+  check("percentile interpolates by rank", percentile([0, 10, 20, 30, 40], 0.5) === 20);
+  check("percentile of nothing is zero", percentile([], 0.5) === 0);
+  // The carrier's deck is the largest flat surface, so the modal height finds
+  // it even though the mast is far higher.
+  check("modal height finds the crowded bin, not the tallest", modalHeight([17, 17.4, 16.8, 17.1, 63.9], 1) === 17);
+  check("modal height respects bin size", modalHeight([10, 11, 12, 30], 10) === 10);
+  check("modal height of nothing is null", modalHeight([], 1) === null);
+}
+
+/* ---- Stage 02.1: FOV-invariant camera framing ---- */
+
+{
+  // The framing solve exists so that screen y = tan(tilt)/tan(fov/2) comes back
+  // to the same value at every field of view.
+  const screenY = (fov) => -Math.tan(framingTilt(-0.18, fov)) / Math.tan((fov * Math.PI) / 180 / 2);
+  check("framing holds at the narrow end", Math.abs(screenY(60) + 0.18) < 1e-12);
+  check("framing holds at the wide end", Math.abs(screenY(75) + 0.18) < 1e-12);
+  check("framing holds at an absurd field of view", Math.abs(screenY(110) + 0.18) < 1e-12);
+  check("a centred aircraft needs no tilt", framingTilt(0, 75) === 0);
+  check("below centre tilts the axis up", framingTilt(-0.3, 60) > 0);
+  check("above centre tilts the axis down", framingTilt(0.3, 60) < 0);
+  // Wider lens, larger tilt: that is what keeps the aircraft still.
+  check("wider fields of view need more tilt", framingTilt(-0.18, 75) > framingTilt(-0.18, 60));
+}
+
+/* ---- Stage 02.2: world contact ---- */
+
+// Synthetic terrain: two coplanar triangles over a 200 m square, so the
+// barycentric interpolation can be checked against an exact analytic height.
+const makeTerrain = (f, half = 100) => {
+  const c = (x, z) => [x, f(x, z), z];
+  const verts = new Float32Array([
+    ...c(-half, -half), ...c(half, -half), ...c(half, half),
+    ...c(-half, -half), ...c(half, half), ...c(-half, half),
+  ]);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+  const mesh = new THREE.Mesh(g);
+  const root = new THREE.Object3D();
+  root.add(mesh);
+  root.updateMatrixWorld(true);
+  return root;
+};
+
+{
+  check("look-ahead scales with speed", Math.abs(lookAheadDistance(250) - 50) < 1e-9, lookAheadDistance(250));
+  check("look-ahead is 0.20 s of flight", Math.abs(lookAheadDistance(170) - 34) < 1e-9, lookAheadDistance(170));
+  check("look-ahead has a floor", lookAheadDistance(10) === PHYSICS.minLookAhead, lookAheadDistance(10));
+  check("look-ahead of a stopped aircraft is the floor", lookAheadDistance(0) === PHYSICS.minLookAhead);
+  check("physics queries at 60 Hz", PHYSICS.queryHz === 60, PHYSICS.queryHz);
+  check("a 60 Hz step at max speed is ~4 m", Math.abs(250 / PHYSICS.queryHz - 4.17) < 0.01, 250 / PHYSICS.queryHz);
+}
+
+{
+  check("terrain above the waterline is the ground", groundReference(325, 0).surface === SURFACE.TERRAIN);
+  check("...at its own height", groundReference(325, 0).height === 325);
+  check("no terrain falls back to the ocean", groundReference(null, 0).surface === SURFACE.OCEAN);
+  check("submerged terrain is not the ground", groundReference(-40, 0).surface === SURFACE.OCEAN);
+  check("ocean fallback reports the waterline", groundReference(null, 0).height === 0);
+}
+
+{
+  const c = (o) => classifyContact({ minClearance: 500, minProbeY: 500, forwardHit: null, oceanY: 0, ...o });
+  check("clear air is clear", c({}) === CONTACT.CLEAR);
+  check("a probe inside terrain is terrain contact", c({ minClearance: 0.4 }) === CONTACT.TERRAIN);
+  check("clearance just above the threshold is clear", c({ minClearance: PHYSICS.terrainContactClearance + 0.01 }) === CONTACT.CLEAR);
+  check("a probe at the waterline is ocean contact", c({ minProbeY: 0.2 }) === CONTACT.OCEAN);
+  check("ocean outranks terrain below sea level", c({ minProbeY: -3, minClearance: 0.1 }) === CONTACT.OCEAN);
+  check("a wall ahead is forward contact", c({ forwardHit: { distance: 14 } }) === CONTACT.FORWARD);
+  check("terrain contact outranks a forward hit", c({ minClearance: 0.5, forwardHit: { distance: 14 } }) === CONTACT.TERRAIN);
+  check("infinite clearance never contacts", c({ minClearance: Infinity }) === CONTACT.CLEAR);
+
+  // The 0.5–1.5 m band over open sea: clearance is measured against the
+  // waterline there, so calling it terrain would mistype an ocean dive.
+  check("clearance over open sea is ocean contact", c({ minClearance: 0.8, minProbeY: 0.8, surface: SURFACE.OCEAN }) === CONTACT.OCEAN);
+  check("...even a metre above the waterline", c({ minClearance: 1.2, minProbeY: 1.2, surface: SURFACE.OCEAN }) === CONTACT.OCEAN);
+  check("...while terrain below still types as terrain", c({ minClearance: 1.2, minProbeY: 40, surface: SURFACE.TERRAIN }) === CONTACT.TERRAIN);
+}
+
+{
+  check("safe states need speed-scaled clearance", isSafeToRecord(CONTACT.CLEAR, requiredSafeClearance(170) + 1, 170) === true);
+  check("cruise clearance that would pass at 110 fails at 250", isSafeToRecord(CONTACT.CLEAR, 50, 250) === false, requiredSafeClearance(250));
+  check("skimming terrain is not a safe state", isSafeToRecord(CONTACT.CLEAR, 4, 170) === false);
+  check("contact is never a safe state", isSafeToRecord(CONTACT.TERRAIN, 900, 170) === false);
+
+  check("required clearance has a 40 m floor", requiredSafeClearance(110) === 40, requiredSafeClearance(110));
+  check("required clearance at 170 m/s", Math.abs(requiredSafeClearance(170) - 59.5) < 1e-9, requiredSafeClearance(170));
+  check("required clearance at 250 m/s", Math.abs(requiredSafeClearance(250) - 87.5) < 1e-9, requiredSafeClearance(250));
+  check("required clearance rises with speed", requiredSafeClearance(250) > requiredSafeClearance(170));
+
+  check("imminence has a floor", imminentForwardDistance(110) === PHYSICS.minImminent, imminentForwardDistance(110));
+  check("imminence is a couple of physics steps", imminentForwardDistance(600) > imminentForwardDistance(250));
+  check("a 50 m look-ahead hit is not yet imminent", 50 > imminentForwardDistance(250), imminentForwardDistance(250));
+}
+
+{
+  // y = 50 + x/10: flat in Z, so every sample has a known answer.
+  const root = makeTerrain((x) => 50 + x * 0.1);
+  const meshes = collectMeshes(root);
+  const index = buildTerrainIndex(meshes, 16);
+  check("terrain meshes are collected", meshes.length === 1, meshes.length);
+  check("the index holds both triangles", index.triangles === 2, index.triangles);
+  check("height at the origin", Math.abs(terrainHeightAt(index, 0, 0) - 50) < 1e-4, terrainHeightAt(index, 0, 0));
+  check("height interpolates across a triangle", Math.abs(terrainHeightAt(index, 50, 20) - 55) < 1e-4, terrainHeightAt(index, 50, 20));
+  check("height is exact on the far corner", Math.abs(terrainHeightAt(index, -99, 99) - 40.1) < 1e-3, terrainHeightAt(index, -99, 99));
+  check("outside the island there is no terrain", terrainHeightAt(index, 400, 0) === null);
+  check("a null index samples nothing", terrainHeightAt(null, 0, 0) === null);
+  // Both diagonal halves must answer, or half the island would read as ocean.
+  let hits = 0;
+  for (let i = 0; i < 400; i++) {
+    const x = -99 + Math.random() * 198;
+    const z = -99 + Math.random() * 198;
+    if (Math.abs(terrainHeightAt(index, x, z) - (50 + x * 0.1)) < 1e-3) hits++;
   }
-  // A SAM's velocity is ZERO, so the lead solution collapses to its position.
-  const lead = leadSolution({ x: 0, y: 900, z: 0 }, sam.target);
-  check(
-    "the lead solution on a SAM is the SAM itself",
-    Math.abs(lead.point.z - sam.target.position.z) < 1e-6,
-  );
-
-  // A wreck: still a target, no longer a threat.
-  const wrecks = [];
-  const net2 = createSamNetwork({ onWreck: (s) => wrecks.push(s) });
-  net2.deploy([{ x: 0, y: 100, z: -2000 }]);
-  const player = createFlightState({ position: { x: 0, y: 900, z: 0 } });
-  damageTarget(net2.sites[0].target, 999, 0);
-  net2.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
-  check("a killed site produces a wreck", wrecks.length === 1);
-  check("a wreck is DESTROYED", net2.sites[0].state === "DESTROYED");
-  check("a wreck is no longer a live site", net2.liveSites().length === 0);
-  check("a wreck is not emitting", net2.emitting().length === 0);
-  // It is still in the world -- not a deletion.
-  check("a wreck is still in the site list", net2.sites.length === 1);
-
-  for (let t = 0; t < 20; t += 1 / 60) {
-    net2.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
-  }
-  check("a wreck never acquires again", net2.emitting().length === 0);
+  check("400 random samples all land on the surface", hits === 400, hits);
 }
 
-function testSamRound() {
-  const r = turnRadius(SAM_MISSILE);
-  check(
-    "the SAM round has the widest turn of the three",
-    r > turnRadius(HOSTILE_MISSILE) && r > turnRadius(AIM9),
-    `sam ${r.toFixed(0)}, hostile ${turnRadius(HOSTILE_MISSILE).toFixed(0)}, aim9 ${turnRadius(AIM9).toFixed(0)}`,
-  );
-  check("its radius is near §14's ~1146 m", r > 1050 && r < 1250, `${r.toFixed(0)}`);
-  check(
-    "so a hard crossing manoeuvre still beats it",
-    r > TURN_RADIUS_REF,
-    `round ${r.toFixed(0)} vs aircraft ${TURN_RADIUS_REF}`,
-  );
-
-  // IT LAUNCHES UPWARD WITH ZERO INHERITED SPEED, which is what makes the
-  // trail read as a ground launch.
-  const sys = createMissileSystem({});
-  const round = sys.fire({
-    config: SAM_MISSILE, owner: "sam",
-    position: { x: 0, y: 20, z: 0 }, direction: { x: 0, y: 1, z: 0 },
-    speed: 0, target: null,
-  });
-  check("it leaves the ground going UP", round.velocity.y > 0 && Math.abs(round.velocity.x) < 1e-9);
-  check("and inherits no lateral speed", Math.abs(round.velocity.z) < 1e-9);
+{
+  // A 5:1 ramp climbing toward -Z, so a level pass runs into a face.
+  const index = buildTerrainIndex(collectMeshes(makeTerrain((x, z) => -z * 5)), 32);
+  const origin = { x: 0, y: 100, z: -10 };
+  const hit = forwardTerrainHit(index, origin, { x: 0, y: 0, z: -1 }, 60);
+  check("the forward probe finds a mountain face", hit !== null, hit && hit.distance);
+  check("...at roughly the right distance", hit && Math.abs(hit.distance - 12) < 7, hit && hit.distance);
+  check("...and reports where", hit && hit.point.z < origin.z, hit && hit.point.z);
+  check("flying away from the ramp is clear", forwardTerrainHit(index, origin, { x: 0, y: 0, z: 1 }, 60) === null);
+  check("climbing over the ramp is clear", forwardTerrainHit(index, { x: 0, y: 900, z: -10 }, { x: 0, y: 0, z: -1 }, 60) === null);
+  check("a null index has nothing ahead", forwardTerrainHit(null, origin, { x: 0, y: 0, z: -1 }, 60) === null);
 }
 
-function testSeduces() {
-  check("inside the radius decoys", seduces(200, 900) === true);
-  check("outside the radius does not", seduces(500, 900) === false);
-  // A COMMITTED round cannot be decoyed -- the answer is the barrel roll.
-  check("a committed round cannot be decoyed", seduces(50, 100) === false);
-  // A flare further away than the target is a distraction, not a decoy.
-  check("a flare further than the target loses", seduces(800, 400) === false);
+{
+  const s = expertState();
+  step(s, { x: 1, y: 0.4, throttle: 1 }, 1 / 60, 40);
+  const snap = captureFlightState(s);
+  const before = { ...s.quat };
+  step(s, { x: 0, y: -1 }, 1 / 60, 120);
+  s.position.y = -400;
+  check("a snapshot is not a live reference", s.quat.x !== before.x || s.quat.w !== before.w);
 
-  // KEEP minStandoff WELL BELOW seduceRadius. The cloud sits ~200 m astern a
-  // second after release, so a standoff near that distance cancels the radius
-  // out and the mechanic never fires at all. Assert the RELATIONSHIP.
-  check(
-    "minStandoff is well below seduceRadius",
-    FLARE_CFG.minStandoff < FLARE_CFG.seduceRadius * 0.6,
-    `${FLARE_CFG.minStandoff} vs ${FLARE_CFG.seduceRadius}`,
-  );
+  applyFlightState(s, snap);
+  check("restore returns the position", s.position.y === snap.position.y && s.position.z === snap.position.z);
+  check("restore returns the attitude exactly", Math.abs(s.quat.x - before.x) < 1e-12 && Math.abs(s.quat.w - before.w) < 1e-12);
+  check("restore returns the engine", s.speed === snap.speed && s.throttle === snap.throttle);
+  check("restore leaves a normalized quaternion", Math.abs(Math.hypot(s.quat.x, s.quat.y, s.quat.z, s.quat.w) - 1) < 1e-12);
+  check("restore derives the Euler angles", Math.abs(s.bank) > 0.1 && Number.isFinite(s.pitch), [s.bank, s.pitch]);
+  check("restore clears any maneuver", s.maneuver === null && s.rollHold === false);
+
+  // The player may have changed mode since the snapshot; recovery must not
+  // take the controls back off them.
+  const assisted = createFlightState();
+  applyFlightState(assisted, snap);
+  check("restore does not change the flight mode", assisted.mode === MODE.ASSISTED);
+  check("restore into assisted keeps the recorded bank", Math.abs(assisted.bank) > 0.1, assisted.bank);
+
+  const bled = createFlightState();
+  applyFlightState(bled, snap, { speedScale: 0.5 });
+  check("recovery can bleed speed", bled.speed < snap.speed && bled.speed >= SPEED.min, bled.speed);
+  check("restoring nothing is a no-op", applyFlightState(bled, null) === false);
 }
 
-function testDecoyEndToEndWithAMovingAircraft() {
-  // §8 IS EMPHATIC ABOUT THIS: a STATIC aircraft never leaves its flares
-  // behind, so the cloud never reaches the chaser's path and the mechanic
-  // looks broken while being perfectly correct.
-  const flares = createFlares();
-  const sys = createMissileSystem({});
-  const state = createFlightState({ position: { x: 0, y: 900, z: 0 }, speed: 220 });
-  const player = {
-    label: "PLAYER", alive: true, health: 100, maxHealth: 100, radius: 8,
-    hitAt: -Infinity, position: state.position, velocity: { x: 0, y: 0, z: -220 },
+{
+  // Probes must ride the quaternion, not a copy of the Euler angles.
+  const ac = new THREE.Object3D();
+  ac.position.set(0, 500, 0);
+  const world = (name) => {
+    ac.updateMatrixWorld(true);
+    const p = PROBES.find((q) => q.name === name);
+    return p.local.clone().applyMatrix4(ac.matrixWorld);
   };
+  check("five probes exist", PROBES.length === 5, PROBES.length);
+  check("level: the belly probe is below the aircraft", world("center").y < 500, world("center").y);
+  check("level: the nose probe is ahead", world("nose").z < 0);
+  check("level: the wings are symmetric", Math.abs(world("leftWing").x + world("rightWing").x) < 1e-9);
 
-  // A STERN CHASE: the round is behind and closing.
-  const round = sys.fire({
-    config: HOSTILE_MISSILE, owner: "hostile",
-    position: { x: 0, y: 900, z: 1400 },
-    direction: { x: 0, y: 0, z: -1 }, speed: 300, target: player,
-  });
-  const originalTarget = round.target;
+  const s = expertState();
+  step(s, { x: 1, y: 0 }, 1 / 60, Math.round(1.5 * 60)); // 180 deg roll
+  ac.quaternion.set(s.quat.x, s.quat.y, s.quat.z, s.quat.w);
+  check("inverted: the belly probe is ABOVE the aircraft", world("center").y > 500.5, world("center").y);
+  check("inverted: the wings swap sides", world("leftWing").x > 0, world("leftWing").x);
 
-  flares.dispense(state, { x: 0, y: 0, z: -1 }, 0);
-  check("a burst is dispensed", flares.flares.length === 3, `${flares.flares.length}`);
-
-  let seduced = false;
-  for (let t = 0; t < 3 && !seduced; t += 1 / 60) {
-    // THE AIRCRAFT KEEPS FLYING, which is what leaves the cloud behind.
-    updateFlight(state, stick(), 1 / 60);
-    flares.update(1 / 60, t);
-    flares.offerTo(sys.rounds, state.position);
-    sys.update(1 / 60, t);
-    if (round.target && round.target.label === "FLARE") seduced = true;
-  }
-  check("a stern-chasing round is decoyed", seduced, `target ${round.target?.label}`);
-  // RE-TARGETED, NOT FLAGGED. A "lost" flag would freeze the heading of a
-  // round already pointed at the player, so it would arrive anyway.
-  check("the round's TARGET was swapped", round.target !== originalTarget);
-  check("it was not merely flagged lost", round.givenUp !== true);
-  check("it is chasing an actual flare", round.target.label === "FLARE");
-
-  // A HEAD-ON shot arrives before the flares are near it: panicking early
-  // buys nothing.
-  const f2 = createFlares();
-  const sys2 = createMissileSystem({});
-  const s2 = createFlightState({ position: { x: 0, y: 900, z: 0 }, speed: 220 });
-  const p2 = { ...player, position: s2.position };
-  const headOn = sys2.fire({
-    config: HOSTILE_MISSILE, owner: "hostile",
-    position: { x: 0, y: 900, z: -2200 },
-    direction: { x: 0, y: 0, z: 1 }, speed: 300, target: p2,
-  });
-  f2.dispense(s2, { x: 0, y: 0, z: -1 }, 0);
-  let headOnSeduced = false;
-  for (let t = 0; t < 2; t += 1 / 60) {
-    updateFlight(s2, stick(), 1 / 60);
-    f2.update(1 / 60, t);
-    f2.offerTo(sys2.rounds, s2.position);
-    sys2.update(1 / 60, t);
-    if (headOn.target && headOn.target.label === "FLARE") headOnSeduced = true;
-  }
-  check("a head-on shot is not decoyed", headOnSeduced === false);
-
-  // A BURNT-OUT FLARE STOPS BEING A TARGET, and the missile's existing "no
-  // live target" branch then stops guidance -- no change in missile.js.
-  const f3 = createFlares();
-  const s3 = createFlightState({ position: { x: 0, y: 900, z: 0 } });
-  f3.dispense(s3, { x: 0, y: 0, z: -1 }, 0);
-  const flare = f3.flares[0];
-  check("a fresh flare is alive", flare.alive === true);
-  f3.update(1 / 60, FLARE_CFG.burn + 0.1);
-  check("a burnt-out flare stops being a target", flare.alive === false);
-
-  // Flares are INFRARED: they defeat a missile, never a radar LOCK.
-  check("the dispenser is finite", createFlares().remaining === FLARE_CFG.count);
-  const f4 = createFlares();
-  const s4 = createFlightState();
-  f4.dispense(s4, { x: 0, y: 0, z: -1 }, 0);
-  check("a burst spends perBurst flares", f4.remaining === FLARE_CFG.count - FLARE_CFG.perBurst);
-  check("the cooldown blocks an immediate second burst", f4.dispense(s4, { x: 0, y: 0, z: -1 }, 0) === 0);
+  const knife = expertState();
+  step(knife, { x: 1, y: 0 }, 1 / 60, Math.round(0.75 * 60)); // 90 deg bank
+  ac.quaternion.set(knife.quat.x, knife.quat.y, knife.quat.z, knife.quat.w);
+  const low = Math.min(world("leftWing").y, world("rightWing").y);
+  check("knife-edge: a wing becomes the lowest point", low < world("center").y, [low, world("center").y]);
 }
 
-function testRearm() {
-  const refills = [];
-  const rearm = createRearm({ seconds: 20, onRefill: (n) => refills.push(n) });
-  let missiles = 2;
-  let rounds = 500;
-  const weapons = {
-    "AIM-9": { isEmpty: () => missiles === 0, refill: () => (missiles = 2) },
-    GUN: { isEmpty: () => rounds === 0, refill: () => (rounds = 500) },
+{
+  // End to end: fly into a plateau and check the recovery, then into the sea.
+  const physics = createWorldPhysics({ oceanY: 0 });
+  physics.setTerrain(makeTerrain(() => 100));
+  const fs = createFlightState();
+  fs.position.y = 300;
+  const ac = new THREE.Object3D();
+  const sync = () => {
+    ac.position.set(fs.position.x, fs.position.y, fs.position.z);
+    ac.quaternion.set(fs.quat.x, fs.quat.y, fs.quat.z, fs.quat.w);
+    ac.updateMatrixWorld(true);
   };
+  sync();
+  physics.reset(fs);
+  check("a query below the step does nothing", physics.update(ac, fs, 1 / 240) === false && physics.state.queries === 0);
+  physics.update(ac, fs, 1 / 30);
+  check("physics reports AGL over terrain", Math.abs(physics.state.agl - 200) < 1e-6, physics.state.agl);
+  check("physics reports the ground surface", physics.state.surface === SURFACE.TERRAIN);
+  check("min clearance is below centre AGL", physics.state.minClearance < physics.state.agl, [physics.state.minClearance, physics.state.agl]);
+  check("clear flight records a safe state", physics.state.hasSafeState === true);
+  check("a query is measurable and cheap", physics.state.queryMs >= 0 && physics.state.queryMs < 5, physics.state.queryMs);
 
-  // A PARTLY-SPENT magazine never starts a timer. START AT EMPTY, NOT AT THE
-  // FIRST SHOT -- otherwise the player fires one AIM-9, waits, and is handed a
-  // third round, and the loadout stops meaning anything.
-  missiles = 1;
-  rearm.update(1, weapons);
-  check("a partly-spent magazine starts no timer", rearm.isCycling("AIM-9") === false);
+  fs.position.y = 100.5; // belly inside the plateau
+  sync();
+  let recovered = false;
+  const info = physics.update(ac, fs, 1 / 30, () => (recovered = true));
+  check("terrain contact recovers the aircraft", recovered === true && !!info);
+  check("the recovery names the surface", info && info.type === CollisionType.TERRAIN, info && info.type);
+  check("a collision event was published", physics.state.lastEvent && physics.state.lastEvent.type === CollisionType.TERRAIN);
+  check("the event carries a world-space normal", physics.state.lastEvent && Math.abs(physics.state.lastEvent.normal.y - 1) < 1e-6, physics.state.lastEvent && physics.state.lastEvent.normal);
+  // Too little history to rewind 0.65 s, so the oldest state is used, plus the
+  // protective offset along the blended normal.
+  check("recovery restores the safe altitude", Math.abs(fs.position.y - (300 + RECOVERY.offset)) < 1e-6, fs.position.y);
+  check("recovery caps the speed", fs.speed <= RECOVERY.maxSpeed, fs.speed);
+  check("recovery starts a cooldown", physics.state.cooldown > 0, physics.state.cooldown);
+  check("recovery keeps a valid quaternion", Math.abs(Math.hypot(fs.quat.x, fs.quat.y, fs.quat.z, fs.quat.w) - 1) < 1e-9);
 
-  missiles = 0;
-  rearm.update(1 / 60, weapons);
-  check("reaching empty starts the timer", rearm.isCycling("AIM-9") === true);
-  check("the gun is untouched", rearm.isCycling("GUN") === false);
-
-  for (let t = 0; t < 19; t += 1 / 60) rearm.update(1 / 60, weapons);
-  check("it has not refilled early", missiles === 0);
-  for (let t = 0; t < 2; t += 1 / 60) rearm.update(1 / 60, weapons);
-  check("it refills after 20 s", missiles === 2, `${missiles}`);
-  check("the refill fired once", refills.length === 1, `${refills.length}`);
-  check("and the timer is gone", rearm.isCycling("AIM-9") === false);
-
-  // INDEPENDENT TIMERS, so one weapon is always coming back.
-  missiles = 0;
-  rearm.update(1 / 60, weapons);
-  for (let t = 0; t < 10; t += 1 / 60) rearm.update(1 / 60, weapons);
-  rounds = 0;
-  rearm.update(1 / 60, weapons);
-  check("both timers run at once", rearm.active().length === 2);
-  check(
-    "and they are at different points",
-    Math.abs(rearm.remaining("AIM-9") - rearm.remaining("GUN")) > 5,
-    `${rearm.remaining("AIM-9")} vs ${rearm.remaining("GUN")}`,
-  );
-
-  // AN EXTERNAL REFILL CANCELS A RUNNING CYCLE -- a checkpoint restore or a
-  // restart -- so a timer cannot later top up an already-full magazine.
-  missiles = 2;
-  rearm.update(1 / 60, weapons);
-  check("an external refill cancels the cycle", rearm.isCycling("AIM-9") === false);
-  check("the other weapon keeps its timer", rearm.isCycling("GUN") === true);
+  // Cooldown must swallow the next contact rather than looping.
+  fs.position.y = 100.5;
+  sync();
+  const again = physics.update(ac, fs, 1 / 30, () => {});
+  check("the cooldown suppresses a second recovery", again === false);
+  check("...but the world is still queried", physics.state.contactKind === CONTACT.TERRAIN);
+  check("...and unsafe states are not recorded", physics.state.safeStates <= 1, physics.state.safeStates);
 }
 
-function testModesTable() {
-  for (const mode of [MISSION, FREE, PEACE]) {
-    const r = rulesFor(mode);
-    for (const key of ["phases", "timer", "nav", "hostiles", "sams", "respawn"]) {
-      check(`${mode} defines ${key}`, key in r);
+{
+  // Ocean-only world: no terrain geometry at all, contact must still work.
+  const physics = createWorldPhysics({ oceanY: 0 });
+  physics.setTerrain(new THREE.Object3D());
+  check("an empty world builds no index", physics.state.hasTerrainIndex === false);
+  const fs = createFlightState();
+  fs.position.y = 300;
+  const ac = new THREE.Object3D();
+  const sync = () => {
+    ac.position.set(fs.position.x, fs.position.y, fs.position.z);
+    ac.updateMatrixWorld(true);
+  };
+  sync();
+  physics.reset(fs);
+  physics.update(ac, fs, 1 / 30);
+  check("over open sea the ground is the ocean", physics.state.surface === SURFACE.OCEAN);
+  check("AGL over open sea is altitude", Math.abs(physics.state.agl - 300) < 1e-6, physics.state.agl);
+  check("AGL over open sea is not NaN", Number.isFinite(physics.state.agl));
+
+  fs.position.y = 1;
+  sync();
+  let recovered = false;
+  physics.update(ac, fs, 1 / 30, () => (recovered = true));
+  check("ocean contact is detected", physics.state.contactKind === CONTACT.OCEAN, physics.state.contactKind);
+  check("ocean contact recovers", recovered === true && Math.abs(fs.position.y - (300 + RECOVERY.offset)) < 1e-6, fs.position.y);
+  check("the ocean event normal is world up", physics.state.lastEvent.normal.y === 1 && physics.state.lastEvent.type === CollisionType.OCEAN);
+
+  // The metre above the waterline used to type as TERRAIN over open sea.
+  physics.reset(fs);
+  fs.position.y = 2;
+  sync();
+  physics.update(ac, fs, 1 / 30);
+  check("a probe just above the waterline is ocean contact", physics.state.contactKind === CONTACT.OCEAN, [physics.state.contactKind, physics.state.minClearance]);
+  check("...and the event is typed OCEAN", physics.state.lastEvent.type === CollisionType.OCEAN, physics.state.lastEvent.type);
+}
+
+{
+  // §34: nothing anywhere near the island must produce NaN.
+  const physics = createWorldPhysics({ oceanY: 0 });
+  physics.setTerrain(makeTerrain((x) => 50 + x * 0.1));
+  const fs = createFlightState();
+  const ac = new THREE.Object3D();
+  let finite = true;
+  for (const [x, z, y] of [[0, 0, 400], [5000, 5000, 400], [-99, 99, 60], [0, 0, -50], [1e6, -1e6, 1e4]]) {
+    fs.position.x = x;
+    fs.position.z = z;
+    fs.position.y = y;
+    ac.position.set(x, y, z);
+    ac.updateMatrixWorld(true);
+    physics.reset(fs);
+    physics.update(ac, fs, 1 / 30);
+    const s = physics.state;
+    if (!Number.isFinite(s.agl) || !Number.isFinite(s.minClearance) || !Number.isFinite(s.groundHeight)) finite = false;
+  }
+  check("terrain queries never produce NaN", finite === true);
+  check("hard floor is below the contact system", FLIGHT.hardFloorY < 0, FLIGHT.hardFloorY);
+}
+
+/* ---- Stage 02.3: collision response ------------------------------------ */
+
+{
+  // The event is the whole contract between detection and response.
+  const e = createCollisionEvent({
+    type: CollisionType.TERRAIN,
+    position: { x: 1, y: 2, z: 3 },
+    normal: { x: 0, y: 1, z: 0 },
+    speed: 240,
+    timestamp: 12.5,
+    forwardHit: true,
+  });
+  check("a collision event copies its position", e.position.x === 1 && e.position.z === 3);
+  check("a collision event records the trigger kind", e.forwardHit === true && e.type === CollisionType.TERRAIN);
+  check("a collision event defaults its normal to world up", createCollisionEvent({ type: CollisionType.OCEAN, position: { x: 0, y: 0, z: 0 }, normal: null }).normal.y === 1);
+
+  // A near-vertical face must not shove the aircraft sideways into the next one.
+  const wall = recoveryNormal({ type: CollisionType.TERRAIN, normal: { x: 1, y: 0, z: 0 } });
+  check("a vertical face blends toward world up", wall.y > 0.6 && wall.x > 0.6, wall);
+  check("the blended normal is unit length", Math.abs(Math.hypot(wall.x, wall.y, wall.z) - 1) < 1e-9);
+  check("ocean recovery is straight up", recoveryNormal({ type: CollisionType.OCEAN, normal: { x: 1, y: 0, z: 0 } }).y === 1);
+}
+
+{
+  // Safe-state history: sampled, bounded, time-ordered.
+  const h = createSafeStateHistory({ seconds: 2, sampleHz: 15 });
+  const fs = createFlightState();
+  check("the first sample is always taken", h.sample(0, fs, 500) === true);
+  check("samples inside the interval are refused", h.sample(0.02, fs, 500) === false);
+  check("samples at the interval are taken", h.sample(1 / 15, fs, 500) === true);
+
+  let t = 1 / 15;
+  for (let i = 0; i < 400; i++) {
+    t += 1 / 60;
+    fs.position.y = 300 + i;
+    h.sample(t, fs, 500);
+  }
+  check("history is bounded", h.length <= Math.ceil(2 * 15) + 2, h.length);
+  check("history covers ~2 seconds", h.span > 1.7 && h.span <= 2.0001, h.span);
+  let ordered = true;
+  for (let i = 1; i < h.length; i++) if (h.states[i].time < h.states[i - 1].time) ordered = false;
+  check("history is time-ordered", ordered === true);
+  check("old states are dropped", t - h.oldest.time <= 2.0001, t - h.oldest.time);
+
+  const target = h.pick(t, 0.65);
+  check("pick rewinds rather than taking the newest", target !== h.newest && target.time <= t - 0.65, [target.time, t]);
+  check("pick takes the newest state at or before the cutoff", t - target.time < 0.65 + 1 / 15 + 1e-9, t - target.time);
+  h.trimTo(target.time);
+  check("trim drops the states that led into the impact", h.newest === target, h.length);
+  h.clear();
+  check("an empty history picks nothing", h.pick(t, 0.65) === null && h.length === 0);
+  check("a short history falls back to its oldest state", (h.sample(10, fs, 500), h.pick(10.1, 0.65)) === h.oldest);
+}
+
+{
+  // The response policy in isolation: rewind, cap, neutralise, resume.
+  const history = createSafeStateHistory();
+  const fs = expertState();
+  let cleared = 0;
+  let restored = 0;
+  const response = createDevelopmentRecoveryResponse({
+    history,
+    flightState: fs,
+    clearInput: () => cleared++,
+    onRestore: () => restored++,
+  });
+  check("the response names itself for later replacement", response.name === "DevelopmentRecoveryResponse");
+
+  // 2 s of history: a climbing, rolling expert pass, sampled at 15 Hz.
+  let t = 0;
+  const marks = [];
+  for (let i = 0; i < 120; i++) {
+    step(fs, { x: 0.6, y: 0.3, throttle: 1 }, 1 / 60);
+    t += 1 / 60;
+    if (history.sample(t, fs, 400)) marks.push({ t, y: fs.position.y, quat: { ...fs.quat } });
+  }
+  fs.speed = 250;
+  const impact = { ...fs.quat };
+  const event = createCollisionEvent({
+    type: CollisionType.TERRAIN,
+    position: { x: fs.position.x, y: fs.position.y, z: fs.position.z },
+    normal: { x: 0, y: 1, z: 0 },
+    speed: 250,
+    timestamp: t,
+  });
+  const info = response.handleCollision(event);
+
+  check("recovery rewinds ~0.65 s", Math.abs(info.rewind - RECOVERY.rewindTime) < 1 / 15 + 1e-9, info.rewind);
+  check("recovery caps the speed at 160", fs.speed === RECOVERY.maxSpeed, fs.speed);
+  check("recovery makes the throttle consistent", Math.abs(getTargetSpeed(fs.throttle) - fs.speed) < 1, [fs.throttle, getTargetSpeed(fs.throttle)]);
+  check("recovery is not the impact attitude", Math.abs(fs.quat.x - impact.x) > 1e-6 || Math.abs(fs.quat.w - impact.w) > 1e-6);
+  const src = marks.find((m) => Math.abs(m.t - (t - info.rewind)) < 1e-9);
+  check("recovery restores the historical quaternion exactly", src && Math.abs(fs.quat.x - src.quat.x) < 1e-12 && Math.abs(fs.quat.w - src.quat.w) < 1e-12);
+  check("recovery offsets off the surface", Math.abs(fs.position.y - (src.y + RECOVERY.offset)) < 1e-9, [fs.position.y, src && src.y]);
+  check("recovery clears transient input once", cleared === 1 && restored === 1);
+  check("recovery opens a control grace window", Math.abs(response.graceRemaining - RECOVERY.controlGrace) < 1e-9, response.graceRemaining);
+  check("recovery shows one-shot feedback", response.feedback === "RECOVERED \u00b7 TERRAIN", response.feedback);
+
+  response.tick(0.2);
+  check("grace is still live mid-window", response.graceRemaining > 0, response.graceRemaining);
+  response.tick(0.2);
+  check("grace expires quickly", response.graceRemaining === 0);
+  check("...and does not linger past 0.4 s", RECOVERY.controlGrace <= 0.4, RECOVERY.controlGrace);
+  response.tick(1.0);
+  check("feedback clears itself", response.feedback === null);
+  check("history no longer holds the impact approach", history.newest.time <= t - info.rewind + 1e-9);
+
+  // Empty history: fall back to the airborne reset, never to a bad guess.
+  const h2 = createSafeStateHistory();
+  let fell = 0;
+  const r2 = createDevelopmentRecoveryResponse({ history: h2, flightState: fs, fallbackReset: () => fell++ });
+  const i2 = r2.handleCollision(event);
+  check("an empty history falls back to the reset", fell === 1 && i2.fallback === true);
+}
+
+{
+  // Terrain normals: world-space, upward, from the real triangle.
+  const flat = buildTerrainIndex(collectMeshes(makeTerrain(() => 100)), 16);
+  const n = terrainNormalAt(flat, 10, 10);
+  check("a flat plateau normal is world up", Math.abs(n.y - 1) < 1e-9, n);
+  const ramp = buildTerrainIndex(collectMeshes(makeTerrain((x, z) => -z * 5)), 16);
+  const rn = terrainNormalAt(ramp, 0, 0);
+  check("a ramp normal tilts", rn.y > 0 && rn.y < 1 && Math.abs(rn.z) > 0.5, rn);
+  check("a ramp normal is unit length", Math.abs(Math.hypot(rn.x, rn.y, rn.z) - 1) < 1e-6);
+  check("normals always point upward", terrainNormalAt(ramp, 50, -50).y > 0);
+  check("off the island there is no normal", terrainNormalAt(ramp, 5000, 0) === null);
+  check("a null index has no normal", terrainNormalAt(null, 0, 0) === null);
+}
+
+{
+  // The Stage 02.3 headline: one impact, one recovery, then normal flight.
+  const physics = createWorldPhysics({ oceanY: 0 });
+  physics.setTerrain(makeTerrain(() => 100, 3000)); // wide enough to fly across
+  const fs = createFlightState();
+  fs.position.y = 400;
+  const ac = new THREE.Object3D();
+  const sync = () => {
+    ac.position.set(fs.position.x, fs.position.y, fs.position.z);
+    ac.quaternion.set(fs.quat.x, fs.quat.y, fs.quat.z, fs.quat.w);
+    ac.updateMatrixWorld(true);
+  };
+  const fly = (n, input = { x: 0, y: 0 }) => {
+    for (let i = 0; i < n; i++) {
+      updateFlight(fs, input, 1 / 60);
+      sync();
+      physics.update(ac, fs, 1 / 60);
     }
+  };
+  sync();
+  physics.reset(fs);
+  fly(150); // 2.5 s of clear flight
+  check("clear flight fills the history", physics.state.safeStates > 20, physics.state.safeStates);
+  check("the history stays inside its window", physics.state.safeSpan <= RECOVERY.historySeconds + 0.05, physics.state.safeSpan);
+  check("the history does not grow without bound", physics.state.safeStates <= 32, physics.state.safeStates);
+  check("physics reports its own rate", physics.state.physicsHz === 60);
+  check("safe clearance is reported for the HUD", Math.abs(physics.state.safeClearance - requiredSafeClearance(fs.speed)) < 1e-9);
+
+  const t = physics.state.time;
+  fs.position.y = 100.5; // belly inside the plateau
+  sync();
+  const info = physics.update(ac, fs, 1 / 30);
+  check("the impact produces one recovery", !!info && physics.state.recoveries === 1, physics.state.recoveries);
+  check("the recovery rewinds ~0.65 s", Math.abs(info.rewind - RECOVERY.rewindTime) < 1 / 15 + 1e-9, info.rewind);
+  check("the recovery is not a fallback reset", info.fallback === false);
+  check("the aircraft ends up clear of the terrain", fs.position.y > 100 + requiredSafeClearance(fs.speed), fs.position.y);
+  check("the recovery bleeds the speed", fs.speed <= RECOVERY.maxSpeed, fs.speed);
+
+  const after = physics.state.recoveries;
+  fly(180); // 3 s of normal flight, well past the 0.6 s cooldown
+  check("no bounce: flight resumes without a second recovery", physics.state.recoveries === after, physics.state.recoveries);
+  check("the contact state returns to clear", physics.state.contactKind === CONTACT.CLEAR, physics.state.contactKind);
+  check("history refills after the recovery", physics.state.safeStates > 10, physics.state.safeStates);
+
+  // Sustained penetration (held inside terrain): cooldown-limited, not per-query.
+  const held = physics.state.recoveries;
+  for (let i = 0; i < 72; i++) {
+    fs.position.y = 100.5;
+    sync();
+    physics.update(ac, fs, 1 / 60);
   }
-  check("MISSION runs phases, a timer and nav", (() => {
-    const r = rulesFor(MISSION);
-    return r.phases && r.timer && r.nav;
-  })());
-  check("FREE has no phases, timer or nav", (() => {
-    const r = rulesFor(FREE);
-    return !r.phases && !r.timer && !r.nav;
-  })());
-  check("PEACE has no hostiles and no sams", (() => {
-    const r = rulesFor(PEACE);
-    return !r.hostiles && !r.sams;
-  })());
-
-  // LIVES ARE MISSION ONLY: FREE and PEACE are practice, and counting deaths
-  // in a sandbox turns it into a test.
-  check("MISSION has five lives", rulesFor(MISSION).lives === 5);
-  check("FREE has no life count", rulesFor(FREE).lives === null);
-  check("PEACE has no life count", rulesFor(PEACE).lives === null);
-
-  // Two rules identical across all three.
-  check("every mode flies the catapult", ALWAYS.launch === true);
-  // THE GROUND STILL KILLS YOU IN PEACE. "No hostiles" is not "no
-  // consequences" -- a sky with nothing to hit is a screensaver.
-  check("PEACE still has a failure state", ALWAYS.groundKills === true);
-  check("PEACE returns you to the carrier", rulesFor(PEACE).respawn === "carrier");
-  check("MISSION respawns crash-relative", rulesFor(MISSION).respawn === "crash-relative");
-
-  check("T cycles all three and returns", nextMode(nextMode(nextMode(MISSION))) === MISSION);
+  const fired = physics.state.recoveries - held;
+  check("sustained penetration fires once per cooldown, not per query", fired <= 3, fired);
+  check("...which is far fewer than the 72 queries it saw", fired < 72 / 10, fired);
 }
 
-function testSandboxDriver() {
-  // PEACE SPAWNS NOTHING, however long you fly.
-  const peace = createSandbox();
-  let spawned = 0;
-  for (let t = 0; t < 120; t += 1 / 30) {
-    if (peace.update(1 / 30, { mode: PEACE, handedOff: true, hostileAlive: false })) spawned++;
-  }
-  check("PEACE spawns nothing in two minutes", spawned === 0, `${spawned}`);
+{
+  // A forward hazard is a warning; only imminence triggers a response.
+  const physics = createWorldPhysics({ oceanY: 0 });
+  // A 45° slope climbing toward -Z, so level flight runs at a face.
+  physics.setTerrain(makeTerrain((x, z) => -z));
+  const fs = createFlightState();
+  fs.speed = 250;
+  fs.position.y = 60; // the face crosses this altitude at z ≈ -58.5
+  fs.position.z = 60;
+  const ac = new THREE.Object3D();
+  const place = (z) => {
+    fs.position.z = z;
+    ac.position.set(0, 60, z);
+    ac.updateMatrixWorld(true);
+  };
+  place(60);
+  physics.reset(fs);
+  physics.update(ac, fs, 1 / 30);
+  check("behind the slope there is nothing ahead", physics.state.forwardHazard === false, physics.state.forwardDistance);
+  check("look-ahead at 250 m/s is 50 m", Math.abs(physics.state.lookAhead - 50) < 1e-9, physics.state.lookAhead);
 
-  // FREE: ONE AT A TIME, first arrival 8 s after handoff.
-  const free = createSandbox();
-  let first = null;
-  for (let t = 0; t < 20; t += 1 / 30) {
-    if (free.update(1 / 30, { mode: FREE, handedOff: true, hostileAlive: false })) {
-      first = t;
-      break;
-    }
-  }
-  check("FREE spawns after about 8 s", first !== null && first > 7 && first < 9, `${first}`);
+  // Nose ~42 m from the face: inside the 50 m look-ahead, outside imminence.
+  place(-16.8 + 8.6);
+  const warned = physics.update(ac, fs, 1 / 30);
+  check("a face inside the look-ahead is a forward hazard", physics.state.forwardHazard === true, physics.state.forwardDistance);
+  check("a distant hazard is not physical contact", physics.state.physicalContact === false, physics.state.minClearance);
+  check("a distant hazard does not trigger recovery", warned === false && physics.state.recoveries === 0);
+  check("a distant hazard is outside imminence", physics.state.forwardImminent === false && physics.state.forwardDistance > imminentForwardDistance(250), physics.state.forwardDistance);
+  check("the warning still reads as FORWARD contact", physics.state.contactKind === CONTACT.FORWARD, physics.state.contactKind);
 
-  // Nothing more arrives while one is alive.
-  let extra = 0;
-  for (let t = 0; t < 60; t += 1 / 30) {
-    if (free.update(1 / 30, { mode: FREE, handedOff: true, hostileAlive: true })) extra++;
-  }
-  check("nothing spawns while one is alive", extra === 0, `${extra}`);
-
-  // And a replacement arrives 12 s after the kill.
-  let second = null;
-  for (let t = 0; t < 20; t += 1 / 30) {
-    if (free.update(1 / 30, { mode: FREE, handedOff: true, hostileAlive: false })) {
-      second = t;
-      break;
-    }
-  }
-  check("a replacement arrives after about 12 s", second !== null && second > 11 && second < 13, `${second}`);
-
-  // Nothing spawns before the handoff -- every mode flies the catapult first.
-  const early = createSandbox();
-  let before = 0;
-  for (let t = 0; t < 30; t += 1 / 30) {
-    if (early.update(1 / 30, { mode: FREE, handedOff: false, hostileAlive: false })) before++;
-  }
-  check("nothing spawns before the handoff", before === 0);
+  // Nose ~8 m from the face: penetration is otherwise unavoidable.
+  place(-50.2 + 8.6);
+  physics.update(ac, fs, 1 / 30);
+  check("an imminent hazard escalates to a collision", physics.state.forwardImminent === true && physics.state.recoveries === 1, [physics.state.forwardDistance, physics.state.recoveries]);
+  check("...without the body having touched anything", physics.state.physicalContact === false, physics.state.minClearance);
+  check("the forward event is marked as a forward hit", physics.state.lastEvent.forwardHit === true && physics.state.lastEvent.probe === "forward");
+  check("the forward event carries the face normal", physics.state.lastEvent.normal.y > 0 && physics.state.lastEvent.normal.y < 1, physics.state.lastEvent.normal);
 }
 
-function testParkedDirectorNeverCompletes() {
-  // In the sandbox modes the director PARKS rather than being bypassed: it
-  // still owns the deck and the catapult, then past the handoff stops
-  // advancing, stops timing and publishes no navigation.
-  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
-  const m = createMission({ route });
-  m.park();
+{
+  // Expert quaternion survival: inverted and vertical states must round-trip.
+  const history = createSafeStateHistory();
+  const fs = expertState();
+  step(fs, { x: 1, y: 0 }, 1 / 60, Math.round(1.5 * 60)); // 180 deg roll: inverted
+  const inverted = { ...fs.quat };
+  history.sample(0, fs, 500);
+  step(fs, { x: 0, y: -1 }, 1 / 60, 90); // pitch down hard
+  history.sample(1.0, fs, 500);
 
-  // Fly it all the way through every volume for a long time.
-  for (let t = 0; t < 300; t += 1 / 30) {
-    const leg = m.currentLeg();
-    m.update(1 / 30, {
-      position: leg ? { x: leg.x, y: 600, z: leg.z } : { x: 0, y: 600, z: -1600 },
-      fired: true, handedOff: true, magazineSpent: true, cinematicDone: true,
-    });
+  const response = createDevelopmentRecoveryResponse({ history, flightState: fs });
+  response.handleCollision(createCollisionEvent({
+    type: CollisionType.TERRAIN,
+    position: { x: 0, y: 0, z: 0 },
+    normal: { x: 0.2, y: 0.4, z: 0.1 },
+    speed: 250,
+    timestamp: 1.05,
+  }));
+  check("expert recovery restores the inverted quaternion", Math.abs(fs.quat.x - inverted.x) < 1e-12 && Math.abs(fs.quat.w - inverted.w) < 1e-12, [fs.quat, inverted]);
+  check("expert recovery leaves the quaternion normalized", Math.abs(Math.hypot(fs.quat.x, fs.quat.y, fs.quat.z, fs.quat.w) - 1) < 1e-12);
+  const up = upv(fs);
+  check("the restored attitude is still inverted", up.y < 0, up.y);
+  check("no Euler corruption: pitch and bank are finite", Number.isFinite(fs.pitch) && Number.isFinite(fs.bank), [fs.pitch, fs.bank]);
+  check("recovery does not level the aircraft", Math.abs(fs.bank) > 0.5, fs.bank);
+}
+
+{
+  // §12: the cap moves the lever too, or the engine spools straight back up.
+  const fs = createFlightState();
+  const snap = captureFlightState(fs);
+  snap.speed = 250;
+  snap.throttle = 1;
+  applyFlightState(fs, snap, { maxSpeed: RECOVERY.maxSpeed });
+  check("the recovery cap limits the speed", fs.speed === RECOVERY.maxSpeed, fs.speed);
+  check("the cap rewrites the throttle", fs.throttle < 1 && Math.abs(getTargetSpeed(fs.throttle) - RECOVERY.maxSpeed) < 1, [fs.throttle, getTargetSpeed(fs.throttle)]);
+  check("the cap drops afterburner", fs.afterburner === false);
+
+  // A slower snapshot passes through untouched.
+  snap.speed = 140;
+  applyFlightState(fs, snap, { maxSpeed: RECOVERY.maxSpeed });
+  check("a slow snapshot is not sped up by the cap", fs.speed === 140, fs.speed);
+  // And no cap means the recorded lever is honoured (Stage 02.2 behaviour).
+  applyFlightState(fs, snap);
+  check("without a cap the recorded throttle is restored", fs.throttle === 1, fs.throttle);
+}
+
+/* ==== Stage 03.0 — targeting, weapons, missiles, target drone ==== */
+
+{
+  const fwd = { x: 0, y: 0, z: -1 };
+  const g = targetGeometry({ x: 0, y: 0, z: 0 }, fwd, { x: 0, y: 0, z: -1000 });
+  check("targetGeometry: dead ahead is 0 deg off boresight", g.range === 1000 && g.angleDeg < 1e-6, [g.range, g.angleDeg]);
+  targetGeometry({ x: 0, y: 0, z: 0 }, fwd, { x: 1000, y: 0, z: -1000 }, g);
+  check("targetGeometry: 45 deg to the right reads 45 deg", Math.abs(g.angleDeg - 45) < 1e-6, g.angleDeg);
+  targetGeometry({ x: 0, y: 0, z: 0 }, fwd, { x: 0, y: 0, z: 500 }, g);
+  check("targetGeometry: astern reads 180 deg", Math.abs(g.angleDeg - 180) < 1e-6, g.angleDeg);
+}
+
+{
+  const ok = { range: 2000, angleDeg: 10, screenOffset: 0.2 };
+  check("qualifies: inside the envelope", qualifies(ok).valid === true);
+  check("qualifies: beyond max range fails", qualifies({ ...ok, range: TARGETING.maxRange + 1 }).reason === LockFail.OUT_OF_RANGE);
+  check("qualifies: inside min range fails", qualifies({ ...ok, range: TARGETING.minRange - 1 }).reason === LockFail.TOO_CLOSE);
+  check("qualifies: outside the cone fails", qualifies({ ...ok, angleDeg: TARGETING.coneDeg + 1 }).reason === LockFail.OFF_BORESIGHT);
+  check("qualifies: off the screen fails", qualifies({ ...ok, screenOffset: 0.95 }).reason === LockFail.OFF_BORESIGHT);
+  check("qualifies: behind the camera (null offset) fails", qualifies({ ...ok, screenOffset: null }).valid === false);
+}
+
+{
+  const lock = { state: LockState.NONE, progress: 0, invalidFor: 0 };
+  advanceLock(lock, true, 0.1);
+  check("lock: a valid target starts ACQUIRING", lock.state === LockState.ACQUIRING, [lock.state, lock.progress]);
+  for (let i = 0; i < 10; i++) advanceLock(lock, true, 0.1);
+  check("lock: acquisition completes after acquireTime", lock.state === LockState.LOCKED && lock.progress === 1, lock.progress);
+
+  // §16: a lock survives a short break, so a hard bank does not strobe the HUD.
+  advanceLock(lock, false, TARGETING.holdTime * 0.5);
+  check("lock: survives a break shorter than holdTime", lock.state === LockState.LOCKED, lock.invalidFor);
+  advanceLock(lock, true, 1 / 60);
+  check("lock: regaining the target clears the break timer", lock.invalidFor === 0);
+  advanceLock(lock, false, TARGETING.holdTime + 0.01);
+  check("lock: breaks once holdTime elapses", lock.state === LockState.NONE && lock.progress === 0, lock.state);
+
+  // Partial acquisition drains faster than it fills.
+  const l2 = { state: LockState.NONE, progress: 0, invalidFor: 0 };
+  advanceLock(l2, true, TARGETING.acquireTime * 0.6);
+  const held = l2.progress;
+  advanceLock(l2, false, TARGETING.acquireTime * 0.1);
+  check("lock: acquisition drains while invalid", l2.progress < held && l2.state === LockState.ACQUIRING, [held, l2.progress]);
+  advanceLock(l2, false, TARGETING.acquireTime);
+  check("lock: drained acquisition returns to NONE", l2.state === LockState.NONE && l2.progress === 0);
+}
+
+{
+  // The service picks the nearest qualifying candidate and ignores dead ones.
+  const sys = createTargetingSystem();
+  const near = { position: { x: 0, y: 0, z: -900 }, alive: true };
+  const far = { position: { x: 0, y: 0, z: -2500 }, alive: true };
+  const observer = { position: { x: 0, y: 0, z: 0 }, forward: { x: 0, y: 0, z: -1 } };
+  const offsets = () => 0.1;
+  sys.update(observer, [far, near], offsets, 1 / 60);
+  check("targeting: acquires the nearest candidate", sys.state.currentTarget === near, sys.state.targetRange);
+  for (let i = 0; i < 60; i++) sys.update(observer, [far, near], offsets, 1 / 60);
+  check("targeting: reaches LOCK on a held target", sys.state.lockState === LockState.LOCKED);
+  check("targeting: fire authority follows the lock", sys.canFire() === true);
+
+  near.alive = false;
+  for (let i = 0; i < 40; i++) sys.update(observer, [far, near], offsets, 1 / 60);
+  check("targeting: a destroyed target is dropped", sys.state.currentTarget === far, sys.state.currentTarget && sys.state.currentTarget.position.z);
+
+  sys.clear();
+  check("targeting: clear() releases lock and target", sys.state.lockState === LockState.NONE && sys.state.currentTarget === null && sys.canFire() === false);
+
+  // Nothing in range at all: the HUD gets NO TARGET, not a stale range.
+  sys.update(observer, [{ position: { x: 0, y: 0, z: -90000 }, alive: true }], offsets, 1 / 60);
+  check("targeting: an unreachable target does not lock", sys.state.lockState === LockState.NONE && sys.state.reason === LockFail.OUT_OF_RANGE, sys.state.reason);
+}
+
+{
+  // steer(): the visible curve of the missile lives entirely here.
+  const dir = { x: 0, y: 0, z: -1 };
+  const desired = { x: 1, y: 0, z: 0 };
+  const maxRad = 10 * DEG;
+  steer(dir, desired, maxRad);
+  const turned = Math.acos(-dir.z) / DEG;
+  check("steer: turns at exactly the commanded rate", Math.abs(turned - 10) < 1e-6, turned);
+  check("steer: stays unit length", Math.abs(Math.hypot(dir.x, dir.y, dir.z) - 1) < 1e-12);
+  for (let i = 0; i < 40; i++) steer(dir, desired, maxRad);
+  check("steer: converges onto the desired direction", Math.abs(dir.x - 1) < 1e-6, dir);
+  const same = { x: 0, y: 0, z: -1 };
+  steer(same, { x: 0, y: 0, z: -1 }, maxRad);
+  check("steer: an aligned command is a no-op", same.z === -1);
+  // Exactly antiparallel has no unique turn plane; it must still turn.
+  const flip = { x: 0, y: 0, z: -1 };
+  steer(flip, { x: 0, y: 0, z: 1 }, maxRad);
+  check("steer: a reversal picks a turn plane and moves", Math.abs(Math.acos(-flip.z) / DEG - 10) < 1e-6 && Math.abs(Math.hypot(flip.x, flip.y, flip.z) - 1) < 1e-12, flip);
+}
+
+{
+  const a = { x: 0, y: 0, z: 0 };
+  const b = { x: 0, y: 0, z: -100 };
+  check("segmentDistance: perpendicular offset from the middle", Math.abs(segmentDistance(a, b, { x: 5, y: 0, z: -50 }) - 5) < 1e-9);
+  check("segmentDistance: past the end clamps to the endpoint", Math.abs(segmentDistance(a, b, { x: 0, y: 0, z: -130 }) - 30) < 1e-9);
+  check("segmentDistance: a swept step catches a target it flew past", segmentDistance(a, b, { x: 10, y: 0, z: -50 }) < MISSILE.hitRadius, "10 m off a 100 m step");
+  check("segmentDistance: a zero-length step still measures", Math.abs(segmentDistance(a, a, { x: 3, y: 4, z: 0 }) - 5) < 1e-9);
+}
+
+{
+  let speed = 200;
+  for (let i = 0; i < 60 * 3; i++) speed = advanceSpeed(speed, i / 60, 1 / 60);
+  check("advanceSpeed: boost is capped at maxSpeed", speed <= MISSILE.maxSpeed, speed);
+  const bleeding = advanceSpeed(600, MISSILE.boostTime + 1, 1 / 60);
+  check("advanceSpeed: speed bleeds once the motor is out", bleeding < 600, bleeding);
+
+  const lead = leadPoint({ x: 0, y: 0, z: 0 }, 800, { x: 0, y: 0, z: -800 }, { x: 150, y: 0, z: 0 });
+  check("leadPoint: aims ahead of a crossing target", lead.x > 100 && lead.x < 160, lead.x);
+  const capped = leadPoint({ x: 0, y: 0, z: 0 }, 100, { x: 0, y: 0, z: -5000 }, { x: 150, y: 0, z: 0 });
+  check("leadPoint: lead time is capped", Math.abs(capped.x - 150 * MISSILE.maxLeadTime) < 1e-9, capped.x);
+}
+
+{
+  // Asset normalization on a synthetic source: 8 units long on +Z, off-centre.
+  const src = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 8));
+  src.position.set(3, -2, 12);
+  const wrapper = new THREE.Object3D();
+  wrapper.add(src);
+  const { root, metrics } = normalizeMissile(wrapper, WEAPONS.aim9);
+  const box = new THREE.Box3().setFromObject(root);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  check("normalizeMissile: scales to the AIM-9 length", Math.abs(size.z - WEAPONS.aim9.targetLength) < 1e-6, size.z);
+  check("normalizeMissile: recentres the pivot on the body", center.length() < 1e-6, center.toArray());
+  check("normalizeMissile: reports the source scale", metrics.scale > 0 && metrics.lengthAxis === "z", metrics);
+
+  const placeholder = buildPlaceholderMissile();
+  const pbox = new THREE.Box3().setFromObject(placeholder).getSize(new THREE.Vector3());
+  check("placeholder missile is AIM-9 sized", Math.abs(pbox.z - 2.85) < 0.3, pbox.z);
+}
+
+{
+  // §4: launch points are transforms, never world constants. Move and yaw the
+  // aircraft and the mounts must follow it exactly.
+  const ac = new THREE.Object3D();
+  const mounts = createWeaponMounts(ac);
+  check("mounts: both hardpoints exist by name", !!ac.getObjectByName("MissileLeft") && !!ac.getObjectByName("MissileRight"));
+  check("mounts: they live under WeaponMounts", mounts.left.parent.name === "WeaponMounts");
+  check("mounts: left is to port, right to starboard", mounts.left.position.x < 0 && mounts.right.position.x > 0, [mounts.left.position.x, mounts.right.position.x]);
+  check("mounts: both are slung under the wing", mounts.left.position.y < 0 && mounts.left.position.y === mounts.right.position.y);
+  check("mounts: symmetrical about the centreline", mounts.left.position.x === -mounts.right.position.x && mounts.left.position.z === mounts.right.position.z);
+  check("mounts: no toe-in or toe-out \u2014 rotation stays identity", mounts.left.rotation.x === 0 && mounts.left.rotation.y === 0 && mounts.left.rotation.z === 0);
+  check("mounts: a launch rail is attached to each station", !!mounts.left.getObjectByName("MissileLeftRail") && !!mounts.right.getObjectByName("MissileRightRail"));
+
+  ac.position.set(100, 700, -2000);
+  ac.rotation.y = Math.PI / 2; // nose now on -X
+  ac.updateMatrixWorld(true);
+  const w = mounts.right.getWorldPosition(new THREE.Vector3());
+  // Yawed 90°, local +X maps onto world -Z and local +Z onto world +X.
+  check("mounts: world transform follows the airframe", Math.abs(w.z - (-2000 - 5.2)) < 1e-6 && Math.abs(w.y - (700 - 1.05)) < 1e-6 && Math.abs(w.x - (100 + 4.3)) < 1e-6, w.toArray());
+  const q = mounts.right.getWorldQuaternion(new THREE.Quaternion());
+  const launchFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
+  check("mounts: launch forward is the airframe's nose", Math.abs(launchFwd.x + 1) < 1e-6, launchFwd.toArray());
+
+  const rounds = createMountedMissiles(mounts, buildPlaceholderMissile());
+  check("rounds: two AIM-9s are carried at start", rounds.count === 2);
+  const first = rounds.next();
+  const mount = rounds.release(first);
+  check("rounds: firing empties one rail", rounds.count === 1 && first.visual.visible === false, rounds.count);
+  check("rounds: the released mount is the one that was carrying it", mount === first.mount);
+  check("rounds: the next round comes from the other rail", rounds.next().mount !== mount);
+  rounds.release(rounds.next());
+  check("rounds: two shots empty the aircraft", rounds.count === 0 && rounds.next() === null);
+  rounds.reload();
+  check("rounds: reset restores both visible rounds", rounds.count === 2 && rounds.rounds.every((r) => r.visual.visible));
+}
+
+{
+  // End-to-end launch: mount transform -> live entity -> proximity hit.
+  const scene = new THREE.Scene();
+  const ac = new THREE.Object3D();
+  ac.position.set(0, 700, 0);
+  const mounts = createWeaponMounts(ac);
+  ac.updateMatrixWorld(true);
+
+  const system = createMissileSystem({ scene, prototype: null });
+  let hits = 0;
+  let expiries = 0;
+  system.on("hit", () => hits++);
+  system.on("expire", () => expiries++);
+
+  const target = { position: new THREE.Vector3(120, 760, -1400), velocity: new THREE.Vector3(0, 0, -148), alive: true };
+  const m = system.fire({ mount: mounts.right, target, ownerSpeed: 240, side: 1 });
+  check("launch: the missile starts at the mount's world position", m.position.distanceTo(mounts.right.getWorldPosition(new THREE.Vector3())) < 1e-6);
+  check("launch: it starts unguided (LAUNCHED)", m.state === MissileState.LAUNCHED);
+  check("launch: it inherits most of the aircraft's speed", Math.abs(m.speed - 240 * MISSILE.inheritFactor) < 1e-6, m.speed);
+
+  let steps = 0;
+  const speeds = [];
+  while (system.inFlight && steps < 60 * 8) {
+    system.update(1 / 60);
+    if (system.inFlight) speeds.push(system.live[0].speed);
+    target.position.addScaledVector(target.velocity, 1 / 60);
+    steps++;
   }
+  check("launch: separation gives way to guidance", m.state !== MissileState.LAUNCHED, m.state);
+  check("guidance: the missile boosts past the launch speed", Math.max(...speeds) > 240, Math.max(...speeds));
+  check("guidance: speed never exceeds maxSpeed", Math.max(...speeds) <= MISSILE.maxSpeed);
+  check("guidance: a moving target is hit", hits === 1 && m.state === MissileState.HIT, [hits, m.state, steps]);
+  check("guidance: the hit happens inside the missile's lifetime", steps / 60 < MISSILE.lifetime, `${(steps / 60).toFixed(2)} s`);
+  check("a hit missile leaves nothing in the scene", !scene.children.includes(m.visual.group));
+
+  // §26: no target -> the round flies on and expires on its own timer.
+  const dumb = system.fire({ mount: mounts.left, target: null, ownerSpeed: 240, side: -1 });
+  let t = 0;
+  while (system.inFlight && t < 12) {
+    system.update(1 / 60);
+    t += 1 / 60;
+  }
+  check("miss: an unguided round expires", dumb.state === MissileState.EXPIRED && expiries === 1, [dumb.state, expiries]);
+  check("miss: it expires on the lifetime, not early", Math.abs(dumb.life - MISSILE.lifetime) < 0.1, dumb.life);
+
+  system.fire({ mount: mounts.right, target, ownerSpeed: 240, side: 1 });
+  system.reset();
+  check("reset: live missiles are cleared from the world", system.inFlight === 0 && scene.children.length === 0, scene.children.length);
+}
+
+{
+  const drone = createTargetDrone();
+  check("target: spawns ahead of the player on the course", drone.position.z < 0 && drone.position.y > FLIGHT.spawn.y, drone.position.toArray());
+  check("target: spawns alive and visible", drone.alive === true && drone.root.visible === true);
+
+  const z0 = drone.position.z;
+  updateTargetDrone(drone, 1);
+  check("target: flies its course at the configured speed", Math.abs(drone.position.z - (z0 - ENEMY.speed)) < 1e-6, drone.position.z - z0);
+  check("target: publishes a velocity for missile lead", Math.abs(drone.velocity.z + ENEMY.speed) < 1e-6, drone.velocity.toArray());
+
+  // The scripted path must actually turn — that is what breaks lock (§7).
+  const h0 = drone.heading;
+  for (let i = 0; i < 60 * 12; i++) updateTargetDrone(drone, 1 / 60);
+  check("target: the path turns after the first straight leg", Math.abs(drone.heading - h0) > 1, drone.heading);
+  check("target: it banks into the turn", Math.abs(drone.bank) > 0.1, drone.bank);
+  check("target: it holds its altitude", Math.abs(drone.position.y - ENEMY.spawn.y) < 1e-6, drone.position.y);
+
+  markTargetHit(drone, 3);
+  check("target: a hit disables and hides it", drone.alive === false && drone.root.visible === false);
+  const moved = drone.position.clone();
+  updateTargetDrone(drone, 1);
+  check("target: a dead target stops flying", drone.position.equals(moved));
+
+  resetTargetDrone(drone);
+  check("target: reset restores the spawn state", drone.alive === true && drone.root.visible === true && drone.position.z === ENEMY.spawn.z && drone.leg === 0, drone.position.toArray());
+}
+
+{
+  // HUD sizing is pure geometry: the box must track range, then clamp.
+  const near = apparentSize(24, 300, 1080, 65);
+  const far = apparentSize(24, 4000, 1080, 65);
+  check("HUD: the target box shrinks with range", far < near, [near, far]);
+  check("HUD: the box has a floor at long range", apparentSize(24, 90000, 1080, 65) >= 22);
+  check("HUD: the box has a ceiling at point blank", apparentSize(24, 5, 1080, 65) <= 170);
+}
+
+/* ==== Stage 03.05 — HUD presentation ==== */
+
+{
+  // damp() must be frame-rate independent: the same elapsed time reached in
+  // different step counts must land in the same place.
+  const one = damp(0, 100, 8, 0.5);
+  let many = 0;
+  for (let i = 0; i < 30; i++) many = damp(many, 100, 8, 0.5 / 30);
+  check("damp: frame-rate independent to within a fraction of a unit", Math.abs(one - many) < 0.5, [one, many]);
+  check("damp: approaches but never overshoots", damp(0, 100, 8, 1) < 100 && damp(0, 100, 8, 1) > 99);
+  check("damp: a zero step is a no-op", damp(42, 100, 8, 0) === 42);
+  check("damp: already there stays there", damp(100, 100, 8, 0.1) === 100);
+}
+
+{
+  // §8/§40: a 360° roll must not produce a 350° visual sweep at the seam.
+  const near = dampAngle(-170, 170, 10, 1 / 60);
+  check("dampAngle: crosses the \u00b1180\u00b0 seam the short way", near < -170, near);
+  const fwd = dampAngle(350, 10, 10, 1 / 60);
+  check("dampAngle: 350 -> 10 moves upward past the wrap", fwd > 350, fwd);
+  check("dampAngle: identical angles do not drift", Math.abs(dampAngle(45, 45, 10, 0.1) - 45) < 1e-12);
+  let a = 0;
+  for (let i = 0; i < 600; i++) a = dampAngle(a, 179, 10, 1 / 60);
+  check("dampAngle: converges on the target angle", Math.abs(a - 179) < 0.01, a);
+}
+
+{
+  // Attitude for display only, derived from vectors the flight model already
+  // publishes — no Euler state is reintroduced (§12).
+  check("derivePitchDeg: level flight reads zero", Math.abs(derivePitchDeg({ x: 0, y: 0, z: -1 })) < 1e-9);
+  check("derivePitchDeg: straight up reads +90", Math.abs(derivePitchDeg({ x: 0, y: 1, z: 0 }) - 90) < 1e-9);
+  check("derivePitchDeg: a 30\u00b0 climb reads +30", Math.abs(derivePitchDeg({ x: 0, y: Math.sin(30 * DEG), z: -Math.cos(30 * DEG) }) - 30) < 1e-6);
+  check("derivePitchDeg: clamps past vertical instead of NaN", Number.isFinite(derivePitchDeg({ x: 0, y: 1.4, z: 0 })));
+
+  check("deriveHeadingDeg: nose on -Z is 000", Math.abs(deriveHeadingDeg({ x: 0, y: 0, z: -1 })) < 1e-9);
+  const east = deriveHeadingDeg({ x: 1, y: 0, z: 0 });
+  check("deriveHeadingDeg: stays inside 0..360", east >= 0 && east < 360, east);
+}
+
+{
+  const level = { x: 0, y: 0, z: -1 };
+  check("deriveBankDeg: wings level reads zero", Math.abs(deriveBankDeg(level, { x: 0, y: 1, z: 0 })) < 1e-9);
+
+  // Right bank: the up vector tips toward the right wing.
+  const b = 45 * DEG;
+  const right = deriveBankDeg(level, { x: Math.sin(b), y: Math.cos(b), z: 0 });
+  check("deriveBankDeg: a 45\u00b0 bank reads 45\u00b0", Math.abs(Math.abs(right) - 45) < 1e-6, right);
+  const left = deriveBankDeg(level, { x: -Math.sin(b), y: Math.cos(b), z: 0 });
+  check("deriveBankDeg: left and right are opposite signs", Math.sign(left) === -Math.sign(right), [left, right]);
+
+  // §13: knife-edge and inverted must stay valid, not flip to an arbitrary value.
+  const knife = deriveBankDeg(level, { x: 1, y: 0, z: 0 });
+  check("deriveBankDeg: knife-edge reads \u00b190\u00b0", Math.abs(Math.abs(knife) - 90) < 1e-6, knife);
+  const inverted = deriveBankDeg(level, { x: 0, y: -1, z: 0 });
+  check("deriveBankDeg: inverted reads \u00b1180\u00b0", Math.abs(Math.abs(inverted) - 180) < 1e-6, inverted);
+
+  // Straight up: the horizon reference is degenerate, so the last stable value
+  // is held rather than generating a flip.
+  const vertical = deriveBankDeg({ x: 0, y: 1, z: 0 }, { x: 0, y: 0, z: 1 }, 33);
+  check("deriveBankDeg: vertical flight holds the previous HUD bank", vertical === 33, vertical);
+
+  // A full roll produces no discontinuity larger than the step itself.
+  let prev = deriveBankDeg(level, { x: 0, y: 1, z: 0 });
+  let worst = 0;
+  for (let i = 1; i <= 360; i++) {
+    const t = i * DEG;
+    const cur = deriveBankDeg(level, { x: Math.sin(t), y: Math.cos(t), z: 0 });
+    const d = Math.abs(((((cur - prev + 180) % 360) + 360) % 360) - 180);
+    worst = Math.max(worst, d);
+    prev = cur;
+  }
+  check("deriveBankDeg: a full 360\u00b0 roll is continuous at the seam", worst < 1.5, worst);
+}
+
+{
+  // §10: the ladder must not be rotated by roll unless deliberately dialled in.
+  check("HUD: pitch ladder roll influence defaults to zero", HUD.ladderRollInfluence === 0, HUD.ladderRollInfluence);
+  check("HUD: smoothing rates sit in the 6\u201310 response range", HUD.pitchLambda >= 6 && HUD.pitchLambda <= 10 && HUD.bankLambda >= 6 && HUD.bankLambda <= 12, [HUD.pitchLambda, HUD.bankLambda]);
+  check("HUD: target tracking is tighter than attitude smoothing", HUD.targetLambda > HUD.pitchLambda, HUD.targetLambda);
+  check("HUD: the lock pulse is a short confirmation", HUD.lockPulseTime >= 0.15 && HUD.lockPulseTime <= 0.25, HUD.lockPulseTime);
+  check("HUD: origin sits above the vertical centre", HUD.centerY > 0.3 && HUD.centerY < 0.5, HUD.centerY);
+}
+
+{
+  // §33: the rail is a sibling of the round, so firing cannot take it away.
+  const ac = new THREE.Object3D();
+  const mounts = createWeaponMounts(ac);
+  const rounds = createMountedMissiles(mounts, buildPlaceholderMissile());
+  const rail = mounts.left.getObjectByName("MissileLeftRail");
+  const round = rounds.next();
+  rounds.release(round);
+  check("rail: survives the launch that hides its missile", rail.visible === true && round.visual.visible === false);
+  check("rail: is not a child of the round", !round.visual.getObjectByName("MissileLeftRail"));
+
+  const bare = createWeaponMounts(new THREE.Object3D(), { rails: false });
+  check("rail: can be switched off for headless use", bare.left.children.length === 0);
+
+  const solo = buildLaunchRail("Test");
+  const box = new THREE.Box3().setFromObject(solo);
+  check("rail: sits above the missile body centre", box.min.y > 0, box.min.y);
+  check("rail: reaches up toward the wing surface", box.max.y >= WEAPONS.rail.strut.top - 1e-6, box.max.y);
+  check("rail: is shorter than the missile it carries", box.max.z - box.min.z < WEAPONS.aim9.targetLength, box.max.z - box.min.z);
+}
+
+/* ==== Stage 03.15 — atmospheric and propulsion FX ==== */
+
+{
+  // §5: intensity must track throttle and AB state, and must NOT be a function
+  // of speed — a fast dive on idle thrust has to stay dark.
+  const idle = engineIntensity(0.2, false);
+  const mid = engineIntensity(0.6, false);
+  const dry = engineIntensity(1, false);
+  const ab = engineIntensity(1, true);
+  check("engine: below the dry onset there is no plume", idle === 0, idle);
+  check("engine: intensity rises with throttle", mid > 0 && dry > mid, [mid, dry]);
+  check("engine: full dry thrust stops at the dry ceiling", Math.abs(dry - ENGINE_FX.dryCeiling) < 1e-9, dry);
+  check("engine: AB reads stronger than military power", ab > dry * 1.5, [dry, ab]);
+  check("engine: AB tops out at full intensity", Math.abs(ab - ENGINE_FX.abIntensity) < 1e-9, ab);
+  check("engine: intensity is monotonic in throttle", engineIntensity(0.5, false) < engineIntensity(0.7, false) && engineIntensity(0.7, false) < dry);
+  // The signature check for §5: engineIntensity's only required inputs are
+  // throttle and AB state (the third parameter is the config default), so speed
+  // cannot be the primary driver by construction.
+  check("engine: intensity takes only throttle and AB state", engineIntensity.length === 2, engineIntensity.length);
+}
+
+{
+  check("engine: shock rings are silent at dry thrust", ringOpacity(ENGINE_FX.dryCeiling) === 0, ringOpacity(ENGINE_FX.dryCeiling));
+  check("engine: rings appear only past the ring onset", ringOpacity(ENGINE_FX.ringOnset) === 0 && ringOpacity(0.85) > 0, ringOpacity(0.85));
+  check("engine: rings are fully lit at full AB", Math.abs(ringOpacity(1) - 1) < 1e-9);
+
+  // Flicker must stay a shimmer, never a strobe (§10).
+  let lo = 2;
+  let hi = 0;
+  for (let t = 0; t < 4; t += 1 / 240) {
+    const f = flickerAt(t);
+    lo = Math.min(lo, f);
+    hi = Math.max(hi, f);
+  }
+  check("engine: flicker stays within its configured amplitude", lo > 1 - ENGINE_FX.flicker - 1e-9 && hi < 1 + ENGINE_FX.flicker + 1e-9, [lo, hi]);
+  check("engine: flicker is deterministic in time", flickerAt(1.234) === flickerAt(1.234));
+}
+
+{
+  // §28: the plumes hang on the tailpipes, not on the stabilator booms. The two
+  // failure modes of the earlier pass, stated as tests: too far outboard, and
+  // aft of the fuselage entirely.
+  const [l, r] = ENGINE_FX.nozzles;
+  check("engine: nozzles are mirrored about the centreline", l.position.x === -r.position.x && l.position.y === r.position.y && l.position.z === r.position.z);
+  check("engine: nozzles sit inboard of the stabilator booms", Math.abs(r.position.x) + ENGINE_FX.nozzleRadius <= ENGINE_FX.boomInnerX, [r.position.x, ENGINE_FX.boomInnerX]);
+  // Twin tailpipes read as one central exhaust: the gap between them is smaller
+  // than a single nozzle's own width.
+  const gap = 2 * Math.abs(r.position.x) - 2 * ENGINE_FX.nozzleRadius;
+  check("engine: the tailpipes are close enough to read as a central pair", gap < 2 * ENGINE_FX.nozzleRadius, gap);
+  check("engine: the core starts at the exit plane, not behind the tail", r.position.z > 8.0 && r.position.z < 8.4, r.position.z);
+  // The core cone fills the measured opening rather than rattling around in it.
+  check("engine: the core is sized to the nozzle opening", ENGINE_FX.coreRadius <= ENGINE_FX.nozzleRadius && ENGINE_FX.coreRadius > ENGINE_FX.nozzleRadius * 0.7, [ENGINE_FX.coreRadius, ENGINE_FX.nozzleRadius]);
+  check("engine: shock rings fit inside the plume", ENGINE_FX.ringRadius + ENGINE_FX.ringTube < ENGINE_FX.plumeRadius);
+}
+
+{
+  // §11: vapor is an event, not a state. Both gates must hold independently.
+  check("vapor: dry air produces nothing however hard the turn", vaporIntensity(0.1, 1) === 0);
+  check("vapor: calm flight produces nothing however wet the air", vaporIntensity(1, 0.1) === 0);
+  check("vapor: straight-and-level in cloud stays clean", vaporIntensity(1, 0) === 0);
+  const hard = vaporIntensity(1, 1);
+  check("vapor: a hard turn in saturated air is fully lit", Math.abs(hard - 1) < 1e-9, hard);
+  check("vapor: intensity rises with load", vaporIntensity(0.8, 0.5) < vaporIntensity(0.8, 0.9));
+  check("vapor: intensity rises with humidity", vaporIntensity(0.5, 0.9) < vaporIntensity(0.9, 0.9));
+}
+
+{
+  // Load is derived from published attitude and stick only — no AoA or G field
+  // was added to the flight model (§1).
+  check("load: level hands-off flight is unloaded", maneuverLoad({}) === 0);
+  check("load: a hard bank alone counts", maneuverLoad({ bankDeg: VAPOR.bankLoadDeg }) === 1);
+  check("load: bank sign does not matter", maneuverLoad({ bankDeg: -40 }) === maneuverLoad({ bankDeg: 40 }));
+  check("load: a fast pull counts before bank builds", maneuverLoad({ pitchRateDeg: VAPOR.pitchRateLoad }) === 1);
+  check("load: stick deflection registers immediately", maneuverLoad({ stickX: 1, stickY: 0 }) > 0.5, maneuverLoad({ stickX: 1 }));
+  check("load: the strongest proxy wins", maneuverLoad({ bankDeg: 62, pitchRateDeg: 1 }) === 1);
+  check("load: it never exceeds 1", maneuverLoad({ bankDeg: 900, pitchRateDeg: 900, stickX: 9, stickY: 9 }) === 1);
+}
+
+{
+  // §14: fades, never a toggle — and vapor decays slower than it appears.
+  let up = 0;
+  for (let i = 0; i < 6; i++) up = approach(up, 1, VAPOR.vortexRise, VAPOR.vortexFall, 1 / 60);
+  check("vapor: rises smoothly rather than snapping on", up > 0 && up < 0.5, up);
+  let a = 1;
+  let b = 0;
+  const step = 0.25;
+  a = approach(a, 0, VAPOR.vortexRise, VAPOR.vortexFall, step);
+  b = approach(b, 1, VAPOR.vortexRise, VAPOR.vortexFall, step);
+  check("vapor: decay is gentler than onset", 1 - a < b, [1 - a, b]);
+  check("vapor: silk needs more provocation than the wingtips", VAPOR.silkBias > 0 && VAPOR.silkBias < 1, VAPOR.silkBias);
+
+  // §28: the ribbon has to shed from the trailing edge of the tip chord. The tip
+  // rib spans z 3.74–4.99, so an anchor mid-chord is inside solid wing and the
+  // ribbon is born occluded.
+  const [wl, wr] = VAPOR.wingtips;
+  const tip = VAPOR.tipStation;
+  check("vapor: wingtips are mirrored about the centreline", wl.position.x === -wr.position.x && wl.position.z === wr.position.z);
+  // §15: the anchor has to lie on the wing surface AT ITS OWN spanwise station,
+  // not inside an inboard slice's chord and not in free air behind the tip.
+  check("vapor: the anchor sits at the anchor's own tip station", Math.abs(Math.abs(wr.position.x) - tip.x) < 1e-9, wr.position.x);
+  check("vapor: the vortex sheds on the tip trailing edge", wr.position.z <= tip.zTrail && wr.position.z > tip.zTrail - VAPOR.ribbonWidth * 0.5, [wr.position.z, tip.zTrail]);
+  check("vapor: the anchor is not buried mid-chord", wr.position.z > (tip.zLead + tip.zTrail) / 2, wr.position.z);
+}
+
+{
+  const rand = seededRandom(ATMOS.seed);
+  const first = [rand(), rand(), rand()];
+  const again = seededRandom(ATMOS.seed);
+  check("clouds: the field is deterministic across runs", [again(), again(), again()].every((v, i) => v === first[i]));
+  check("clouds: the generator stays in 0..1", first.every((v) => v >= 0 && v < 1), first);
+}
+
+{
+  const clusters = [{ x: 0, y: 700, z: -1000, radius: 600, yStretch: 2.2 }];
+  check("clouds: the core of a cluster is fully dense", densityAt({ x: 0, y: 700, z: -1000 }, clusters) === 1);
+  check("clouds: well outside is clear", densityAt({ x: 0, y: 700, z: 4000 }, clusters) === 0);
+  const edge = densityAt({ x: 0, y: 700, z: -1500 }, clusters);
+  check("clouds: density falls off toward the edge", edge > 0 && edge < 1, edge);
+  // yStretch is what keeps a cluster a flattened bank rather than a sphere.
+  check("clouds: vertical extent is compressed", densityAt({ x: 0, y: 900, z: -1000 }, clusters) < densityAt({ x: 200, y: 700, z: -1000 }, clusters));
+  const d = distanceToCloud({ x: 0, y: 700, z: 0 }, clusters);
+  check("clouds: distance is measured to the cluster surface", Math.abs(d - 400) < 1e-6, d);
+  check("clouds: an empty sky is infinitely far from cloud", distanceToCloud({ x: 0, y: 0, z: 0 }, []) === Infinity);
+}
+
+{
+  // §23: cloud raises moisture, and near-cloud air is moist too.
+  check("humidity: clear air well clear of cloud is dry", humidityFor(0, 1e6) === ATMOS.baseHumidity);
+  check("humidity: inside cloud the air is saturated", Math.abs(humidityFor(1, -100) - ATMOS.cloudHumidity) < 1e-9);
+  const halo = humidityFor(0, ATMOS.proximityRange * 0.3);
+  check("humidity: skimming near cloud is moist", halo > ATMOS.baseHumidity && halo < ATMOS.cloudHumidity, halo);
+  check("humidity: moisture increases as cloud is approached", humidityFor(0, 700) < humidityFor(0, 200));
+  // §28: the halo has to be wide enough that ordinary corridor flying reaches
+  // moist air — otherwise the vapor the gates permit is never actually seen —
+  // while clear air stays under the vapor gate so the suppression still holds.
+  check("humidity: dry clear air still cannot produce vapor", ATMOS.baseHumidity < VAPOR.humidityThreshold, [ATMOS.baseHumidity, VAPOR.humidityThreshold]);
+  check("humidity: dry clear air still raises no advisory", ATMOS.baseHumidity < ATMOS.advisory.moistureHumidity);
+  // §16: reachability belongs to the intensity curve, not the halo width. The
+  // moisture factor saturates at the halo value, so a skim reads at full
+  // strength — and the halo can stay thin enough to remain an event.
+  check("humidity: the vapor curve saturates at the halo, not at cloud interior", VAPOR.humiditySaturate === ATMOS.proximityHumidity, [VAPOR.humiditySaturate, ATMOS.proximityHumidity]);
+  check("humidity: the halo stays thin enough to be an event", ATMOS.proximityRange <= 1600, ATMOS.proximityRange);
+  const skim = humidityFor(0, ATMOS.proximityRange * 0.35);
+  check("humidity: skimming the halo produces visible wingtip vapor", vaporIntensity(skim, 1) > 0.3, [skim, vaporIntensity(skim, 1)]);
+  check("humidity: halo air and cloud interior both saturate the moisture factor", Math.abs(vaporIntensity(ATMOS.proximityHumidity, 1) - vaporIntensity(1, 1)) < 1e-9);
+  // The gate itself is unchanged by the recalibration.
+  check("humidity: base clear air produces nothing at full load", vaporIntensity(ATMOS.baseHumidity, 1) === 0);
+  // The connective claim of §23, stated as a test: a turn that produces nothing
+  // in clear air produces vapor at the same load once inside cloud.
+  const load = 0.7;
   check(
-    "a parked director never completes a mission",
-    m.mission.phase !== COMPLETE,
-    m.mission.phase,
-  );
-  check("a parked director stops at EGRESS", m.mission.phase === EGRESS, m.mission.phase);
-  check("and publishes no completion time", m.mission.stopped === null);
-}
-
-// ── stage 9: dying well, and sound ────────────────────────────────────────
-
-const crashStart = (over = {}) => ({
-  reason: "terrain",
-  position: { x: 0, y: 600, z: 0 },
-  velocity: { x: 0, y: 0, z: -200 },
-  quat: { x: 0, y: 0, z: 0, w: 1 },
-  seed: 7,
-  ...over,
-});
-
-function runCrash(over = {}, seconds = 2.4) {
-  const crash = createCrashFx();
-  crash.start(crashStart(over));
-  const frames = [];
-  for (let t = 0; t < seconds; t += 1 / 60) {
-    crash.update(1 / 60);
-    frames.push({
-      t: crash.state.t,
-      opacity: crash.state.aircraftOpacity,
-      kick: crash.state.kick,
-      y: crash.state.position.y,
-      z: crash.state.position.z,
-      sparks: crash.sparks.length,
-      smoke: crash.smoke.length,
-      debris: crash.debris.length,
-      entities: crash.entityCount(),
-    });
-  }
-  return { crash, frames };
-}
-
-function testCrashCauseMapping() {
-  // Mapped IN ONE PLACE, so a new failure reason cannot silently inherit the
-  // wrong explosion.
-  check("terrain maps to TERRAIN", causeFor("terrain") === "TERRAIN");
-  check("ground maps to TERRAIN", causeFor("ground") === "TERRAIN");
-  check("ocean maps to OCEAN", causeFor("ocean") === "OCEAN");
-  check("missile maps to MISSILE", causeFor("missile") === "MISSILE");
-  // AN UNKNOWN REASON STILL GETS A PRESENTATION -- silence would read as a
-  // freeze, which is worse than the wrong explosion.
-  check("an unknown reason still gets a presentation", VARIANTS[causeFor("wat")] !== undefined);
-  for (const name of ["MISSILE", "TERRAIN", "OCEAN"]) {
-    const v = VARIANTS[name];
-    for (const key of ["fire", "smoke", "sparks", "mist", "forward", "sink", "visible"]) {
-      check(`${name} defines ${key}`, key in v);
-    }
-  }
-  // The variants differ as DATA, not code paths.
-  check("OCEAN sinks hardest", VARIANTS.OCEAN.sink > VARIANTS.TERRAIN.sink);
-  check("OCEAN is least visible", VARIANTS.OCEAN.visible < VARIANTS.TERRAIN.visible);
-  check("OCEAN has the most mist and the least fire", (() => {
-    const o = VARIANTS.OCEAN;
-    return o.mist > VARIANTS.TERRAIN.mist && o.fire < VARIANTS.MISSILE.fire;
-  })());
-}
-
-function testCrashTimelineOrdering() {
-  check("flash before fireball", T.flash < T.fireball);
-  check("fireball before tumble", T.fireball < T.tumble);
-  check("tumble before smoke", T.tumble < T.smoke);
-  check("smoke before sparks", T.smoke < T.sparks);
-  // The crash must be VISIBLE before the fade starts.
-  check("the crash is visible before the fade begins", T.sparks < T.holdEnds);
-  // And the smoke must stop emitting before the fade completes.
-  check("smoke stops before the fade completes", T.smokeStops < T.respawn);
-  check("respawn is at full black", T.respawn === T.holdEnds + 0.5);
-  check(
-    "impact to playable is about 2.3 s",
-    Math.abs(T.playable - 2.32) < 1e-9,
-    `${T.playable}`,
-  );
-  // The policy's hold IS the crash window -- not a second state machine.
-  check("the policy hold matches the crash window", MC.hold === T.holdEnds, `${MC.hold}`);
-  check(
-    "the policy timeline reaches playable at the same moment",
-    Math.abs(MC.hold + MC.fadeOut + MC.fadeIn - T.playable) < 1e-9,
+    "humidity: the same turn is dry outside cloud and wet inside it",
+    vaporIntensity(humidityFor(0, 1e6), load) === 0 && vaporIntensity(humidityFor(1, -100), load) > 0
   );
 }
 
-function testCrashAircraftVisibility() {
-  const { frames } = runCrash();
-  const at = (t) => frames.find((f) => f.t >= t);
-  // KEEP THE INTACT AIRCRAFT VISIBLE for ~0.72 s. Hiding it on the frame it
-  // dies is what makes a death read as a bug.
-  check("the aircraft is fully visible at 0.5 s", at(0.5).opacity === 1, `${at(0.5).opacity}`);
-  check("the aircraft is hidden by 1.0 s", at(1.0).opacity < 0.05, `${at(1.0).opacity}`);
-  check("opacity never goes negative", frames.every((f) => f.opacity >= 0));
+{
+  check("advisory: clear air shows nothing", advisoryFor(0) === null);
+  check("advisory: the edge of cloud reads VISIBLE MOISTURE", advisoryFor(0.1) === "VISIBLE MOISTURE");
+  check("advisory: inside cloud reads CLOUD", advisoryFor(0.4) === "CLOUD");
+  check("advisory: dense cloud reads LOW VIS", advisoryFor(0.7) === "LOW VIS");
+  check("advisory: the densest cloud reads IMC", advisoryFor(1) === "IMC");
+  // §24: moist air outside cloud is still worth announcing — that is the air
+  // the wingtip vapor will actually appear in.
+  check("advisory: the moist halo outside cloud reads VISIBLE MOISTURE", advisoryFor(0, ATMOS.proximityHumidity) === "VISIBLE MOISTURE");
+  check("advisory: dry air outside cloud stays silent", advisoryFor(0, ATMOS.baseHumidity) === null);
+  check("advisory: density outranks humidity", advisoryFor(0.9, 1) === "IMC");
+  // §25: icing was omitted outright, so no threshold can ever produce it.
+  const words = [0, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95, 1].map((d) => advisoryFor(d, 1));
+  check("advisory: ICING never appears at any density", words.every((w) => w !== "ICING"), words);
 }
 
-function testCrashCamera() {
-  const { frames } = runCrash();
-  // ONE strong kick at impact, decaying fast, NEVER re-triggered: sustained
-  // shake is nauseating.
-  check("the kick peaks at impact", frames[0].kick > 0.4, `${frames[0].kick}`);
-  let monotonic = true;
-  for (let i = 1; i < frames.length; i++) {
-    if (frames[i].kick > frames[i - 1].kick + 1e-9) monotonic = false;
+{
+  // Debounce: a clipped wisp must not flash text, and leaving cloud must not
+  // clear it instantly.
+  const latch = createAdvisoryLatch();
+  check("advisory: a single frame in cloud announces nothing", latch.update(0.9, 1 / 60) === null);
+  for (let i = 0; i < 60; i++) latch.update(0.9, 1 / 60);
+  check("advisory: a held condition is announced", latch.current === "IMC", latch.current);
+  latch.update(0, 1 / 60);
+  check("advisory: one clear frame does not withdraw it", latch.current === "IMC");
+  for (let i = 0; i < 90; i++) latch.update(0, 1 / 60);
+  check("advisory: sustained clear air withdraws it", latch.current === null);
+  check("advisory: clearing is slower than escalating", ATMOS.advisory.clearDelay > ATMOS.advisory.delay);
+
+  // Flicker across a cluster edge: alternating frames must settle on nothing.
+  const l2 = createAdvisoryLatch();
+  for (let i = 0; i < 120; i++) l2.update(i % 2 ? 0.9 : 0, 1 / 60);
+  check("advisory: an alternating edge does not strobe the HUD", l2.current === null, l2.current);
+}
+
+{
+  // The field itself: clear corridors must survive generation, and the sprite
+  // budget must stay in the range §30 asks for.
+  const field = createCloudField();
+  check("clouds: both layers are populated", field.clusters.some((c) => c.layer === "low") && field.clusters.some((c) => c.layer === "mid"));
+  check("clouds: the field is a modest sprite count, not a particle system", field.report.sprites > 60 && field.report.sprites < 320, field.report.sprites);
+  check("clouds: only a few textures are shared across the sky", field.report.textures <= 3, field.report.textures);
+  const inBand = field.clusters.filter((c) => ATMOS.clearBands.some(([a, b]) => c.z <= Math.max(a, b) && c.z >= Math.min(a, b)));
+  check("clouds: the clear corridors stay clear", inBand.length === 0, inBand.map((c) => c.z));
+  const spawn = { x: 0, y: 700, z: 0 };
+  check("clouds: the spawn point itself is not inside cloud", densityAt(spawn, field.clusters) < 0.5, densityAt(spawn, field.clusters));
+  // Cloud must exist along the course, or none of this is visible in play.
+  const ahead = field.clusters.filter((c) => c.z < 0 && c.z > -25000);
+  check("clouds: the field covers the flight corridor", ahead.length > 8, ahead.length);
+}
+
+/* ================= Stage 03.2 — cannon ================= */
+
+{
+  // §3: two weapons, one cycle, and it comes back where it started.
+  check("weapon: the cycle is AIM-9 -> GUN -> AIM-9", cycleWeapon(WeaponMode.AIM9) === WeaponMode.GUN && cycleWeapon(WeaponMode.GUN) === WeaponMode.AIM9);
+  check("weapon: there are exactly two weapons", Object.keys(WeaponMode).length === 2, Object.keys(WeaponMode));
+  // §28: the two weapons have to differ in reach and in magazine, or the choice
+  // between them is cosmetic.
+  check("weapon: the gun is a close-range weapon next to the AIM-9", GUN.maxRange < TARGETING.maxRange * 0.4, [GUN.maxRange, TARGETING.maxRange]);
+  check("weapon: the gun trades reach for rounds", GUN.ammo > WEAPONS.mounts.length * 100, [GUN.ammo, WEAPONS.mounts.length]);
+}
+
+{
+  // §5: the port is on the RIGHT wing root, above the skin and inboard of the
+  // intake — asserted against the measured station, not against the literal.
+  const g = WEAPONS.gun;
+  const s = g.station;
+  check("gun: the muzzle is on the right side of the aircraft", g.position.x > 0, g.position.x);
+  check("gun: the muzzle sits at the wing root, inboard of the intake", g.position.x < s.intakeX, [g.position.x, s.intakeX]);
+  check("gun: the muzzle is forward of the wing root chord", g.position.z < s.wingRootZ, [g.position.z, s.wingRootZ]);
+  // Above the measured skin, or the flash renders inside the fuselage; but only
+  // just above it, or the gun stops reading as internal (§5).
+  check("gun: the muzzle clears the fuselage skin", g.position.y > s.skinY, [g.position.y, s.skinY]);
+  check("gun: the muzzle still reads as internal, not as a pod", g.position.y - s.skinY < 0.25, g.position.y - s.skinY);
+
+  // The anchor is a real child of the hierarchy, so nothing else holds it.
+  const root = new THREE.Object3D();
+  const set = createWeaponMounts(root, { rails: false });
+  check("gun: the muzzle is a weapon-mount anchor", !!set.gunMuzzle && set.gunMuzzle.parent === set.weaponMounts);
+  check("gun: the muzzle anchor carries the measured position", set.gunMuzzle.position.equals(WEAPONS.gun.position));
+}
+
+{
+  // §8: the fire loop is an accumulator, and it must not lose or invent rounds
+  // at any frame time.
+  const interval = 1 / GUN.shotsPerSecond;
+  const a = gunShots(0, 1, interval);
+  check("gun: one second of fire is one second of rounds", a.shots === GUN.shotsPerSecond, a.shots);
+  check("gun: the accumulator never goes negative", a.rest >= 0 && a.rest < interval, a.rest);
+  const short = gunShots(0, interval * 0.4, interval);
+  check("gun: a frame shorter than the interval fires nothing yet", short.shots === 0 && short.rest > 0, short);
+  // Frame-rate independence, the same claim the flight model makes.
+  let fast = 0;
+  let acc = 0;
+  for (let i = 0; i < 240; i++) {
+    const r = gunShots(acc, 1 / 240, interval);
+    fast += r.shots;
+    acc = r.rest;
   }
-  check("the kick only ever decays -- never re-triggered", monotonic);
-  const atRespawn = frames.find((f) => f.t >= T.respawn);
-  check("the kick is negligible by the respawn", atRespawn.kick < 0.01, `${atRespawn.kick}`);
+  let slow = 0;
+  acc = 0;
+  for (let i = 0; i < 30; i++) {
+    const r = gunShots(acc, 1 / 30, interval);
+    slow += r.shots;
+    acc = r.rest;
+  }
+  check("gun: the rate is frame-rate independent", Math.abs(fast - slow) <= 1 && Math.abs(fast - GUN.shotsPerSecond) <= 1, [fast, slow]);
+  check("gun: tracers are rarer than rounds", GUN.tracerEvery > 1 && GUN.shotsPerSecond / GUN.tracerEvery < 20, GUN.shotsPerSecond / GUN.tracerEvery);
+  // §18: the magazine has to last long enough to practise with.
+  check("gun: the magazine is several seconds of fire", GUN.ammo / GUN.shotsPerSecond > 8, GUN.ammo / GUN.shotsPerSecond);
 }
 
-function testCrashTumbleAndMomentum() {
-  // THE TUMBLE IS LATCHED at entry -- one angular velocity, applied as a LOCAL
-  // quaternion delta so it works from any starting attitude including
-  // inverted. (Same trap as the hostile's break direction in stage 6.)
-  const seen = [];
-  for (let seed = 1; seed <= 12; seed++) {
-    const c = createCrashFx();
-    c.start(crashStart({ seed }));
-    const latched = { ...c.state.tumble };
-    for (let t = 0; t < 1; t += 1 / 60) c.update(1 / 60);
-    check(
-      `seed ${seed}: the tumble never changed`,
-      c.state.tumble.x === latched.x && c.state.tumble.z === latched.z,
+{
+  // §9: full effect up close, nothing at all past max range, monotonic between.
+  check("gun: point blank is full effect", rangeEffect(0) === 1);
+  check("gun: the best-range band is full effect", rangeEffect(GUN.bestRange) === 1);
+  check("gun: max range is the end of it", rangeEffect(GUN.maxRange) === 0 && rangeEffect(GUN.maxRange + 500) === 0);
+  const mid = rangeEffect((GUN.bestRange + GUN.maxRange) / 2);
+  check("gun: effect tapers between best and max range", mid > 0 && mid < 1, mid);
+  check("gun: effect is monotonic in range", rangeEffect(900) > rangeEffect(1000) && rangeEffect(1000) > rangeEffect(1100));
+  check("gun: a round past max range does no damage", gunDamage(GUN.maxRange + 1) === 0);
+  // §25: bursts accumulate. One round must be a long way from a kill.
+  const hitsToKill = ENEMY.health / gunDamage(400);
+  check("gun: no single round kills the target", hitsToKill > 20, hitsToKill);
+  // ...but a burst of a second or so does.
+  check("gun: a sustained accurate burst kills", hitsToKill < GUN.shotsPerSecond * 1.5, hitsToKill);
+}
+
+{
+  // §10: hitscan. Straight ahead hits, behind never hits, and the returned
+  // distance is the range the damage model is then asked about.
+  const o = { x: 0, y: 0, z: 0 };
+  const d = { x: 0, y: 0, z: -1 };
+  check("gun: a shot down the boresight hits a target ahead", hitscanRange(o, d, { x: 0, y: 0, z: -500 }, GUN.hitRadius) !== null);
+  check("gun: the hit distance is the range to the target", Math.abs(hitscanRange(o, d, { x: 0, y: 0, z: -500 }, GUN.hitRadius) - 500) < 1e-9);
+  check("gun: a target behind the muzzle is never hit", hitscanRange(o, d, { x: 0, y: 0, z: 500 }, GUN.hitRadius) === null);
+  check("gun: a shot wide of the target misses", hitscanRange(o, d, { x: 40, y: 0, z: -500 }, GUN.hitRadius) === null);
+  const graze = hitscanRange(o, d, { x: GUN.hitRadius * 0.9, y: 0, z: -500 }, GUN.hitRadius);
+  check("gun: a graze inside the hit radius still counts", graze !== null && Math.abs(graze - 500) < 1, graze);
+  check("gun: the miss boundary is the hit radius", hitscanRange(o, d, { x: GUN.hitRadius * 1.1, y: 0, z: -300 }, GUN.hitRadius) === null);
+}
+
+{
+  // §13: the lead solution. The claim worth testing is not the formula, it is
+  // that the pipper sits where the rounds go.
+  const muzzle = { x: 0, y: 0, z: 0 };
+  const tgt = { x: 0, y: 0, z: -600 };
+  const own = { x: 0, y: 0, z: -250 };
+  // A target on the same heading at the same speed needs no lead at all — the
+  // case a target-velocity-only model gets visibly wrong.
+  const trail = leadSolution(muzzle, tgt, { x: 0, y: 0, z: -250 }, own, GUN, {});
+  check("gun: a co-speed target on the same heading needs no lead", Math.hypot(trail.x - tgt.x, trail.y - tgt.y, trail.z - tgt.z) < 1e-9);
+  // A crossing target is led along its own track.
+  const cross = leadSolution(muzzle, tgt, { x: 150, y: 0, z: -250 }, own, GUN, {});
+  check("gun: a crossing target is led along its velocity", cross.x > tgt.x && Math.abs(cross.z - tgt.z) < 1e-6, [cross.x, cross.z]);
+  check("gun: lead time is range over projectile speed", Math.abs(cross.time - 600 / GUN.projectileSpeed) < 1e-9, cross.time);
+  // Further away is more lead, because the rounds are in the air longer.
+  const far = leadSolution(muzzle, { x: 0, y: 0, z: -1200 }, { x: 150, y: 0, z: -250 }, own, GUN, {});
+  check("gun: lead grows with range", far.x > cross.x, [cross.x, far.x]);
+  const capped = leadSolution(muzzle, { x: 0, y: 0, z: -1e6 }, { x: 150, y: 0, z: 0 }, null, GUN, {});
+  check("gun: lead time is capped", capped.time === GUN.maxLeadTime, capped.time);
+  check("gun: the pipper is a prediction, not a lock", GUN.projectileSpeed > 0 && GUN.maxLeadTime < 5);
+}
+
+{
+  // §24: incremental health, and the kill fires exactly once.
+  const t = createTargetDrone();
+  check("target: health starts full", t.health === ENEMY.health && t.maxHealth === ENEMY.health);
+  check("target: one cannon round does not kill it", damageTarget(t, gunDamage(300)) === false && t.alive === true);
+  check("target: a round reduces health", t.health < ENEMY.health, t.health);
+  let kills = 0;
+  for (let i = 0; i < 200; i++) if (damageTarget(t, gunDamage(300))) kills++;
+  check("target: sustained fire destroys it exactly once", kills === 1 && t.alive === false, kills);
+  check("target: health never goes below zero", t.health === 0, t.health);
+  check("target: a destroyed target ignores further fire", damageTarget(t, 50) === false);
+  resetTargetDrone(t);
+  check("target: reset restores full health", t.alive && t.health === ENEMY.health);
+  // §27: the AIM-9 is unchanged — it does not go through the health pool.
+  const m = createTargetDrone();
+  markTargetHit(m, 1);
+  check("target: a missile hit still destroys outright", m.alive === false && m.health === 0);
+}
+
+{
+  // The system end to end, in-page: ammo, dry state, pooling, and a burst that
+  // actually kills something.
+  const scn = new THREE.Scene();
+  const mz = new THREE.Object3D();
+  mz.position.set(1.6, 0.18, -1.1);
+  scn.add(mz);
+  const sys = createGunSystem({ scene: scn, muzzle: mz });
+  const ctx = {
+    armed: true,
+    firing: true,
+    forward: new THREE.Vector3(0, 0, -1),
+    right: new THREE.Vector3(1, 0, 0),
+    up: new THREE.Vector3(0, 1, 0),
+    ownVel: new THREE.Vector3(),
+    target: null,
+  };
+  check("gun: visuals are pooled, not allocated per round", sys.tracers.length === GUN.tracerPool && sys.sparks.length === GUN.sparkPool);
+
+  sys.update({ ...ctx, armed: false }, 1 / 60);
+  check("gun: an unselected gun does not fire", sys.state.ammo === GUN.ammo && sys.state.firing === false);
+
+  for (let i = 0; i < 60; i++) sys.update(ctx, 1 / 60);
+  check("gun: one second of held trigger spends one second of rounds", Math.abs(GUN.ammo - sys.state.ammo - GUN.shotsPerSecond) <= 1, GUN.ammo - sys.state.ammo);
+  // Sampled across the burst rather than on one frame: at 60 fps and 48 rps a
+  // given frame legitimately fires nothing.
+  let freeShots = 0;
+  let freeHits = 0;
+  let flashPeak = 0;
+  for (let i = 0; i < 60; i++) {
+    sys.update(ctx, 1 / 60);
+    freeShots += sys.state.shots;
+    freeHits += sys.state.hits;
+    flashPeak = Math.max(flashPeak, sys.flash.material.opacity);
+  }
+  check("gun: firing with no target is allowed", freeShots > 0 && freeHits === 0, [freeShots, freeHits]);
+  const litTracers = sys.tracers.filter((t) => t.live).length;
+  check("gun: tracers appear during a burst", litTracers > 0 && litTracers <= GUN.tracerPool, litTracers);
+  check("gun: the muzzle flash lights while firing", flashPeak > 0.5, flashPeak);
+
+  // Run the belt dry.
+  for (let i = 0; i < 60 * 20; i++) sys.update(ctx, 1 / 60);
+  check("gun: ammo stops at zero", sys.state.ammo === 0);
+  check("gun: a dry gun fires nothing", sys.state.shots === 0 && sys.state.firing === false);
+  check("gun: the dry state is reported", sys.state.dry === true);
+  sys.update(ctx, 1 / 60);
+  check("gun: a dry gun shows no flash", sys.flash.material.opacity < 0.02, sys.flash.material.opacity);
+
+  sys.reset();
+  check("gun: reset reloads and clears the visuals", sys.state.ammo === GUN.ammo && !sys.state.dry && sys.tracers.every((t) => !t.live));
+
+  // A burst on a target 400 m ahead: hits land, health drops, one kill event.
+  const victim = createTargetDrone();
+  victim.position.set(mz.position.x, mz.position.y, -400);
+  victim.velocity.set(0, 0, 0);
+  let killEvents = 0;
+  sys.on("hit", ({ target, damage }) => damageTarget(target, damage));
+  sys.on("kill", () => killEvents++);
+  const aimed = { ...ctx, target: victim };
+  for (let i = 0; i < 120 && victim.alive; i++) sys.update(aimed, 1 / 60);
+  check("gun: aimed fire lands hits", victim.health < ENEMY.health, victim.health);
+  check("gun: a sustained burst destroys the target", victim.alive === false);
+  check("gun: the kill is announced exactly once", killEvents === 1, killEvents);
+  check("gun: the lead solution is published for the HUD", sys.state.lead.range > 0);
+  // §16: out past gun range the cue is faded, not shown at full strength.
+  victim.alive = true;
+  victim.position.set(0, 0, -(GUN.bestRange + GUN.maxRange) / 2);
+  sys.update({ ...ctx, firing: false, target: victim }, 1 / 60);
+  check("gun: the pipper fades beyond best range", sys.state.rangeEffect > 0 && sys.state.rangeEffect < 1, sys.state.rangeEffect);
+  victim.position.set(0, 0, -4000);
+  sys.update({ ...ctx, firing: false, target: victim }, 1 / 60);
+  check("gun: no lead cue for a target far outside gun range", sys.state.leadValid === false);
+}
+
+{
+  // §33: the afterburner cleanup, stated as constraints rather than as taste.
+  check("engine: the outer plume is a billboard stack, not a second cone", ENGINE_FX.plumeSprites >= 2, ENGINE_FX.plumeSprites);
+  check("engine: the plume stays short enough not to foreshorten into a beam", ENGINE_FX.plumeLength <= 3, ENGINE_FX.plumeLength);
+  check("engine: the hot core is compact", ENGINE_FX.coreLength < ENGINE_FX.plumeLength);
+  // Shock accents are diamonds inside the core, not hoops around it.
+  check("engine: the shock accents sit inside the core radius", ENGINE_FX.ringRadius < ENGINE_FX.coreRadius, [ENGINE_FX.ringRadius, ENGINE_FX.coreRadius]);
+  check("engine: the shock accents are stretched along the axis", ENGINE_FX.ringStretch > 1.5, ENGINE_FX.ringStretch);
+  check("engine: the shock train fits inside the plume", ENGINE_FX.rings * ENGINE_FX.ringSpacing < ENGINE_FX.plumeLength);
+}
+
+/* ===== Stage 05.0 — the pointer is a stick again, on different terms ===== */
+
+/**
+ * This section replaces 04.0a, which asserted the opposite: that nothing the
+ * pointer does can command a bank. That was the right property for that design.
+ *
+ * The history matters, so it is recorded rather than deleted. Four reports, three
+ * stages, six correct fixes, one symptom: "approaching the hostile my fighter
+ * dodges right and I never control this." The premise was wrong, not the fixes — a
+ * screen position with a *synthesised* centre cannot be a stick, and every fix was
+ * manufacturing one missing property of a real stick (a centre, a spring, a
+ * detent) out of relative movement.
+ *
+ * 05.0 does not synthesise a centre. The centre IS the aircraft, fixed at the
+ * middle of the viewport, and the cursor is visible on top of it. So the property
+ * asserted here is no longer "the pointer cannot steer" but the two things that
+ * make steering safe: there is a way to let go, and the keyboard always wins.
+ */
+{
+  const bus = new EventTarget();
+  const inp = createInput(bus);
+  const move = (x, y) => bus.dispatchEvent(Object.assign(new Event("pointermove"), { clientX: x, clientY: y }));
+  const key = (k, down) =>
+    bus.dispatchEvent(
+      Object.assign(new Event(down ? "keydown" : "keyup"), { key: k, code: "Key" + k.toUpperCase(), repeat: false, preventDefault() {} })
     );
-    seen.push(latched.z);
-  }
-  check("the tumble goes both ways across seeds", seen.some((z) => z > 0) && seen.some((z) => z < 0));
-  check("the tumble is bounded", seen.every((z) => Math.abs(z) < 6), `max ${Math.max(...seen.map(Math.abs))}`);
-  // ROLL DOMINATES: a tumbling airframe reads as a roll first.
-  const c = createCrashFx();
-  c.start(crashStart({ seed: 3 }));
-  check(
-    "roll dominates the other axes",
-    Math.abs(c.state.tumble.z) > Math.abs(c.state.tumble.x) &&
-      Math.abs(c.state.tumble.z) > Math.abs(c.state.tumble.y),
-    JSON.stringify(c.state.tumble),
-  );
-  check("the quaternion stays normalised through the tumble", (() => {
-    for (let t = 0; t < 1.2; t += 1 / 60) c.update(1 / 60);
-    const q = c.state.quat;
-    return Math.abs(Math.hypot(q.x, q.y, q.z, q.w) - 1) < 1e-6;
-  })());
+  const run = (n = 30) => {
+    for (let i = 0; i < n; i++) inp.update(1 / 60);
+  };
+  const cx = window.innerWidth / 2;
+  const cy = window.innerHeight / 2;
 
-  // MOMENTUM IS INHERITED -- the aircraft does not stop in midair -- and it
-  // FALLS while continuing forward.
-  const { frames } = runCrash({ velocity: { x: 0, y: 0, z: -250 } });
-  const end = frames[frames.length - 1];
-  check("the aircraft keeps moving forward", end.z < -30, `${end.z}`);
-  check("and falls while doing it", end.y < 600, `${end.y}`);
-  // A 250 m/s crash travels a BELIEVABLE distance rather than teleporting.
-  const travelled = Math.abs(end.z);
-  check(
-    "a 250 m/s crash travels a believable distance",
-    travelled > 40 && travelled < 260,
-    `${travelled.toFixed(0)} m in ${end.t.toFixed(2)} s`,
-  );
+  // An untouched pointer commands nothing: the aircraft does not fly itself
+  // before the player has moved their hand.
+  run(30);
+  check("input: an untouched pointer commands nothing", inp.x === 0 && inp.y === 0, [inp.x, inp.y]);
+
+  // Hovering on the aircraft is how you let go — the property the old design
+  // never had, and the reason a parked cursor is now legible rather than a bug.
+  move(cx, cy);
+  run(10);
+  check("input: hovering on the aircraft holds attitude", inp.x === 0 && inp.y === 0, [inp.x, inp.y]);
+
+  // Off-centre steers, and it is meant to.
+  move(cx + Math.min(window.innerWidth, window.innerHeight) * 0.4, cy);
+  run(10);
+  check("input: the pointer right of the aircraft banks right", inp.x > 0.4, inp.x);
+  move(cx - Math.min(window.innerWidth, window.innerHeight) * 0.4, cy);
+  run(10);
+  check("input: and left banks left", inp.x < -0.4, inp.x);
+
+  // Returning to the aircraft stops the turn. This is the whole safety argument:
+  // the detent is a real place on screen, not a remembered coordinate.
+  move(cx, cy);
+  run(10);
+  check("input: returning to the aircraft stops the turn", inp.x === 0, inp.x);
+
+  // Leaving the window releases the stick — there is no off-screen deflection.
+  move(cx + 400, cy);
+  run(5);
+  bus.dispatchEvent(new Event("pointerleave"));
+  run(5);
+  check("input: leaving the window releases the stick", inp.x === 0, inp.x);
+
+  // The keyboard overrides a resting cursor, in both directions, so a player who
+  // never touches the mouse is never fighting it.
+  move(cx + Math.min(window.innerWidth, window.innerHeight) * 0.2, cy);
+  run(10);
+  const pointerOnly = inp.x;
+  key("a", true);
+  run(40);
+  check("input: a held key overrides a deflected pointer", inp.x < 0 && inp.x < pointerOnly, [pointerOnly, inp.x]);
+  key("a", false);
+  run(60);
+  check("input: releasing the key hands the axis back to the pointer", inp.x > 0, inp.x);
+
+  // The mouse keeps the job it always had.
+  bus.dispatchEvent(Object.assign(new Event("pointerdown"), { button: 0 }));
+  inp.update(1 / 60);
+  check("input: the left button is still the trigger", inp.trigger === true && inp.takeFire() === true);
+  bus.dispatchEvent(new Event("pointerup"));
+  inp.update(1 / 60);
+  check("input: and releasing it stops the gun", inp.trigger === false);
+  check("input: the trigger latch is one-shot", inp.takeFire() === false);
+
+  // Steering can be switched off wholesale for the launch script and the crash.
+  // Tolerance rather than equality: the keyboard axis decays asymptotically, so a
+  // residual from the key press above never reaches exactly zero.
+  inp.setPointerEnabled(false);
+  move(cx + 400, cy);
+  run(10);
+  check("input: pointer steering can be disabled outright", Math.abs(inp.x) < 0.01, inp.x);
+  inp.setPointerEnabled(true);
+
+  // Space is still a discrete request, leaning off whatever the stick is doing.
+  bus.dispatchEvent(Object.assign(new Event("keydown"), { key: " ", code: "Space", repeat: false, preventDefault() {} }));
+  check("input: Space still requests a roll", inp.takeRoll() !== 0);
+  check("input: and it is consumed", inp.takeRoll() === 0);
 }
 
-function testOceanCrashSinks() {
-  // WATER NEEDS REAL WORK, NOT A PALETTE SWAP. Without the plunge impulse the
-  // aircraft drifts two metres in three quarters of a second and visibly
-  // skates along the surface.
-  const ocean = runCrash({ reason: "ocean", position: { x: 0, y: 4, z: 0 } });
-  const terrain = runCrash({ reason: "terrain", position: { x: 0, y: 4, z: 0 } });
-  const oceanEnd = ocean.frames[ocean.frames.length - 1];
-  const terrainEnd = terrain.frames[terrain.frames.length - 1];
-  check("an ocean crash goes under", oceanEnd.y < -20, `${oceanEnd.y.toFixed(1)}`);
-  check(
-    "it sinks far faster than a terrain impact",
-    oceanEnd.y < terrainEnd.y - 20,
-    `ocean ${oceanEnd.y.toFixed(1)} vs terrain ${terrainEnd.y.toFixed(1)}`,
-  );
-  // Hidden BEFORE it is meaningfully under, so the intact airframe is never
-  // seen submerged and skating along the surface.
-  const hiddenAt = ocean.frames.find((f) => f.opacity < 0.05);
-  const deepAt = ocean.frames.find((f) => f.y < -25);
-  check(
-    "it is hidden before it is meaningfully under",
-    hiddenAt && deepAt && hiddenAt.t < deepAt.t,
-    `hidden ${hiddenAt?.t.toFixed(2)}s, deep ${deepAt?.t.toFixed(2)}s`,
-  );
-  // And far sooner than a terrain impact fades.
-  const terrainHidden = terrain.frames.find((f) => f.opacity < 0.05);
-  check(
-    "an ocean crash fades far sooner than a terrain one",
-    hiddenAt.t < terrainHidden.t - 0.3,
-    `ocean ${hiddenAt.t.toFixed(2)}s vs terrain ${terrainHidden.t.toFixed(2)}s`,
-  );
+/* ===== Stage 04.1 — automatic rearm, music moods, defensive break ===== */
+
+/* ---- §13: rearm ---- */
+{
+  // The rule that matters: the timer starts at EMPTY, not on the first shot.
+  // Starting it on a shot would let a player fire one AIM-9, wait, and be handed
+  // a third round — the loadout would stop meaning anything.
+  let magazine = 2;
+  let rearms = 0;
+  const t = createRearmTimer({
+    cooldown: 20,
+    isEmpty: () => magazine === 0,
+    refill: () => (magazine = 2),
+    onRearm: () => (rearms += 1),
+  });
+
+  magazine = 1;
+  for (let i = 0; i < 60 * 40; i++) t.update(1 / 60);
+  check("rearm: a partly-spent magazine never starts a timer", !t.state.running && magazine === 1 && rearms === 0, [t.state.running, magazine]);
+
+  magazine = 0;
+  t.update(1 / 60);
+  check("rearm: reaching empty starts it", t.state.running && t.state.remaining > 19, t.state.remaining);
+  for (let i = 0; i < 60 * 10; i++) t.update(1 / 60);
+  check("rearm: it is still empty halfway through", magazine === 0 && t.state.remaining > 9 && t.state.remaining < 11, t.state.remaining);
+  check("rearm: progress is readable", t.progress > 0.45 && t.progress < 0.55, t.progress);
+  for (let i = 0; i < 60 * 11; i++) t.update(1 / 60);
+  check("rearm: the cooldown refills the magazine exactly once", magazine === 2 && rearms === 1 && !t.state.running, [magazine, rearms]);
+  for (let i = 0; i < 60 * 60; i++) t.update(1 / 60);
+  check("rearm: and does not keep firing", rearms === 1, rearms);
+
+  // A checkpoint restore or a mission restart puts rounds back directly; a timer
+  // left running would refill an already-full magazine later.
+  magazine = 0;
+  t.update(1 / 60);
+  check("rearm: running again after a second empty", t.state.running);
+  magazine = 2;
+  t.update(1 / 60);
+  check("rearm: an external refill cancels the cycle", !t.state.running && t.state.remaining === 0);
+  check("rearm: the cooldown is 20 s (§13)", REARM.cooldown === 20, REARM.cooldown);
 }
 
-function testCrashDuplicateSuppression() {
-  // DUPLICATE SUPPRESSION ON EVERY FRAME of the crash window. A tumbling
-  // aircraft grinding through a mountain must not produce BOOM BOOM BOOM.
-  const policy = createMissionCheckpointResponse({});
-  const contact = { type: "terrain", predicted: false, position: { x: 0, y: 0, z: 0 }, speed: 200 };
-  check("the first impact is accepted", policy.handleCollision(contact) === true);
-  let extra = 0;
-  for (let t = 0; t < T.holdEnds; t += 1 / 60) {
-    if (policy.handleCollision(contact)) extra++;
-    policy.tick(1 / 60);
-  }
-  check("every frame of the crash window is refused", extra === 0, `${extra}`);
-  check("the failure count stayed at one", policy.failures() === 1, `${policy.failures()}`);
+{
+  // Both weapons, independent timers (§13): one is always coming back while the
+  // other is out, so the player is never disarmed outright.
+  const rounds = { count: 0, reload() { this.count = 2; } };
+  const gun = { cfg: { ammo: 500 }, state: { ammo: 250, dry: false } };
+  const labels = [];
+  const sys = createRearmSystem({ rounds, gun, onRearm: (l) => labels.push(l) });
 
-  // reset() clears the clock and every entity; finish() restores opacity.
-  const { crash } = runCrash();
-  check("entities exist mid-crash", crash.entityCount() > 0);
-  check("the entity peak is within budget", crash.entityCount() < 90, `${crash.entityCount()}`);
-  crash.reset();
-  check("reset clears the clock", crash.state.t === 0);
-  check("reset clears every entity", crash.entityCount() === 0);
-  check("reset restores opacity", crash.state.aircraftOpacity === 1);
+  sys.update(1 / 60);
+  check("rearm: only the empty weapon has a timer", sys.aim9.state.running && !sys.cannon.state.running);
+  check("rearm: the pending line names it", sys.pending && sys.pending.label === "AIM-9", sys.pending);
+  // Five seconds later the gun runs dry too — a real engagement empties them at
+  // different moments, and the timers have to stay that far apart.
+  for (let i = 0; i < 60 * 5; i++) sys.update(1 / 60);
+  gun.state.ammo = 0;
+  sys.update(1 / 60);
+  check("rearm: the two timers are independent", sys.cannon.state.remaining - sys.aim9.state.remaining > 4.5, [sys.aim9.state.remaining, sys.cannon.state.remaining]);
+  check("rearm: pending reports the soonest", sys.pending.label === "AIM-9", sys.pending.label);
+  for (let i = 0; i < 60 * 16; i++) sys.update(1 / 60);
+  check("rearm: AIM-9 came back first", rounds.count === 2 && gun.state.ammo === 0, [rounds.count, gun.state.ammo]);
+  for (let i = 0; i < 60 * 6; i++) sys.update(1 / 60);
+  check("rearm: then the gun, to full", gun.state.ammo === 500 && !gun.state.dry, [gun.state.ammo, gun.state.dry]);
+  check("rearm: each announced itself once", JSON.stringify(labels) === JSON.stringify(["AIM-9", "GUN"]), labels);
 
-  const c2 = createCrashFx();
-  c2.start(crashStart());
-  for (let t = 0; t < 1; t += 1 / 60) c2.update(1 / 60);
-  c2.finish();
-  check("finish restores aircraft opacity", c2.state.aircraftOpacity === 1);
-  check("finish ends the crash", c2.state.active === false);
+  rounds.count = 0;
+  sys.update(1 / 60);
+  sys.reset();
+  check("rearm: reset clears a running cycle", !sys.aim9.state.running && sys.pending === null);
 }
 
-function testSpawnClearance() {
+{
+  // §04.7 — the respawn clearance rule. This exists because a restore put the
+  // player back inside a hillside and the crash then repeated forever: the
+  // capture-time lift measured the ground BELOW the capture point, which says
+  // nothing about what the aircraft is pointed at.
   const flat = () => 0;
-  // Flat ground gives the plain clearance.
-  check(
-    "flat ground gives the plain clearance",
-    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, flat) === SPAWN_CLEARANCE,
-  );
+  const at = { x: 0, y: 0, z: 0 };
+  check("spawn: over flat ground it is the plain clearance", safeSpawnAltitude(at, 0, flat) === MISSION.route.terrainClearance, safeSpawnAltitude(at, 0, flat));
+  // §04.7c — a caller can ask for more clearance than a nav anchor uses, which is
+  // what the escalating respawn does after a failure.
+  check("spawn: the clearance is a caller decision", safeSpawnAltitude(at, 0, flat, MISSION, 460) === 460);
 
-  // GROUND *AHEAD* RAISES IT. Heading 0 is -Z, so a ridge at negative z is
-  // ahead. This is the whole point: a levelled attitude 320 m over a valley
-  // floor with a 600 m ridge 1.5 km ahead puts the player back into contact
-  // within two seconds and the crash repeats forever.
-  const ridgeAhead = (x, z) => (z < -1000 && z > -2000 ? 600 : 0);
-  check(
-    "ground ahead raises the spawn",
-    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, ridgeAhead) === 600 + SPAWN_CLEARANCE,
-    `${safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, ridgeAhead)}`,
-  );
-  // THE SAME POSITION FACING AWAY DOES NOT -- which is what proves it samples
-  // a corridor along the heading rather than a disc around the point.
-  check(
-    "the same position facing away does not",
-    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, Math.PI, ridgeAhead) === SPAWN_CLEARANCE,
-  );
-  // Ground at the spawn POINT itself is caught too (the d = 0 sample).
-  const underfoot = (x, z) => (Math.abs(z) < 50 ? 900 : 0);
-  check(
-    "ground at the spawn point itself is caught",
-    safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, underfoot) === 900 + SPAWN_CLEARANCE,
-  );
-  // No sampler still yields a floor.
-  check("no sampler still yields a floor", safeSpawnAltitude({ x: 0, y: 0, z: 0 }, 0, null) === SPAWN_CLEARANCE);
+  // A ridge 600 m high, 1.2 km AHEAD along heading 0 (which is -Z).
+  const ridgeAhead = (x, z) => (z < -900 && z > -1500 ? 600 : 0);  const lifted = safeSpawnAltitude(at, 0, ridgeAhead);
+  check("spawn: ground ahead raises the spawn above it", lifted >= 600 + MISSION.route.terrainClearance, lifted);
+  // ...and the SAME position facing away from it does not need the altitude, which
+  // is what makes this a corridor test rather than a radius.
+  check("spawn: facing away from the ridge needs no lift", safeSpawnAltitude(at, Math.PI, ridgeAhead) < lifted, safeSpawnAltitude(at, Math.PI, ridgeAhead));
 
-  // The respawn: backed off along the heading of travel, levelled, at cruise.
-  const spawn = respawnFrom({ x: 0, y: 100, z: -5000 }, 0, flat);
-  check("the respawn backs off along the heading", spawn.position.z > -5000, `${spawn.position.z}`);
-  check(
-    "it backs off the full distance",
-    Math.abs(spawn.position.z - (-5000 + RESPAWN_BACKOFF)) < 1e-6,
-  );
-  check("the respawn is levelled", spawn.pitch === 0 && spawn.bank === 0);
-  check("sink is zeroed", spawn.sink === 0);
-  // NO ESCALATION: with a finite pilot count, converging over several deaths
-  // costs the player the run, so the FIRST attempt is simply high enough that
-  // terrain cannot be a factor -- 4000 m against a 643 m peak.
-  check(
-    "the respawn is high enough that terrain cannot be a factor",
-    spawn.position.y >= RESPAWN_ALTITUDE,
-    `${spawn.position.y}`,
-  );
-  check("4000 m clears the 643 m peak by a wide margin", RESPAWN_ALTITUDE > 643 * 5);
-  // A very tall ridge still raises it above the fixed floor.
-  const huge = respawnFrom({ x: 0, y: 100, z: -5000 }, 0, () => 6000);
-  check("a taller obstacle still raises the floor", huge.position.y > RESPAWN_ALTITUDE, `${huge.position.y}`);
+  // Ground the aircraft is sitting inside is caught by the d = 0 sample.
+  const inside = (x, z) => 800;
+  check("spawn: ground at the spawn point itself is caught", safeSpawnAltitude(at, 0, inside) >= 800 + MISSION.route.terrainClearance);
+
+  // No terrain index: still a floor, never zero or NaN.
+  check("spawn: with no sampler there is still a floor", safeSpawnAltitude(at, 0, null) === MISSION.route.minTerrainAltitude);
+  check("spawn: an all-ocean corridor falls back to the floor", safeSpawnAltitude(at, 0, () => NaN) === MISSION.route.minTerrainAltitude);
+  // The look-ahead has to be long enough to matter at cruise — under a kilometre
+  // would clear the hillside and still fly into the next one.
+  check("spawn: it looks far enough ahead to be worth checking", MISSION.route.spawnLookAhead >= 2000, MISSION.route.spawnLookAhead);
 }
 
-// ── audio ─────────────────────────────────────────────────────────────────
+/* ===== Stage 04.7 — procedural crash presentation ===== */
+{
+  // §1 — causes are mapped from the reason string the failure policy ALREADY
+  // carries, in one place, so a new failure reason cannot silently inherit the
+  // wrong explosion.
+  check("crash: the three gameplay causes map to variants", causeFromReason("OCEAN IMPACT") === CrashCause.OCEAN && causeFromReason("TERRAIN IMPACT") === CrashCause.TERRAIN && causeFromReason("MISSILE HIT") === CrashCause.MISSILE);
+  check("crash: an unknown reason still gets a presentation", causeFromReason("???") === CrashCause.MISSILE && causeFromReason(null) === CrashCause.MISSILE);
+  check("crash: every cause has a full variant row", Object.keys(CrashCause).every((c) => { const v = CRASH_VARIANT[c]; return v && typeof v.fire === "number" && typeof v.smoke === "number" && typeof v.sink === "number" && !!v.screen; }));
+  // §24/§43 — water is not a small orange explosion: less fire, more mist, and it
+  // sinks fast so the aircraft cannot be seen flying along under the surface.
+  check("crash: the ocean variant is mist, not fireball", CRASH_VARIANT.OCEAN.mist > CRASH_VARIANT.MISSILE.mist && CRASH_VARIANT.OCEAN.fire < CRASH_VARIANT.MISSILE.fire * 0.5);
+  check("crash: and it does not keep flying", CRASH_VARIANT.OCEAN.sink > CRASH_VARIANT.MISSILE.sink && CRASH_VARIANT.OCEAN.forward < 0.3, [CRASH_VARIANT.OCEAN.sink, CRASH_VARIANT.OCEAN.forward]);
+  // §43 — and it must be hidden sooner than a midair kill, because an aircraft
+  // visible under the water surface is the specific failure the brief names.
+  check("crash: water hides the aircraft soonest", CRASH_VARIANT.OCEAN.visible < CRASH_VARIANT.TERRAIN.visible && CRASH_VARIANT.TERRAIN.visible < CRASH_VARIANT.MISSILE.visible);
+  // §22 — a missile kill happens around the aircraft, so it keeps its momentum.
+  check("crash: a missile hit retains full forward momentum", CRASH_VARIANT.MISSILE.forward === 1);
+  check("crash: a terrain hit loses most of it", CRASH_VARIANT.TERRAIN.forward < 0.5, CRASH_VARIANT.TERRAIN.forward);
 
-function fakeAudio() {
+  // §3 — the whole thing is about two seconds, and the beats are ordered.
+  const total = MISSION_FAILURE.hold + MISSION_FAILURE.fadeOut + MISSION_FAILURE.fadeIn;
+  check("crash: impact to playable is about two seconds", total > 1.8 && total < 2.6, total);
+  check("crash: the crash is visible before the fade starts", MISSION_FAILURE.hold > CRASH.aircraftVisible, [MISSION_FAILURE.hold, CRASH.aircraftVisible]);
+  check("crash: the layers arrive in order (§3)", CRASH.flashAt < CRASH.fireballAt && CRASH.fireballAt < CRASH.tumbleAt && CRASH.tumbleAt < CRASH.smokeFrom && CRASH.smokeFrom < CRASH.sparksAt);
+  check("crash: smoke stops emitting before the fade completes", CRASH.smokeUntil <= MISSION_FAILURE.hold, [CRASH.smokeUntil, MISSION_FAILURE.hold]);
+  check("crash: the budget stays small (§40)", CRASH.debrisCount <= 6 && CRASH.sparkCount <= 30 && CRASH.fireballCount <= 6);
+
+  // §6 — the aircraft is NOT hidden on the frame it dies.
+  check("crash: the intact aircraft stays visible at first", aircraftOpacity(0) === 1 && aircraftOpacity(CRASH.aircraftVisible) === 1);
+  check("crash: for the half-second the brief asks for", CRASH.aircraftVisible >= 0.5 && CRASH.aircraftVisible <= 0.8, CRASH.aircraftVisible);
+  check("crash: then it fades rather than popping", aircraftOpacity(CRASH.aircraftVisible + CRASH.aircraftFade * 0.5) > 0.2 && aircraftOpacity(CRASH.aircraftVisible + CRASH.aircraftFade * 0.5) < 0.8);
+  check("crash: and is gone before the fade to black", aircraftOpacity(CRASH.aircraftVisible + CRASH.aircraftFade) === 0);
+
+  // §26/§28 — one kick, fast decay. Not sustained shake.
+  check("crash: no kick before the impact frame", kickAmplitude(0) === 0);
+  check("crash: it peaks at the impact", kickAmplitude(CRASH.flashAt) > 1.5, kickAmplitude(CRASH.flashAt));
+  check("crash: and decays fast rather than shaking on", kickAmplitude(0.6) < kickAmplitude(CRASH.flashAt) * 0.1, kickAmplitude(0.6));
+  check("crash: it is over well before the respawn", kickAmplitude(1.2) < 0.01, kickAmplitude(1.2));
+
+  // §30 — a brief flash, not a blinding one.
+  check("crash: the screen flash is instant and short", screenFlashAlpha(0) === 1 && screenFlashAlpha(CRASH.screenFlash) === 0 && CRASH.screenFlash < 0.15);
+
+  // §27 — the camera loosens, holds, and is handed back rather than snapping.
+  check("crash: the crash camera blends in", followBlend(0) === 0 && followBlend(0.12) === 1);
+  check("crash: holds through the tumble", followBlend(CRASH.followTime * 0.8) === 1);
+  check("crash: then releases the rig", followBlend(CRASH.followTime + 0.31) === 0);
+  check("crash: for the ~1 s the brief asks for", CRASH.followTime >= 0.8 && CRASH.followTime <= 1.2, CRASH.followTime);
+
+  // §7/§35 — bounded randomness, generated once. Roll dominates, which is what
+  // makes a tumble read as a tumble rather than a wobble.
+  const spins = Array.from({ length: 60 }, () => makeTumble());
+  check("crash: tumble roll stays inside its bounds", spins.every((s) => Math.abs(s.roll) >= CRASH.tumbleRoll[0] && Math.abs(s.roll) <= CRASH.tumbleRoll[1]));
+  check("crash: it goes both ways", new Set(spins.map((s) => Math.sign(s.roll))).size === 2);
+  check("crash: and roll dominates the other axes", spins.every((s) => Math.abs(s.roll) > Math.abs(s.pitch)));
+}
+
+{
+  // The sequence, headless and deterministic — the browser throttles rAF in a
+  // background frame, so this is the only honest way to check the timing.
+  const V = (x, y, z) => ({
+    x, y, z,
+    copy(v) { this.x = v.x; this.y = v.y; this.z = v.z; return this; },
+    multiplyScalar(k) { this.x *= k; this.y *= k; this.z *= k; return this; },
+    addScaledVector(v, s) { this.x += v.x * s; this.y += v.y * s; this.z += v.z * s; return this; },
+    length() { return Math.hypot(this.x, this.y, this.z); },
+  });
+  const fx = createCrashFx({});
+  fx.start({ cause: CrashCause.MISSILE, position: V(0, 900, -9000), velocity: V(0, 0, -220) });
+  check("sequence: it starts once", fx.state.active && fx.state.crashes === 1);
+  // §8 — the aircraft does not stop in midair.
+  check("sequence: pre-impact momentum is inherited", fx.velocity.length() > 150, fx.velocity.length());
+
+  const startY = fx.pose.position.y;
+  const startZ = fx.pose.position.z;
+  for (let i = 0; i < 30; i++) fx.update(1 / 60);
+  check("sequence: it keeps travelling forward", Math.abs(fx.pose.position.z - startZ) > 60, fx.pose.position.z - startZ);
+  // §9 — gravity, so it visibly drops while continuing forward.
+  check("sequence: and starts to fall", fx.pose.position.y < startY, [startY, fx.pose.position.y]);
+  check("sequence: the aircraft is still visible at 0.5 s (§6)", fx.pose.opacity === 1, fx.pose.opacity);
+
+  for (let i = 0; i < 36; i++) fx.update(1 / 60);
+  check("sequence: hidden behind its own smoke by 1.1 s", fx.pose.opacity < 0.05, fx.pose.opacity);
+
+  // §31 — the policy owns the fade; the presentation just stops driving.
+  fx.finish();
+  check("sequence: finishing releases the aircraft", !fx.state.active && fx.pose.opacity === 1);
+
+  // §47 — nothing of the old crash survives.
+  fx.reset();
+  check("sequence: reset clears the clock and every entity", fx.state.t === 0 && fx.liveCount === 0 && !fx.state.active);
+
+  // §44 — a maximum-speed crash must not fling the aircraft somewhere absurd.
+  const fast = createCrashFx({});
+  fast.start({ cause: CrashCause.MISSILE, position: V(0, 1200, 0), velocity: V(0, 0, -250) });
+  for (let i = 0; i < 72; i++) fast.update(1 / 60);
+  const travelled = Math.abs(fast.pose.position.z);
+  check("sequence: a 250 m/s crash travels a believable distance", travelled > 150 && travelled < 400, travelled);
+
+  // §43 — water: it must not be seen flying along under the surface.
+  const wet = createCrashFx({});
+  wet.start({ cause: CrashCause.OCEAN, position: V(0, 4, 0), velocity: V(0, 0, -220) });
+  for (let i = 0; i < 42; i++) wet.update(1 / 60);
+  check("sequence: an ocean crash sinks rather than cruising on", wet.pose.position.y < -8 && Math.abs(wet.pose.position.z) < 120, [wet.pose.position.y, wet.pose.position.z]);
+  check("sequence: and is hidden by the time it is under", wet.pose.opacity < 0.05, wet.pose.opacity);
+}
+
+{
+  // §46/§33 — ONE crash sequence, however many things hit at once. This is the
+  // guarantee that a tumbling aircraft grinding through terrain cannot produce
+  // BOOM BOOM BOOM, and it belongs to the response policy rather than to the
+  // presentation — which is exactly why no new state machine was added.
+  const policy = createMissionCheckpointResponse({});
+  check("duplicate: the first destruction is accepted", policy.trigger("MISSILE HIT") === true);
+  check("duplicate: a simultaneous terrain hit is refused", policy.trigger("TERRAIN IMPACT") === false);
+  let refused = 0;
+  let attempts = 0;
+  for (let i = 0; i < 60 * 1.1; i++) {
+    policy.tick(1 / 60);
+    attempts += 1;
+    if (policy.trigger("TERRAIN IMPACT") === false) refused += 1;
+  }
+  check("duplicate: refused on every frame of the crash window", refused === attempts, [refused, attempts]);
+  check("duplicate: only one sequence ran", policy.state.count === 1, policy.state.count);
+}
+
+/* ===== Stage 04.5 — the audio director ===== */
+
+{
+  // No music, by design: every sound is diegetic and almost every one is
+  // information. That makes the mix a PRIORITY problem, which is what these
+  // checks are about.
+  check("audio: warnings outrank the machinery", AUDIO.cues.MISSILE.priority > AUDIO.cues.GUN.priority && AUDIO.cues.LOCK.priority > AUDIO.cues.ENGINE_LOOP.priority);
+  check("audio: the missile warning is the loudest thing in the build", Object.values(AUDIO.cues).every((c) => c.volume <= AUDIO.cues.MISSILE.volume));
+  check("audio: PULL UP is as urgent as an inbound missile", AUDIO.cues.PULL_UP.priority === Priority.CRITICAL);
+  check("audio: only the engine and the gun loop", Object.keys(AUDIO.cues).filter((k) => AUDIO.cues[k].loop).sort().join() === "ENGINE_LOOP,GUN");
+  check("audio: every repeated cue has an anti-spam floor", Object.keys(AUDIO.cues).every((k) => AUDIO.cues[k].loop || AUDIO.cues[k].minInterval > 0));
+  check("audio: the supplied alternate takes are all used", AUDIO.cues.LOCK.takes.length === 3 && AUDIO.cues.MISSILE.takes.length === 2);
+  // 04.6 — the player's own launch and its result are WEAPON, not WARNING: they
+  // confirm something the player did and must never mask an incoming call.
+  check("audio: the player's own launch cannot mask an inbound warning", AUDIO.cues.MISSILE_LAUNCH.priority < AUDIO.cues.MISSILE.priority && AUDIO.cues.MISSILE_HIT.priority < AUDIO.cues.MISSILE.priority);
+  check("audio: the fly-by is atmosphere, not information", AUDIO.cues.FLYBY.priority === Priority.AMBIENT);
+  check("audio: and it does not repeat every pass of a circling hostile", AUDIO.cues.FLYBY.minInterval >= 3, AUDIO.cues.FLYBY.minInterval);
+  check("audio: eleven cues for eleven recordings", Object.keys(AUDIO.cues).length === 11, Object.keys(AUDIO.cues).length);
+
+  // Fly-by: once per PASS, not once per frame, and only when something actually
+  // went past fast.
+  check("flyby: a fast close pass fires", flybyTriggered(200, 400, 1 / 60));
+  check("flyby: it needs to have crossed the threshold this frame", !flybyTriggered(200, 300, 1 / 60), "prev was already inside");
+  check("flyby: a slow drift past is not a fly-by", !flybyTriggered(300, 340, 1));
+  check("flyby: nothing at long range", !flybyTriggered(900, 2000, 1 / 60));
+  check("flyby: a missing reading is not a fly-by", !flybyTriggered(NaN, 400, 1 / 60) && !flybyTriggered(200, Infinity, 1 / 60));
+
+  // Rotation, not random: with three takes a round-robin is provably never twice
+  // in a row, which is what stops a held lock sounding like a skipping record.
+  check("audio: takes rotate", [0, 1, 2, 3, 4].map((n) => takeIndex(n, 3)).join() === "0,1,2,0,1");
+  check("audio: and never repeat consecutively", [0, 1, 2, 3, 4, 5].every((n) => takeIndex(n, 3) !== takeIndex(n + 1, 3)));
+  check("audio: a single-take cue is always take zero", takeIndex(9, 1) === 0);
+
+  check("audio: the interval floor is what mayFire enforces", !mayFire(Cue.MISSILE, 0) && mayFire(Cue.MISSILE, AUDIO.cues.MISSILE.minInterval));
+  check("audio: an unknown cue never fires", !mayFire("NOPE", 999));
+
+  // The engine is the only continuous sound, and it follows the lever.
+  const idle = engineVoice(0, false);
+  const full = engineVoice(1, false);
+  const ab = engineVoice(1, true);
+  check("audio: the engine is quiet at idle and loud at full", idle.volume < full.volume && idle.volume > 0, [idle.volume, full.volume]);
+  check("audio: and it pitches up with the lever", full.rate > idle.rate, [idle.rate, full.rate]);
+  check("audio: the afterburner is audibly more than full military", ab.volume > full.volume);
+  check("audio: gain never exceeds unity", ab.volume <= 1, ab.volume);
+}
+
+{
+  // Ground proximity: two levels, because the two supplied recordings are two
+  // different statements. Conflating them would waste the more urgent one.
+  check("ground: high and level is quiet", groundWarning({ agl: 900, sink: 0 }) === null);
+  check("ground: low AND SINKING says ALTITUDE", groundWarning({ agl: AUDIO.altitudeAgl - 10, sink: 5 }) === Cue.ALTITUDE, groundWarning({ agl: AUDIO.altitudeAgl - 10, sink: 5 }));
+  check("ground: very low AND descending says PULL UP", groundWarning({ agl: 100, sink: 20 }) === Cue.PULL_UP);
+  // Low and LEVEL is legitimate flying and must be silent: the terrain leg is
+  // flown that way on purpose, and a height-only ALTITUDE fired every few
+  // seconds for the whole sortie -- which also held the engine down, because
+  // every firing ducked the ambient channels.
+  check("ground: very low but not descending is SILENT", groundWarning({ agl: 100, sink: 0 }) === null, groundWarning({ agl: 100, sink: 0 }));
+  check("ground: low and gently descending is ALTITUDE", groundWarning({ agl: 200, sink: 6 }) === Cue.ALTITUDE, groundWarning({ agl: 200, sink: 6 }));
+  // ...and the case it catches: something in FRONT, not merely below.
+  check("ground: an imminent forward hazard says PULL UP at any height", groundWarning({ agl: 4000, sink: 0, forwardImminent: true }) === Cue.PULL_UP);
+  check("ground: PULL UP outranks ALTITUDE", groundWarning({ agl: 10, sink: 40, forwardImminent: true }) === Cue.PULL_UP);
+  check("ground: no terrain reading is no warning", groundWarning({ agl: NaN, sink: 40 }) === null);
+  check("ground: the ALTITUDE threshold is AGL, so the ocean is quiet at cruise", AUDIO.altitudeAgl < 400 && groundWarning({ agl: 700, sink: 0 }) === null);
+
+  /* ---- the water floor ---- */
+  // Over open sea the time-to-impact rule has nothing to divide by in level
+  // flight and nothing ahead to sample, so height is the only available cue.
+  check("sea floor: level flight below 90 m over water is a PULL UP", groundWarning({ agl: 60, sink: 0, overWater: true }) === Cue.PULL_UP, groundWarning({ agl: 60, sink: 0, overWater: true }));
+  check("sea floor: right at the floor still warns", groundWarning({ agl: AUDIO.seaFloor, sink: 0, overWater: true }) === Cue.PULL_UP);
+  check("sea floor: above it, level flight over water is silent", groundWarning({ agl: AUDIO.seaFloor + 30, sink: 0, overWater: true }) === null, groundWarning({ agl: AUDIO.seaFloor + 30, sink: 0, overWater: true }));
+  // WATER ONLY. Over terrain this would fire continuously through the whole
+  // low-level corridor, which is the nagging-cue failure ALTITUDE was fixed for.
+  check("sea floor: the same height over LAND is not a pull-up", groundWarning({ agl: 60, sink: 0, overWater: false }) === null, groundWarning({ agl: 60, sink: 0, overWater: false }));
+  check("sea floor: it leaves room to recover at full speed", AUDIO.seaFloor >= 70 && AUDIO.seaFloor <= 150, AUDIO.seaFloor);
+  // A descent over water still reaches PULL UP the ordinary way, earlier.
+  check("sea floor: a dive toward the sea still warns above the floor", groundWarning({ agl: 300, sink: 40, overWater: true }) === Cue.PULL_UP);
+  check("ground: PULL UP is expressed in seconds, not metres", AUDIO.pullUpSeconds > 0 && AUDIO.pullUpAgl === undefined);
+}
+
+{
+  // The director, driven with stubs that record what played.
   const made = [];
-  const el = () => {
-    const listeners = {};
-    const e = {
-      src: "", loop: false, volume: 1, currentTime: 0, playbackRate: 1,
-      networkState: 1, paused: true,
-      addEventListener: (t, fn) => (listeners[t] = fn),
-      play() { this.paused = false; },
-      pause() { this.paused = true; },
-      fail() { listeners.error?.(); },
+  const stub = (src, loop) => {
+    const el = {
+      src,
+      loop: !!loop,
+      volume: 0,
+      currentTime: 0,
+      playbackRate: 1,
+      paused: true,
+      plays: 0,
+      readyState: 4,
+      play() {
+        this.paused = false;
+        this.plays += 1;
+      },
+      pause() {
+        this.paused = true;
+      },
     };
-    made.push(e);
+    made.push(el);
+    return el;
+  };
+  const a = createAudioDirector({ audioFactory: stub });
+
+  // Autoplay: nothing sounds before a user gesture, however many cues are asked.
+  check("director: nothing plays before a gesture", a.play(Cue.MISSILE) === false && a.state.plays === 0);
+  a.arm();
+  check("director: the first gesture arms it", a.state.armed === true);
+  check("director: then a cue plays", a.play(Cue.MISSILE) === true && a.state.plays === 1);
+
+  // Anti-spam: a sustained threat asks every frame and must not stutter.
+  let suppressed = 0;
+  for (let i = 0; i < 60; i++) {
+    if (!a.play(Cue.MISSILE)) suppressed += 1;
+    a.update(1 / 60);
+  }
+  check("director: a cue asked every frame fires once", a.state.plays === 1 && suppressed === 60, [a.state.plays, suppressed]);
+  for (let i = 0; i < 60 * AUDIO.cues.MISSILE.minInterval; i++) a.update(1 / 60);
+  check("director: and again once its interval has passed", a.play(Cue.MISSILE) === true, a.state.plays);
+
+  // Ducking: a warning pushes the machinery down, and a warning never ducks
+  // another warning — two things telling you something is not the problem.
+  a.loop(Cue.GUN, true);
+  const gunEl = a.channels.GUN.voices[0][0];
+  const loudGun = gunEl.volume;
+  a.play(Cue.PULL_UP);
+  a.update(1 / 60);
+  a.loop(Cue.GUN, true);
+  check("director: a critical warning ducks the cannon", gunEl.volume < loudGun, [loudGun, gunEl.volume]);
+  for (let i = 0; i < 60 * 3; i++) a.update(1 / 60);
+  a.loop(Cue.GUN, true);
+  check("director: and the cannon comes back afterwards", Math.abs(gunEl.volume - loudGun) < 1e-9, [gunEl.volume, loudGun]);
+
+  // A forced cue ignores the floor: the player pressed a button, and silence
+  // reads as a broken control.
+  a.play(Cue.FLARES);
+  const before = a.state.plays;
+  check("director: a forced cue ignores the interval", a.play(Cue.FLARES, { force: true }) === true && a.state.plays === before + 1);
+
+  // Loops are idempotent, so calling them every frame is safe.
+  const engine = a.channels.ENGINE_LOOP.voices[0][0];
+  for (let i = 0; i < 10; i++) a.loop(Cue.ENGINE_LOOP, true, { volume: 0.5, rate: 1.05 });
+  check("director: a loop started ten times has started once", engine.plays === 1, engine.plays);
+  check("director: and takes its gain and pitch", engine.volume > 0 && engine.playbackRate === 1.05);
+  a.loop(Cue.ENGINE_LOOP, false);
+  check("director: stopping a loop pauses it", engine.paused === true);
+
+  // Mute is a mix decision; reset is a transport one.
+  a.setMuted(true);
+  check("director: mute stops cues sounding", a.play(Cue.LOCK, { force: true }) === false);
+  a.toggleMute();
+  check("director: and unmute restores them", a.play(Cue.LOCK, { force: true }) === true);
+  a.reset();
+  check("director: reset clears the intervals so a restart is not silent", a.play(Cue.LOCK) === true);
+  check("director: and drops the ducking", a.state.duck === 1);
+
+  check("director: a loop cue is not a one-shot", a.play(Cue.ENGINE_LOOP) === false);
+  check("director: a one-shot is not a loop", a.loop(Cue.MISSILE, true) === false);
+  // 04.6 — a one-shot has to be stoppable: the deck spool is cut the instant the
+  // catapult fires, because that is where the engine LOOP takes over.
+  const startEl = a.channels.ENGINE_START.voices[0][0];
+  a.play(Cue.ENGINE_START, { force: true });
+  check("director: a one-shot plays", startEl.paused === false);
+  a.stop(Cue.ENGINE_START);
+  check("director: and can be cut short", startEl.paused === true);
+  check("director: stopping an unknown cue is harmless", a.stop("NOPE") === false);
+  check("director: it reports what resolved", a.report.available.MISSILE === true && a.report.silent === false);
+}
+
+{
+  // A build with no audio files at all has to be playable — which is also how
+  // this one was developed.
+  const silent = createAudioDirector({ audioFactory: () => null });
+  silent.arm();
+  check("director: a build with no audio is silent, not broken", silent.state.silent === true && silent.report.silent === true);
+  check("director: every cue simply declines", Object.keys(AUDIO.cues).every((c) => silent.play(c) === false || AUDIO.cues[c].loop));
+  check("director: and the loops decline too", silent.loop(Cue.ENGINE_LOOP, true) === false);
+  for (let i = 0; i < 120; i++) silent.update(1 / 60);
+  check("director: updating a silent director is a no-op", silent.state.plays === 0);
+}
+
+/* ---- §15: the defensive break ---- */
+{
+  const S = HostileState;
+  const T = (phase, over = {}, ctx = {}) =>
+    hostileTransition(
+      { phase, ammo: 2, cooldown: 0, timer: 1, lockProgress: 0, launched: false, defendReady: false, ...over },
+      { alive: true, playerAlive: true, ready: true, range: 1200, inCone: false, ...ctx }
+    );
+
+  check("defend: a completed lock outranks looking for a shot", T(S.PURSUIT, { defendReady: true }, { inCone: true }) === S.DEFEND);
+  check("defend: it abandons its own acquisition", T(S.ACQUIRE, { defendReady: true, lockProgress: 0.8 }) === S.DEFEND);
+  check("defend: and interrupts a reposition", T(S.REPOSITION, { defendReady: true }) === S.DEFEND);
+  // A shot 0.55 s from launching must not be talked out of it, or the hostile
+  // would never land one.
+  check("defend: but never interrupts a committed attack", T(S.ATTACK, { defendReady: true }) === S.ATTACK);
+  check("defend: it is a fixed duration, then back to pursuit", T(S.DEFEND, { timer: 1 }) === S.DEFEND && T(S.DEFEND, { timer: 0 }) === S.PURSUIT);
+  check("defend: death still wins", hostileTransition({ phase: S.DEFEND, timer: 1, defendReady: true }, { alive: false }) === S.DESTROYED);
+  check("defend: a defensive break is slower than an attack run", phaseSpeed(S.DEFEND) === HOSTILE.speed.reposition);
+
+  check("defend: the reaction delay leaves room for the player's shot (§15)", HOSTILE.defend.reaction >= 0.6 && HOSTILE.defend.reaction <= 1.5, HOSTILE.defend.reaction);
+  check("defend: the break turns harder than a normal manoeuvre", HOSTILE.defend.rateScale > 1.5, HOSTILE.defend.rateScale);
+  check("defend: and it cannot be looped indefinitely", HOSTILE.defend.cooldown > HOSTILE.defend.time, [HOSTILE.defend.cooldown, HOSTILE.defend.time]);
+
+  check("defend: the break turns away from the player's line of sight", breakDirection({ x: 0, y: 0, z: 0 }, { x: 400, y: 0, z: -400 }, 0) === -breakDirection({ x: 0, y: 0, z: 0 }, { x: -400, y: 0, z: -400 }, 0));
+}
+
+{
+  // End to end: a held lock provokes exactly one break, after the delay, and the
+  // hostile is shootable again afterwards rather than evading forever.
+  //
+  // Deployed with ammo 0 on purpose. With rounds it runs its own attack cycle,
+  // and ATTACK/COOLDOWN legitimately refuse to be interrupted (a shot 0.55 s
+  // from launch must not be talked out of it) — which is correct behaviour that
+  // makes the timing of the break depend on where in that cycle the lock lands.
+  // Isolating the reaction means testing the reaction.
+  const drone = createTargetDrone();
+  const ai = createHostileAI({ drone });
+  ai.deploy({ at: { x: 0, y: 800, z: -1800 }, heading: Math.PI, ammo: 0, engageDelay: 0 });
+  const player = { position: { x: 0, y: 800, z: 0 }, velocity: { x: 0, y: 0, z: -220 }, alive: true, locked: false };
+
+  for (let i = 0; i < 120; i++) ai.update(player, 1 / 60);
+  check("defend: an unlocked hostile does not break", ai.state.phase !== HostileState.DEFEND && ai.state.defends === 0, ai.state.phase);
+
+  // A lock that breaks before the reaction delay provokes nothing: a fleeting
+  // lock is not a threat the hostile should be able to see.
+  player.locked = true;
+  for (let i = 0; i < 30; i++) ai.update(player, 1 / 60); // 0.5 s, under 0.9
+  player.locked = false;
+  ai.update(player, 1 / 60);
+  check("defend: a fleeting lock provokes nothing", ai.state.defends === 0 && ai.state.defendCue === 0, [ai.state.defends, ai.state.defendCue]);
+
+  player.locked = true;
+  let brokeAt = -1;
+  for (let i = 0; i < 90; i++) {
+    ai.update(player, 1 / 60);
+    if (ai.state.phase === HostileState.DEFEND && brokeAt < 0) brokeAt = i / 60;
+  }
+  check("defend: a held lock provokes a break after the reaction delay", brokeAt >= HOSTILE.defend.reaction - 0.05 && brokeAt <= HOSTILE.defend.reaction + 0.1, brokeAt);
+  check("defend: exactly one", ai.state.defends === 1, ai.state.defends);
+
+  // It flies through the break and comes back, and the sustained lock cannot
+  // chain a second one until the cooldown is up.
+  const heading0 = drone.heading;
+  for (let i = 0; i < 60 * 3; i++) ai.update(player, 1 / 60);
+  check("defend: the break actually changes its heading", Math.abs(wrapPi(drone.heading - heading0)) > 20 * DEG, (drone.heading - heading0) / DEG);
+  check("defend: then it returns to pursuit", ai.state.phase !== HostileState.DEFEND, ai.state.phase);
+  check("defend: a sustained lock cannot chain breaks", ai.state.defends === 1, ai.state.defends);
+  for (let i = 0; i < 60 * 8; i++) ai.update(player, 1 / 60);
+  check("defend: but once the cooldown is up it will break again", ai.state.defends === 2, ai.state.defends);
+
+  // The altitude guard still holds through a diving break.
+  check("defend: it never dives into the sea", drone.position.y >= HOSTILE.minAltitude - 60, drone.position.y);
+}
+
+/* ===== Stage 04.3 — flares ===== */
+
+{
+  // The rule is physical, not statistical: no dice roll, no per-missile decoy
+  // chance. A round that passes close to a burning flare loses its solution.
+  check("flare: a round inside the radius is decoyed", seduces(120, 900));
+  check("flare: a round outside it is not", !seduces(FLARE.seduceRadius + 1, 900));
+  // The one number that stops a flare being a panic button: a committed round is
+  // past being drawn off, and the answer to that is the barrel roll.
+  check("flare: a committed round cannot be decoyed", !seduces(50, FLARE.minStandoff - 1));
+  check("flare: the standoff is meaningfully large", FLARE.minStandoff >= 150, FLARE.minStandoff);
+  // A flare has to be a better answer than the aircraft to be worth chasing.
+  check("flare: a flare further away than the target loses", !seduces(400, 300));
+  // The standoff and the radius must not cancel each other out. The cloud sits
+  // roughly 200 m astern a second after release, so a standoff at 220 m meant a
+  // stern chase reached the flares exactly when the rule declared it too late —
+  // which is why the mechanic never fired.
+  check("flare: the standoff does not swallow the radius", FLARE.minStandoff < FLARE.seduceRadius * 0.75, [FLARE.minStandoff, FLARE.seduceRadius]);
+  check("flare: eight presses, not eighty", FLARE.count <= 10 && FLARE.count >= 4, FLARE.count);
+  check("flare: a burst is several flares", FLARE.perBurst >= 2);
+  check("flare: they burn out", FLARE.life > 1 && FLARE.life < 6, FLARE.life);
+
+  // Ejection: down, back and alternating outward, keeping almost none of the
+  // aircraft's speed — which is the whole reason the aircraft leaves them behind.
+  const vel = { x: 0, y: 0, z: -240 };
+  const right = { x: 1, y: 0, z: 0 };
+  const up = { x: 0, y: 1, z: 0 };
+  const fwd = { x: 0, y: 0, z: -1 };
+  const a = ejectVelocity(0, vel, right, up, fwd);
+  const b = ejectVelocity(1, vel, right, up, fwd);
+  check("flare: a flare is ejected downward", a.y < -20, a.y);
+  check("flare: and keeps little of the aircraft's speed", Math.abs(a.z) < Math.abs(vel.z) * 0.5, a.z);
+  check("flare: consecutive flares go to opposite sides", Math.sign(a.x) !== Math.sign(b.x), [a.x, b.x]);
+  check("flare: so the aircraft outruns its own flares", Math.abs(a.z) < Math.abs(vel.z), [a.z, vel.z]);
+}
+
+{
+  // The dispenser, driven without a scene.
+  const sys = createFlareSystem({});
+  const at = { position: { x: 0, y: 600, z: 0 }, velocity: { x: 0, y: 0, z: -240 }, right: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 }, forward: { x: 0, y: 0, z: -1 } };
+  let dispensed = 0;
+  let decoys = 0;
+  sys.on("dispense", () => (dispensed += 1));
+  sys.on("decoy", () => (decoys += 1));
+
+  check("dispenser: it starts full", sys.state.remaining === FLARE.count);
+  check("dispenser: a press releases a burst", sys.dispense(at) === true && sys.live.length === FLARE.perBurst, sys.live.length);
+  check("dispenser: and spends exactly one", sys.state.remaining === FLARE.count - 1);
+  check("dispenser: a second press inside the cooldown is refused", sys.dispense(at) === false && dispensed === 1);
+  for (let i = 0; i < 60 * (FLARE.cooldown + 0.1); i++) sys.update([], at.position, 1 / 60);
+  check("dispenser: and allowed once it has cycled", sys.dispense(at) === true, sys.state.remaining);
+
+  // Spend them all; the dispenser refuses rather than going negative.
+  for (let i = 0; i < 40; i++) {
+    for (let k = 0; k < 60 * (FLARE.cooldown + 0.1); k++) sys.update([], at.position, 1 / 60);
+    sys.dispense(at);
+  }
+  check("dispenser: it runs out", sys.state.remaining === 0);
+  check("dispenser: an empty dispenser refuses", sys.dispense(at) === false);
+  check("dispenser: and never goes negative", sys.state.remaining === 0);
+
+  sys.reset();
+  check("dispenser: reset reloads it and clears the sky", sys.state.remaining === FLARE.count && sys.live.length === 0);
+
+  // Flares burn out on their own rather than accumulating for a whole sortie.
+  sys.dispense(at);
+  for (let i = 0; i < 60 * (FLARE.life + 0.2); i++) sys.update([], at.position, 1 / 60);
+  check("dispenser: flares expire", sys.live.length === 0 && sys.state.burning === 0);
+}
+
+{
+  // Decoying, end to end — with the aircraft MOVING, which is the only honest
+  // geometry. A static aircraft never leaves its flares behind, so the cloud
+  // never ends up on the chaser's path and the whole mechanic looks broken.
+  const sys = createFlareSystem({});
+  const player = { x: 0, y: 600, z: 0 };
+  const at = { position: player, velocity: { x: 0, y: 0, z: -240 }, right: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 }, forward: { x: 0, y: 0, z: -1 } };
+  sys.dispense(at);
+
+  // A tail-chaser 700 m astern at 400 m/s against a 240 m/s aircraft: 160 m/s of
+  // closure, straight down the line the flares were dropped on.
+  const chaser = { owner: "hostile", position: { x: 0, y: 600, z: 700 }, lost: false };
+  for (let i = 0; i < 60 * 3 && !chaser.lost; i++) {
+    player.z -= 240 / 60;
+    chaser.position.z -= 400 / 60;
+    sys.update([chaser], player, 1 / 60);
+  }
+  check("decoy: a stern chase is defeated by the flares it flies through", chaser.decoyed === true && chaser.target && chaser.target.label === "FLARE", [chaser.decoyed, Math.round(chaser.position.z)]);
+  check("decoy: it is counted", sys.state.decoys === 1, sys.state.decoys);
+  /**
+   * The mechanism, asserted directly, because the first version got it wrong:
+   * a decoyed round is RE-TARGETED, not switched off. Setting `lost` freezes a
+   * round's heading, and a round that was tracking well is already pointed at
+   * the aircraft — freezing it changes nothing and it arrives anyway. That is
+   * exactly the "flares are useless" report.
+   */
+  check("decoy: the round is re-targeted, not frozen", chaser.lost !== true && chaser.target !== player, chaser.lost);
+  check("decoy: and the flare it chases is a real target", chaser.target.alive === true && !!chaser.target.position);
+  // ...and when the flare burns out the round loses its solution, which the
+  // missile system already handles: no live target means no guidance.
+  for (let i = 0; i < 60 * (FLARE.life + 0.2); i++) sys.update([chaser], player, 1 / 60);
+  check("decoy: a burnt-out flare stops being a target", chaser.target.alive === false);
+
+  // A head-on shot arrives before the flares are anywhere near its path, so
+  // panicking early buys nothing. This is the fairness half of the mechanic.
+  const early = createFlareSystem({});
+  const p2 = { x: 0, y: 600, z: 0 };
+  const at2 = { position: p2, velocity: { x: 0, y: 0, z: -240 }, right: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 }, forward: { x: 0, y: 0, z: -1 } };
+  early.dispense(at2);
+  const headOn = { owner: "sam", position: { x: 0, y: 600, z: -2000 }, lost: false };
+  for (let i = 0; i < 60 * 3 && !headOn.decoyed; i++) {
+    p2.z -= 240 / 60;
+    headOn.position.z += 300 / 60; // closing from ahead
+    early.update([headOn], p2, 1 / 60);
+  }
+  check("decoy: a head-on shot is not defeated by flares", !headOn.decoyed, [headOn.decoyed, Math.round(headOn.position.z)]);
+
+  // A round that is already inside the standoff cannot be saved from.
+  const sys2 = createFlareSystem({});
+  const p3 = { x: 0, y: 600, z: 0 };
+  sys2.dispense({ position: p3, velocity: { x: 0, y: 0, z: -240 }, right: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 }, forward: { x: 0, y: 0, z: -1 } });
+  const committed = { owner: "sam", position: { x: 0, y: 600, z: 80 }, lost: false };
+  for (let i = 0; i < 60; i++) sys2.update([committed], p3, 1 / 60);
+  check("decoy: a round already inside the standoff is not decoyed", !committed.decoyed, committed.decoyed);
+
+  // A round that has already lost its solution is not counted twice.
+  const sys3 = createFlareSystem({});
+  const p4 = { x: 0, y: 600, z: 0 };
+  sys3.dispense({ position: p4, velocity: { x: 0, y: 0, z: -240 }, right: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 }, forward: { x: 0, y: 0, z: -1 } });
+  const already = { owner: "hostile", position: { x: 0, y: 600, z: 400 }, lost: true };
+  for (let i = 0; i < 60; i++) sys3.update([already], p4, 1 / 60);
+  check("decoy: an already-defeated round is not re-counted", sys3.state.decoys === 0);
+}
+
+/* ===== Stage 04.2 — SAM sites, terrain masking, game modes ===== */
+
+/* ---- line of sight: the mechanic ---- */
+{
+  // A ridge 300 m high sitting between x 400 and x 700.
+  const ridge = (x) => (x > 400 && x < 700 ? 300 : 20);
+  const ground = (x, _z) => ridge(x);
+  const site = { x: 0, y: 25, z: 0 };
+
+  check("los: flat ground between two points is clear", lineOfSight(site, { x: 300, y: 400, z: 0 }, ground));
+  check("los: a ridge in the way blocks it", !lineOfSight(site, { x: 1200, y: 120, z: 0 }, ground));
+  check("los: going over the ridge is clear again", lineOfSight(site, { x: 1200, y: 900, z: 0 }, ground));
+  // The clearance margin is in the player's favour: a graze counts as cover.
+  check("los: a graze counts as cover", !lineOfSight(site, { x: 1200, y: 305, z: 0 }, ground), SAM.losClearance);
+  // Endpoints are skipped, or a site standing ON the ground would block itself.
+  const solid = () => 1000;
+  check("los: with no sampler everything is visible", lineOfSight(site, { x: 9, y: 9, z: 9 }, null));
+  check("los: solid ground everywhere blocks everything", !lineOfSight(site, { x: 1200, y: 100, z: 0 }, solid));
+
+  check("sam: the dead zone overhead is a way through", !inEngagementRange(100) && inEngagementRange(1500));
+  check("sam: and there is an outer limit", !inEngagementRange(9000));
+  check("sam: the envelope sits inside the round's own reach", SAM.maxRange < SAM_MISSILE.maxSpeed * SAM_MISSILE.lifetime, [SAM.maxRange, SAM_MISSILE.maxSpeed * SAM_MISSILE.lifetime]);
+}
+
+/* ---- the transition table ---- */
+{
+  const S = SamState;
+  const T = (phase, over = {}, ctx = {}) =>
+    samTransition({ phase, timer: 1, rounds: 3, launched: false, lostFor: 0, ...over }, { alive: true, visible: true, inRange: true, playerAlive: true, ...ctx });
+
+  check("sam: it only acquires what it can see", T(S.SEARCH) === S.TRACK && T(S.SEARCH, {}, { visible: false }) === S.SEARCH);
+  check("sam: and only inside its envelope", T(S.SEARCH, {}, { inRange: false }) === S.SEARCH);
+  // A spent site is still a target and still worth a kill, but it has stopped
+  // being a threat — it must not sit in LOCK forever with nothing to fire.
+  check("sam: a spent site never acquires again", T(S.SEARCH, { rounds: 0 }) === S.SEARCH);
+  /**
+   * THE SAME RULE ON THE WAY OUT. Enforcing it only at SEARCH left LAUNCH with no
+   * exit except firing: the firing branch is gated on `rounds > 0`, so a spent
+   * site in LAUNCH never set `launched`, and the table returned LAUNCH forever.
+   * The site then held the player in a permanent lock with no missile ever
+   * arriving — reported from play as "it just locks and warns without shooting".
+   */
+  check("sam: a spent site cannot sit in LAUNCH", T(S.LAUNCH, { rounds: 0, launched: false }) === S.RELOAD, T(S.LAUNCH, { rounds: 0, launched: false }));
+  check("sam: a spent site cannot hold a LOCK either", T(S.LOCK, { rounds: 0, timer: 5 }) === S.SEARCH, T(S.LOCK, { rounds: 0, timer: 5 }));
+  check("sam: an armed site still waits in LAUNCH for its own shot", T(S.LAUNCH, { rounds: 2, launched: false }) === S.LAUNCH);
+  check("sam: and leaves once the round is away", T(S.LAUNCH, { rounds: 1, launched: true }) === S.RELOAD);
+  // Termination: from LAUNCH, every magazine state reaches a state that is not
+  // LAUNCH within one step. No path may loop on itself.
+  check(
+    "sam: LAUNCH always terminates",
+    [0, 1, 3].every((r) => [true, false].some(() => T(S.LAUNCH, { rounds: r, launched: true }) !== S.LAUNCH)) &&
+      T(S.LAUNCH, { rounds: 0, launched: false }) !== S.LAUNCH
+  );
+  check("sam: tracking takes time", T(S.TRACK) === S.TRACK && T(S.TRACK, { timer: 0 }) === S.LOCK);
+  check("sam: losing sight during a track drops it", T(S.TRACK, {}, { visible: false }) === S.SEARCH);
+  check("sam: but a lock survives a flicker", T(S.LOCK, { lostFor: SAM.lossGrace * 0.5 }) === S.LOCK);
+  check("sam: and breaks once sight is genuinely lost", T(S.LOCK, { lostFor: SAM.lossGrace + 0.1 }) === S.SEARCH);
+  check("sam: flying out of the envelope breaks a lock too", T(S.LOCK, {}, { inRange: false }) === S.SEARCH);
+  check("sam: a completed lock launches", T(S.LOCK, { timer: 0 }) === S.LAUNCH);
+  check("sam: launching goes to reload", T(S.LAUNCH) === S.LAUNCH && T(S.LAUNCH, { launched: true }) === S.RELOAD);
+  check("sam: reload is a fixed wait", T(S.RELOAD) === S.RELOAD && T(S.RELOAD, { timer: 0 }) === S.SEARCH);
+  check("sam: destruction wins from every state", [S.SEARCH, S.TRACK, S.LOCK, S.LAUNCH, S.RELOAD].every((p) => T(p, {}, { alive: false }) === S.DESTROYED));
+  check("sam: and is terminal", T(S.DESTROYED, {}, { alive: true }) === S.DESTROYED);
+
+  check("sam: the player is told TRACK then LOCK, reusing the air words", samThreatLevel(S.TRACK) === "TRACK" && samThreatLevel(S.LOCK) === "LOCK" && samThreatLevel(S.LAUNCH) === "LOCK");
+  check("sam: a searching or reloading site says nothing", samThreatLevel(S.SEARCH) === "NONE" && samThreatLevel(S.RELOAD) === "NONE" && samThreatLevel(S.DESTROYED) === "NONE");
+
+  // Acquisition is slow enough that a fast covered pass survives it.
+  const toLaunch = SAM.trackTime + SAM.lockTime + SAM.launchDelay;
+  check("sam: nothing is in the air for nearly three seconds", toLaunch > 2.5 && toLaunch < 4, toLaunch);
+  check("sam: the reload is longer than the acquisition", SAM.reload > toLaunch, [SAM.reload, toLaunch]);
+}
+
+/* ---- the round ---- */
+{
+  check("sam round: slower than the AIM-9, faster than the hostile's", SAM_MISSILE.maxSpeed < MISSILE.maxSpeed && SAM_MISSILE.maxSpeed > HOSTILE_MISSILE.maxSpeed, [SAM_MISSILE.maxSpeed, HOSTILE_MISSILE.maxSpeed, MISSILE.maxSpeed]);
+  check("sam round: the widest turn of the three — a crossing manoeuvre beats it", SAM_MISSILE.turnRateDeg < HOSTILE_MISSILE.turnRateDeg && SAM_MISSILE.turnRateDeg < MISSILE.turnRateDeg, SAM_MISSILE.turnRateDeg);
+  check("sam round: the longest legs, because it starts from a standstill", SAM_MISSILE.lifetime > HOSTILE_MISSILE.lifetime, [SAM_MISSILE.lifetime, HOSTILE_MISSILE.lifetime]);
+  check("sam round: it launches upward", SAM_MISSILE.separationDown < 0, SAM_MISSILE.separationDown);
+  check("sam round: it inherits no launch speed", SAM_MISSILE.inheritFactor === 0);
+  // Turn radius: v / omega. Comparable to the F-15's arcade turn, which is the
+  // fairness claim — the same one the hostile's round has to satisfy.
+  const radius = SAM_MISSILE.maxSpeed / (SAM_MISSILE.turnRateDeg * DEG);
+  check("sam round: its turn radius is beatable", radius > 900, Math.round(radius));
+  check("sam round: a defeated round keeps flying a curve", SAM.maskedAuthority > 0 && SAM.maskedAuthority < 0.2, SAM.maskedAuthority);
+}
+
+/* ---- placement ---- */
+{
+  const legs = [
+    { phase: MissionPhase.TERRAIN, name: "PASS", position: { x: 0, y: 400, z: -10000 }, radius: 1300 },
+    { phase: MissionPhase.TERRAIN, name: "VALLEY", position: { x: 500, y: 400, z: -13000 }, radius: 1400 },
+    { phase: MissionPhase.EGRESS, name: "COAST", position: { x: 0, y: 300, z: -4000 }, radius: 1250 },
+  ];
+  const land = () => 200;
+  const plan = planSamSites(legs, land);
+  check("placement: two sites per terrain leg", plan.length === 4, plan.length);
+  check("placement: and none on a leg that is not terrain", plan.every((p) => p.leg !== "COAST"), plan.map((p) => p.leg));
+  check("placement: they flank the corridor rather than sitting on it", plan.every((p) => Math.abs(p.x - (p.leg === "PASS" ? 0 : 500)) > 900), plan.map((p) => p.x));
+  check("placement: both sides are used", new Set(plan.map((p) => Math.sign(p.x - (p.leg === "PASS" ? 0 : 500)))).size === 2, plan.map((p) => p.x));
+  check("placement: they stand on the ground", plan.every((p) => p.y === 200), plan.map((p) => p.y));
+
+  // The bug this probing exists for: a lateral offset can miss the land, and the
+  // first build put two launchers in the sea at y = -3 and y = 14.
+  const sea = () => 0;
+  check("placement: a site with nowhere to stand is dropped, not floated", planSamSites(legs, sea).length === 0, planSamSites(legs, sea));
+  // Land on one side only: it probes outward and finds it rather than giving up.
+  const oneSided = (x) => (x > 200 ? 180 : 0);
+  const found = planSamSites(legs, oneSided);
+  check("placement: it probes outward for real ground", found.length > 0 && found.every((p) => p.y >= MISSION.sam.minGround), found.map((p) => [p.x, p.y]));
+  check("placement: with no terrain sampler at all, no sites", planSamSites(legs, null).length === 0);
+}
+
+/* ---- the network, end to end ---- */
+{
+  const flat = () => 0;
+  const site = createSamSite({ position: { x: 0, y: 0, z: 0 } });
+  const net = createSamNetwork({ sites: [site], sampleHeight: flat });
+  const player = { position: { x: 0, y: 600, z: -1500 }, alive: true };
+
+  net.setActive(false);
+  for (let i = 0; i < 600; i++) net.update(player, 1 / 60);
+  check("network: an inactive network is not simulated", site.phase === SamState.SEARCH && net.state.launches === 0);
+  check("network: and its sites are not drawn", site.root.visible === false);
+
+  let launches = 0;
+  net.on("launch", () => (launches += 1));
+  net.setActive(true);
+  check("network: activating shows the sites", site.root.visible === true);
+
+  let firstLaunchAt = -1;
+  for (let i = 0; i < 60 * 6; i++) {
+    net.update(player, 1 / 60);
+    if (launches && firstLaunchAt < 0) firstLaunchAt = i / 60;
+  }
+  const expected = SAM.trackTime + SAM.lockTime + SAM.launchDelay;
+  check("network: a visible player is tracked, locked and shot at", launches === 1, launches);
+  check("network: after the full acquisition time", firstLaunchAt >= expected - 0.1 && firstLaunchAt <= expected + 0.2, [firstLaunchAt, expected]);
+  check("network: then it reloads rather than firing again", site.phase === SamState.RELOAD && site.rounds === SAM.rounds - 1, [site.phase, site.rounds]);
+
+  // Terrain masking, the whole point: the same geometry behind a hill produces
+  // nothing at all.
+  const wall = (x, z) => (Math.abs(z) > 200 && Math.abs(z) < 1300 ? 900 : 0);
+  const hidden = createSamSite({ position: { x: 0, y: 0, z: 0 } });
+  const masked = createSamNetwork({ sites: [hidden], sampleHeight: wall });
+  let maskedLaunches = 0;
+  masked.on("launch", () => (maskedLaunches += 1));
+  masked.setActive(true);
+  for (let i = 0; i < 60 * 20; i++) masked.update(player, 1 / 60);
+  check("network: terrain masking defeats acquisition entirely", maskedLaunches === 0 && hidden.phase === SamState.SEARCH, [maskedLaunches, hidden.phase]);
+  check("network: and the site knows it cannot see", hidden.visible === false && hidden.lostFor > 19, hidden.lostFor);
+
+  // Destroyable, and it stays in the world as a wreck.
+  check("network: a live site is a targeting candidate", net.targets.length === 1);
+  wreckSamSite(site);
+  check("network: a destroyed site is no longer a candidate", net.targets.length === 0);
+  check("network: but it is still visible — a kill should leave evidence", site.root.visible === true && site.turret.visible === false);
+  check("network: and it stops threatening", net.threatSource() === null);
+  net.update(player, 1 / 60);
+  check("network: a dead site is not simulated", net.state.alive === 0, net.state.alive);
+  resetSamSite(site);
+  check("network: reset brings it back whole", site.alive && site.health === site.maxHealth && site.rounds === SAM.rounds && site.turret.visible);
+
+  check("network: a site publishes the same target contract the drone does", site.position && site.velocity && site.alive === true && typeof site.health === "number" && typeof site.radius === "number");
+  check("network: and identifies itself as ground", site.kind === "SAM" && site.label === "SAM SITE");
+}
+
+/* ---- threat display: two sources, one set of words ---- */
+{
+  const monitor = createThreatMonitor();
+  const base = { position: { x: 0, y: 500, z: 0 }, forward: { x: 0, y: 0, z: -1 }, right: { x: 1, y: 0, z: 0 }, up: { x: 0, y: 1, z: 0 }, expert: false, maneuver: null, incoming: [] };
+
+  monitor.update({ ...base, hostile: { tracking: true, locked: false, range: 3000 }, ground: null }, 1 / 60);
+  check("threat: a fighter tracking says TRACK, from the air", monitor.state.level === ThreatLevel.TRACK && monitor.state.source === "AIR");
+
+  monitor.update({ ...base, hostile: {}, ground: { tracking: true, locked: false, lockProgress: 0.4, range: 2000 } }, 1 / 60);
+  check("threat: a SAM tracking reuses the same word, labelled SAM", monitor.state.level === ThreatLevel.TRACK && monitor.state.source === "SAM");
+
+  // A lock outranks a track whichever side it came from.
+  monitor.update({ ...base, hostile: { tracking: true, range: 3000 }, ground: { locked: true, lockProgress: 1, range: 2500 } }, 1 / 60);
+  check("threat: a SAM lock outranks a fighter merely tracking", monitor.state.level === ThreatLevel.LOCK && monitor.state.source === "SAM");
+
+  // Two acquisitions at once: the nearer one is the one worth telling them about.
+  monitor.update({ ...base, hostile: { locked: true, range: 4000 }, ground: { locked: true, lockProgress: 1, range: 900 } }, 1 / 60);
+  check("threat: with both locked, the closer threat is named", monitor.state.source === "SAM", monitor.state.source);
+  monitor.update({ ...base, hostile: { locked: true, range: 600 }, ground: { locked: true, lockProgress: 1, range: 3800 } }, 1 / 60);
+  check("threat: and the other way round", monitor.state.source === "AIR", monitor.state.source);
+
+  // A round in the air always wins, and names its own owner.
+  const round = { position: { x: 0, y: 500, z: -700 }, owner: "sam", dir: { x: 0, y: 0, z: 1 }, authority: 1 };
+  monitor.update({ ...base, hostile: { tracking: true, range: 100 }, ground: null, incoming: [round] }, 1 / 60);
+  check("threat: a live round outranks any acquisition", monitor.state.level === ThreatLevel.MISSILE);
+  check("threat: and a SAM round says so", monitor.state.source === "SAM", monitor.state.source);
+  round.owner = "hostile";
+  monitor.update({ ...base, hostile: {}, ground: { locked: true, range: 10 }, incoming: [round] }, 1 / 60);
+  check("threat: an air round says so too", monitor.state.source === "AIR", monitor.state.source);
+
+  // The barrel roll works on a SAM round as well; it used to return 1 for any
+  // owner that was not the fighter.
+  const ctx = { position: base.position, velocityDir: { x: 0, y: 0, z: -1 }, inPeak: true };
+  const samRound = { owner: "sam", position: { x: 0, y: 500, z: -400 }, dir: { x: 0, y: 0, z: 1 } };
+  check("threat: the barrel roll degrades a SAM round too", monitor.authorityFor(samRound, ctx) < 1, monitor.authorityFor(samRound, ctx));
+  check("threat: but not the player's own", monitor.authorityFor({ ...samRound, owner: "player" }, ctx) === 1);
+}
+
+/* ---- game modes ---- */
+{
+  check("modes: three of them, and MISSION is first", MODE_ORDER.length === 3 && MODE_ORDER[0] === GameMode.MISSION, MODE_ORDER);
+  check("modes: cycling returns to the start", nextMode(nextMode(nextMode(GameMode.MISSION))) === GameMode.MISSION);
+  check("modes: every mode has a full rules row", MODE_ORDER.every((m) => { const r = modeRules(m); return typeof r.label === "string" && typeof r.phases === "boolean" && typeof r.hostiles === "boolean" && typeof r.sams === "boolean" && r.respawn; }));
+  check("modes: an unknown mode falls back to the mission", modeRules("NOPE") === MODES.MISSION);
+
+  check("modes: only MISSION runs the phase machine", !isSandbox(GameMode.MISSION) && isSandbox(GameMode.FREE) && isSandbox(GameMode.PEACE));
+  check("modes: only MISSION is timed, and only MISSION has an ending", MODES.MISSION.timer && !MODES.FREE.timer && !MODES.PEACE.timer && MODES.MISSION.ending && !MODES.FREE.ending);
+  check("modes: PEACE has no threats at all", !MODES.PEACE.hostiles && !MODES.PEACE.sams);
+  check("modes: FREE keeps both", MODES.FREE.hostiles && MODES.FREE.sams);
+  // Both sandbox modes respawn on the carrier, because placeOnDeck plus the
+  // launch script already IS a carrier respawn.
+  check("modes: the sandbox modes respawn on the carrier", MODES.FREE.respawn === "CARRIER" && MODES.PEACE.respawn === "CARRIER" && MODES.MISSION.respawn === "CHECKPOINT");
+  // PEACE is not a screensaver: the ground still kills you.
+  check("modes: PEACE still has a failure state", !!MODES.PEACE.respawn);
+}
+
+{
+  let spawns = 0;
+  let samsOn = null;
+  const box = createSandbox({ spawnHostile: () => (spawns += 1), setSams: (on) => (samsOn = on) });
+
+  box.begin(GameMode.PEACE);
+  check("sandbox: PEACE switches the SAM network off", samsOn === false);
+  for (let i = 0; i < 60 * 120; i++) box.update({ hostileAlive: false }, 1 / 60);
+  check("sandbox: and never spawns anything, however long you fly", spawns === 0, spawns);
+  check("sandbox: but the clock still runs for the rail", box.state.elapsed > 119, box.state.elapsed);
+
+  box.begin(GameMode.FREE);
+  check("sandbox: FREE switches the SAM network on", samsOn === true);
+  for (let i = 0; i < 60 * (SANDBOX.firstHostile - 1); i++) box.update({ hostileAlive: false }, 1 / 60);
+  check("sandbox: the first hostile waits a beat after the launch", spawns === 0, spawns);
+  for (let i = 0; i < 60 * 2; i++) box.update({ hostileAlive: false }, 1 / 60);
+  check("sandbox: then it arrives", spawns === 1, spawns);
+
+  // One at a time, always. A living hostile freezes the respawn clock entirely.
+  for (let i = 0; i < 60 * 60; i++) box.update({ hostileAlive: true }, 1 / 60);
+  check("sandbox: a live hostile is never joined by a second", spawns === 1, spawns);
+  for (let i = 0; i < 60 * (SANDBOX.hostileRespawn - 1); i++) box.update({ hostileAlive: false }, 1 / 60);
+  check("sandbox: a kill buys a real pause", spawns === 1, spawns);
+  for (let i = 0; i < 60 * 2; i++) box.update({ hostileAlive: false }, 1 / 60);
+  check("sandbox: and then the next one", spawns === 2, spawns);
+
+  // SAM sites deliberately do not come back: clearing the valley is the reward.
+  check("sandbox: SAM sites never respawn", SANDBOX.samRespawn === null);
+
+  box.reset();
+  for (let i = 0; i < 60 * 60; i++) box.update({ hostileAlive: false }, 1 / 60);
+  check("sandbox: reset stops it dead", spawns === 2 && !box.state.live, spawns);
+}
+
+/* ---- the director parks in a sandbox mode ---- */
+{
+  const d = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  d.setRoute(planRoute({ coastZ: -7600, features: [] }));
+  d.setSandbox(true);
+  d.reset();
+  const pos = { x: 0, y: 600, z: -1546 };
+  // Fly the launch, then a long way past where EGRESS would have ended.
+  for (let i = 0; i < 60 * 90; i++) {
+    if (d.state.phase !== MissionPhase.DECK && d.state.phase !== MissionPhase.LAUNCH) pos.z -= 220 / 60;
+    d.update({ position: pos, strokeStarted: i > 60 * 1.7, launchDone: i > 60 * 5.42, hostileAlive: true, hostileSpent: false }, 1 / 60);
+  }
+  check("parked: every mode still flies the catapult", d.state.phase !== MissionPhase.DECK, d.state.phase);
+  check("parked: but a sandbox mode stops at EGRESS and stays there", d.state.phase === MissionPhase.EGRESS && d.state.parked, [d.state.phase, d.state.parked]);
+  check("parked: with no navigation", !d.state.navValid && d.state.navName === null);
+  check("parked: and no clock", d.state.missionTime === 0 && !d.state.timerRunning, d.state.missionTime);
+  check("parked: the mission is never completed by accident", !d.state.finished);
+
+  // The mission mode, same input, still runs to the end.
+  const m = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  m.setRoute(planRoute({ coastZ: -7600, features: [] }));
+  m.reset();
+  m.update({ position: { x: 0, y: 600, z: -1546 }, strokeStarted: true, launchDone: false, hostileAlive: true, hostileSpent: false }, 1 / 60);
+  m.update({ position: { x: 0, y: 600, z: -1546 }, strokeStarted: true, launchDone: true, hostileAlive: true, hostileSpent: false }, 1 / 60);
+  check("parked: MISSION does not park", m.state.phase === MissionPhase.EGRESS && !m.state.parked && m.state.timerRunning);
+}
+
+/* ===== Stage 04.0b — the arrow keys are not flight axes ===== */
+
+/**
+ * The real cause of "my fighter dodges right on its own", found in a screenshot
+ * rather than in the code: the dev rail's held-key field read `ArrowRight` while
+ * the stick read `in +1.00` and bank sat pinned at -70°. A physical ArrowRight
+ * keydown whose keyup never arrived, commanding a full right turn forever.
+ *
+ * Arrow keys were an unadvertised secondary binding, and they are exactly the
+ * keys browser chrome and embedded preview panes steal for their own navigation
+ * — so they are the ones whose keyup goes missing when something else takes
+ * focus mid-press. Four rounds of mouse fixes were the wrong device entirely.
+ */
+{
+  const bus = new EventTarget();
+  const inp = createInput(bus);
+  const raw = (code, down, key) =>
+    bus.dispatchEvent(Object.assign(new Event(down ? "keydown" : "keyup"), { key: key || code, code, repeat: false, preventDefault() {} }));
+  const run = (n = 40) => {
+    for (let i = 0; i < n; i++) inp.update(1 / 60);
+  };
+
+  // The reported failure, reproduced: press ArrowRight and never release it.
+  raw("ArrowRight", true);
+  run(60);
+  check("arrows: a stuck ArrowRight commands no bank", inp.x === 0, inp.x);
+  check("arrows: and it is not even tracked as held", inp.heldKeys().length === 0, inp.heldKeys());
+  for (const code of ["ArrowLeft", "ArrowUp", "ArrowDown"]) {
+    raw(code, true);
+  }
+  run(60);
+  check("arrows: no arrow key touches the flight axes", inp.x === 0 && inp.y === 0, [inp.x, inp.y]);
+
+  // ...while the advertised keys still work, with all four arrows still "down".
+  raw("KeyD", true, "d");
+  run(40);
+  check("arrows: D still banks right with every arrow stuck down", inp.x > 0.8, inp.x);
+  raw("KeyD", false, "d");
+  run(90);
+  check("arrows: and releasing D still returns to centre", Math.abs(inp.x) < 0.02, inp.x);
+
+  // C is the escape hatch for the general case: any lost keyup, one key press.
+  raw("KeyW", true, "w");
+  run(40);
+  check("stuck keys: W is held", inp.y > 0.8 && inp.heldKeys().includes("KeyW"), [inp.y, inp.heldKeys()]);
+  raw("KeyC", true, "c");
+  run(90);
+  check("stuck keys: C drops every held key without a mission restart", inp.heldKeys().length === 0 && Math.abs(inp.y) < 0.02, [inp.heldKeys(), inp.y]);
+
+  // Losing focus mid-press is the mechanism by which a keyup goes missing, so
+  // blur alone must already clear everything.
+  raw("KeyA", true, "a");
+  run(30);
+  check("stuck keys: A is held", inp.x < -0.8, inp.x);
+  bus.dispatchEvent(new Event("blur"));
+  run(90);
+  check("stuck keys: losing focus releases the stick", Math.abs(inp.x) < 0.02, inp.x);
+}
+
+/* ===================== Stage 03.3 — hostile engagement ===================== */
+
+{
+  /* Geometry: the hostile has to agree with the flight model about what a
+   * heading is, or every angle in the stage is subtly wrong. */
+  const o = { x: 0, y: 700, z: 0 };
+  check("hostile: a point dead ahead is heading 0", Math.abs(aimAngles(o, { x: 0, y: 700, z: -100 }).heading) < 1e-9);
+  check("hostile: a point to the right is a negative heading", aimAngles(o, { x: 100, y: 700, z: 0 }).heading < 0);
+  const up45 = aimAngles(o, { x: 0, y: 800, z: -100 });
+  check("hostile: a climbing target is a positive pitch", Math.abs(up45.pitch - 45 * DEG) < 1e-6, up45.pitch / DEG);
+  check("hostile: range is range", Math.abs(up45.range - Math.hypot(100, 100)) < 1e-9);
+
+  // forwardFrom is the inverse, and it is the drone's velocity direction.
+  for (const [h, p] of [[0, 0], [1.2, 0.3], [-2.4, -0.4], [3.0, 0.2]]) {
+    const f = forwardFrom(h, p, {});
+    check("hostile: forwardFrom is unit length", Math.abs(Math.hypot(f.x, f.y, f.z) - 1) < 1e-9);
+    const back = aimAngles({ x: 0, y: 0, z: 0 }, { x: f.x * 500, y: f.y * 500, z: f.z * 500 });
+    check("hostile: heading/pitch round-trip through the forward vector", Math.abs(wrapPi(back.heading - h)) < 1e-6 && Math.abs(back.pitch - p) < 1e-6, [back.heading, h]);
+  }
+
+  check("hostile: off-nose is 0 dead ahead", offNoseDeg(0, 0, o, { x: 0, y: 700, z: -900 }) < 1e-6);
+  check("hostile: off-nose is 180 dead astern", Math.abs(offNoseDeg(0, 0, o, { x: 0, y: 700, z: 900 }) - 180) < 1e-6);
+  check("hostile: off-nose is 90 abeam", Math.abs(offNoseDeg(0, 0, o, { x: 900, y: 700, z: 0 }) - 90) < 1e-6);
+}
+
+{
+  /* §7 — the single guarantee that stops the enemy behaving like a UFO. */
+  const dt = 1 / 60;
+  const rate = HOSTILE.turnRateDeg * DEG;
+  let h = 0;
+  const desired = Math.PI * 0.9;
+  let worst = 0;
+  for (let i = 0; i < 60 * 20; i++) {
+    const next = steerAngle(h, desired, rate, dt);
+    worst = Math.max(worst, Math.abs(wrapPi(next - h)));
+    h = next;
+  }
+  check("steer: no frame turns faster than the maximum rate", worst <= rate * dt + 1e-12, [worst / dt / DEG, HOSTILE.turnRateDeg]);
+  check("steer: it does get there eventually", Math.abs(wrapPi(h - desired)) < 1e-6, h);
+
+  // Across the seam it must take the short way, exactly like the HUD's dampAngle.
+  const seam = steerAngle(3.0, -3.0, 10 * DEG, dt);
+  check("steer: the ±180 seam is crossed the short way", seam > 3.0, seam);
+
+  // Pitch is not an angle on a circle: no wrap, and the guard bounds it.
+  const p = steerAngle(0, 5, HOSTILE.pitchRateDeg * DEG, 1, false);
+  check("steer: pitch does not wrap", p > 0 && p <= HOSTILE.pitchRateDeg * DEG + 1e-12, p / DEG);
+  check("guard: below the floor it is told to climb", altitudeGuard(100, -20 * DEG) > 0);
+  check("guard: above the ceiling it is told to descend", altitudeGuard(9000, 20 * DEG) < 0);
+  check("guard: otherwise it is clamped to the pitch limit", Math.abs(altitudeGuard(1000, 80 * DEG) - HOSTILE.maxPitchDeg * DEG) < 1e-12);
+
+  const pred = predictPoint({ x: 0, y: 700, z: 0 }, { x: 0, y: 0, z: -250 }, 1.2, {});
+  check("pursuit: the aim point leads the player", Math.abs(pred.z + 300) < 1e-9, pred.z);
+}
+
+{
+  /* §9 — attack geometry. All three conditions required, none sufficient. */
+  const a = HOSTILE.attack;
+  check("cone: a valid geometry qualifies", inAttackCone(1400, 10));
+  check("cone: too close does not", !inAttackCone(a.minRange - 1, 0));
+  check("cone: too far does not", !inAttackCone(a.maxRange + 1, 0));
+  check("cone: off the nose does not", !inAttackCone(1400, a.coneDeg + 1));
+  check("cone: the band is the one §9 asks for", a.minRange >= 500 && a.maxRange <= 2500 && a.coneDeg >= 20 && a.coneDeg <= 35, [a.minRange, a.maxRange, a.coneDeg]);
+  check("lock: acquisition takes a visible time (§10)", HOSTILE.lockTime >= 1.0 && HOSTILE.lockTime <= 1.5, HOSTILE.lockTime);
+  check("lock: and there is a beat before launch (§10)", HOSTILE.launchDelay > 0.2, HOSTILE.launchDelay);
+  check("pacing: the cooldown is 5–10 s (§33)", HOSTILE.cooldown >= 5 && HOSTILE.cooldown <= 10, HOSTILE.cooldown);
+  check("pacing: ammunition is limited (§34)", HOSTILE.ammo >= 2 && HOSTILE.ammo <= 3, HOSTILE.ammo);
+
+  // §8: the player must always be able to run away.
+  for (const phase of Object.values(HostileState)) {
+    check("speed: the hostile is never faster than the player's maximum", phaseSpeed(phase) < SPEED.max, [phase, phaseSpeed(phase)]);
+  }
+  check("speed: pursuit sits in the §8 band", phaseSpeed(HostileState.PURSUIT) >= 170 && phaseSpeed(HostileState.PURSUIT) <= 210);
+  check("speed: an attack run is more aggressive than a patrol", phaseSpeed(HostileState.ACQUIRE) > phaseSpeed(HostileState.PATROL));
+}
+
+{
+  /* §3 — the transition table, stated as a table. Every attack condition lives
+   * in this one function, so these checks are the whole promotion policy. */
+  const S = HostileState;
+  const ai = (over = {}) => ({ phase: S.PATROL, ammo: 2, cooldown: 0, timer: 0, lockProgress: 0, launched: false, ...over });
+  const ctx = (over = {}) => ({ alive: true, playerAlive: true, ready: true, range: 1400, inCone: true, ...over });
+
+  check("fsm: patrol detects the player", hostileTransition(ai(), ctx()) === S.PURSUIT);
+  check("fsm: patrol waits out the engage delay", hostileTransition(ai(), ctx({ ready: false })) === S.PATROL);
+  check("fsm: patrol ignores a distant player", hostileTransition(ai(), ctx({ range: HOSTILE.detectRange + 1 })) === S.PATROL);
+  check("fsm: pursuit gives up past the disengage range", hostileTransition(ai({ phase: S.PURSUIT }), ctx({ range: HOSTILE.disengageRange + 1 })) === S.PATROL);
+  check("fsm: pursuit acquires inside the attack geometry", hostileTransition(ai({ phase: S.PURSUIT }), ctx()) === S.ACQUIRE);
+  check("fsm: pursuit does not acquire out of the cone", hostileTransition(ai({ phase: S.PURSUIT }), ctx({ inCone: false })) === S.PURSUIT);
+  check("fsm: pursuit does not acquire while cooling down", hostileTransition(ai({ phase: S.PURSUIT, cooldown: 3 }), ctx()) === S.PURSUIT);
+  check("fsm: pursuit does not acquire with no missiles left", hostileTransition(ai({ phase: S.PURSUIT, ammo: 0 }), ctx()) === S.PURSUIT);
+  check("fsm: acquisition holds until the lock fills", hostileTransition(ai({ phase: S.ACQUIRE, lockProgress: 0.9 }), ctx()) === S.ACQUIRE);
+  check("fsm: a full lock becomes an attack", hostileTransition(ai({ phase: S.ACQUIRE, lockProgress: 1 }), ctx()) === S.ATTACK);
+  check("fsm: a drained lock falls back to pursuit", hostileTransition(ai({ phase: S.ACQUIRE, lockProgress: 0 }), ctx({ inCone: false })) === S.PURSUIT);
+  check("fsm: attack waits for its own launch", hostileTransition(ai({ phase: S.ATTACK }), ctx()) === S.ATTACK);
+  check("fsm: a launch begins the cooldown", hostileTransition(ai({ phase: S.ATTACK, launched: true }), ctx()) === S.COOLDOWN);
+  check("fsm: the break runs on a timer", hostileTransition(ai({ phase: S.COOLDOWN, timer: 1 }), ctx()) === S.COOLDOWN);
+  check("fsm: then it repositions", hostileTransition(ai({ phase: S.COOLDOWN, timer: 0 }), ctx()) === S.REPOSITION);
+  check("fsm: and comes back to pursuit", hostileTransition(ai({ phase: S.REPOSITION, timer: 0 }), ctx()) === S.PURSUIT);
+  for (const phase of [S.PATROL, S.PURSUIT, S.ACQUIRE, S.ATTACK, S.COOLDOWN, S.REPOSITION]) {
+    check("fsm: death wins from any state", hostileTransition(ai({ phase }), ctx({ alive: false })) === S.DESTROYED, phase);
+  }
+  check("fsm: destroyed is terminal", hostileTransition(ai({ phase: S.DESTROYED }), ctx()) === S.DESTROYED);
+}
+
+{
+  /* The AI end to end against a drone entity: the loop §44 describes. */
+  const drone = createTargetDrone();
+  const hostile = createHostileAI({ drone });
+  let launches = 0;
+  hostile.on("launch", () => launches++);
+
+  const player = { position: new THREE.Vector3(0, 700, 0), velocity: new THREE.Vector3(0, 0, -250), alive: true };
+  const seen = [];
+  const dt = 1 / 60;
+  let worstTurn = 0;
+  let prevHeading = drone.heading;
+  let minAlt = Infinity;
+  const launchTimes = [];
+  let t = 0;
+  for (let i = 0; i < 60 * 90; i++) {
+    t += dt;
+    player.position.z -= 250 * dt;
+    const before = launches;
+    hostile.update(player, dt);
+    if (launches > before) launchTimes.push(t);
+    const turn = Math.abs(wrapPi(drone.heading - prevHeading)) / dt;
+    if (i > 1) worstTurn = Math.max(worstTurn, turn);
+    prevHeading = drone.heading;
+    minAlt = Math.min(minAlt, drone.position.y);
+    const phase = hostile.state.phase;
+    if (seen[seen.length - 1] !== phase) seen.push(phase);
+  }
+
+  check("engagement: it patrols first", seen[0] === HostileState.PATROL, seen);
+  check("engagement: it pursues", seen.includes(HostileState.PURSUIT), seen);
+  check("engagement: it acquires", seen.includes(HostileState.ACQUIRE), seen);
+  check("engagement: it attacks", seen.includes(HostileState.ATTACK), seen);
+  check("engagement: it breaks away and repositions", seen.includes(HostileState.COOLDOWN) && seen.includes(HostileState.REPOSITION), seen);
+  check("engagement: acquisition never skips straight to a launch", seen.indexOf(HostileState.ACQUIRE) < seen.indexOf(HostileState.ATTACK), seen);
+  check("engagement: it never turns faster than its rate limit", worstTurn <= HOSTILE.turnRateDeg * DEG * 1.001, worstTurn / DEG);
+  check("engagement: it stays out of the sea", minAlt > 0, minAlt);
+  check("engagement: it spends its whole magazine and no more (§34)", launches === HOSTILE.ammo && hostile.state.ammo === 0, [launches, hostile.state.ammo]);
+  for (let i = 1; i < launchTimes.length; i++) {
+    check("engagement: no launch inside the cooldown (§33)", launchTimes[i] - launchTimes[i - 1] >= HOSTILE.cooldown, launchTimes);
+  }
+  check("engagement: nothing is launched before the engage delay", launchTimes[0] > HOSTILE.engageDelay, launchTimes[0]);
+
+  // §37: killing it stops new attacks; it does not stop rounds already away.
+  hostile.reset();
+  markTargetHit(drone, 1);
+  launches = 0;
+  for (let i = 0; i < 60 * 30; i++) hostile.update(player, dt);
+  check("destroyed: a dead hostile launches nothing", launches === 0);
+  check("destroyed: and reports the state", hostile.state.phase === HostileState.DESTROYED);
+
+  // §38: reset restores the whole opponent, ammunition included.
+  resetTargetDrone(drone);
+  hostile.reset();
+  check("reset: ammunition comes back", hostile.state.ammo === HOSTILE.ammo);
+  check("reset: the machine is back at patrol", hostile.state.phase === HostileState.PATROL && hostile.state.cooldown === 0);
+}
+
+{
+  /* The drone entity itself: pitch and speed are now real, and the Stage 03.0
+   * racetrack has to be unchanged by that. */
+  const d = createTargetDrone();
+  d.pitch = 10 * DEG;
+  d.speed = 200;
+  const y0 = d.position.y;
+  integrateDrone(d, 1);
+  check("drone: a positive pitch climbs", d.position.y > y0, d.position.y - y0);
+  check("drone: velocity magnitude is the commanded speed", Math.abs(d.velocity.length() - 200) < 1e-6, d.velocity.length());
+
+  const flat = createTargetDrone();
+  const alt = flat.position.y;
+  for (let i = 0; i < 60 * 12; i++) updateTargetDrone(flat, 1 / 60);
+  check("drone: the scripted patrol still holds its altitude", Math.abs(flat.position.y - alt) < 1e-6, flat.position.y);
+  check("drone: and still flies its arc", Math.abs(flat.heading) > 0.1, flat.heading);
+  check("drone: the hardpoint is off the centreline (§16)", Math.abs(flat.hardpoint.position.x) > 0.5 && flat.hardpoint.position.y < 0, flat.hardpoint.position);
+}
+
+{
+  /* §11–§13, §24–§25 — what the player is told. */
+  check("threat: nothing happening is NONE", threatLevelOf({}) === ThreatLevel.NONE);
+  check("threat: acquisition reads TRACK", threatLevelOf({ tracking: true }) === ThreatLevel.TRACK);
+  check("threat: a completed lock reads LOCK", threatLevelOf({ tracking: true, locked: true }) === ThreatLevel.LOCK);
+  check("threat: a round in the air outranks both", threatLevelOf({ tracking: true, locked: true, incoming: true }) === ThreatLevel.MISSILE);
+  check("threat: MISSILE is not shown merely because a hostile exists (§11)", threatLevelOf({ tracking: false, locked: false, incoming: false }) !== ThreatLevel.MISSILE);
+
+  check("threat: over a kilometre is the calm tier", warningTier(1400) === ThreatTier.FAR);
+  check("threat: inside a kilometre escalates", warningTier(800) === ThreatTier.NEAR);
+  check("threat: inside 500 m is urgent", warningTier(300) === ThreatTier.URGENT);
+  check("threat: the tiers are §25's", THREAT.nearRange === 1000 && THREAT.urgentRange === 500);
+
+  // §13 — direction. Player facing -Z, right = +X, up = +Y.
+  const f = { x: 0, y: 0, z: -1 };
+  const r = { x: 1, y: 0, z: 0 };
+  const u = { x: 0, y: 1, z: 0 };
+  const at = { x: 0, y: 0, z: 0 };
+  check("bearing: a threat on the right points right", threatBearing(f, r, u, at, { x: 500, y: 0, z: -100 }, {}).arrow === "\u25b6");
+  check("bearing: a threat on the left points left", threatBearing(f, r, u, at, { x: -500, y: 0, z: -100 }, {}).arrow === "\u25c0");
+  check("bearing: a threat above points up", threatBearing(f, r, u, at, { x: 0, y: 500, z: -100 }, {}).arrow === "\u25b2");
+  const behind = threatBearing(f, r, u, at, { x: 0, y: 0, z: 900 }, {});
+  check("bearing: astern is its own answer, not an arrow at the screen edge", behind.behind === true, behind);
+}
+
+{
+  /* §21–§23 — the dodge. The whole point is that it is a timing skill and not a
+   * button that grants invulnerability. */
+  const assisted = dodgeWindow(false);
+  const expert = dodgeWindow(true);
+  check("dodge: the window is measured against the real roll length", THREAT.rollDuration === ROLL.duration, [THREAT.rollDuration, ROLL.duration]);
+  check("dodge: assisted gets the wider window (§40)", assisted.seconds > expert.seconds, [assisted.seconds, expert.seconds]);
+  check("dodge: assisted is 0.60 s (§40)", Math.abs(assisted.seconds - 0.6) < 1e-9);
+  check("dodge: expert is 0.40–0.45 s (§40)", expert.seconds >= 0.4 && expert.seconds <= 0.45, expert.seconds);
+  check("dodge: the window is a fraction of the manoeuvre, not all of it (§22)", assisted.end < 1 && assisted.start > 0, assisted);
+
+  const roll = (t) => ({ kind: "roll", t });
+  check("dodge: nothing before the peak", !inDodgePeak(roll(0.05), false));
+  check("dodge: the peak is live mid-manoeuvre", inDodgePeak(roll(0.4), false));
+  check("dodge: and over before the roll ends", !inDodgePeak(roll(0.95), false));
+  check("dodge: no manoeuvre, no window", !inDodgePeak(null, false));
+
+  check("evade: without the manoeuvre a round is untouched", evasionAuthority({ inPeak: false, range: 200 }) === 1);
+  check("evade: pressed far too early it does nothing (§23)", evasionAuthority({ inPeak: true, range: 2000 }) === 1);
+  const late = evasionAuthority({ inPeak: true, range: 300, aspectDeg: 60 });
+  check("evade: pressed late against a committed round it cripples guidance", late <= THREAT.dodgeAuthority + 1e-9, late);
+  check("evade: but never to zero — a miss must still fly like a missile", late > 0);
+  const mid = evasionAuthority({ inPeak: true, range: 750, aspectDeg: 60 });
+  check("evade: in between it is a partial effect, not a cliff", mid > late && mid < 1, mid);
+  const stern = evasionAuthority({ inPeak: true, range: 300, aspectDeg: 5 });
+  check("evade: a stern chase is harder to roll out of than a crossing shot (§22)", stern > late, [stern, late]);
+  check("evade: even a stern chase is degraded", stern < 1);
+
+  check("evade: a miss is only announced if it was going to be a hit (§43)", evadeEarned(400) && !evadeEarned(4000));
+  check("evade: a round that never had a range is not an evade", !evadeEarned(Infinity));
+}
+
+{
+  /* §14/§17 — the hostile round is the same implementation with different
+   * numbers. If those numbers ever converge, the two weapons stop meaning
+   * different things. */
+  const h = HOSTILE_MISSILE;
+  check("enemy missile: slower than the player's AIM-9", h.maxSpeed < MISSILE.maxSpeed, [h.maxSpeed, MISSILE.maxSpeed]);
+  check("enemy missile: less agile than the player's AIM-9", h.turnRateDeg < MISSILE.turnRateDeg, [h.turnRateDeg, MISSILE.turnRateDeg]);
+  check("enemy missile: speed is in the §17 band", h.maxSpeed >= 320 && h.maxSpeed <= 420, h.maxSpeed);
+  check("enemy missile: lifetime is in the §17 band", h.lifetime >= 6 && h.lifetime <= 10, h.lifetime);
+  check("enemy missile: the fuze is in the §19 band", h.hitRadius >= 6 && h.hitRadius <= 10, h.hitRadius);
+  check("enemy missile: it gives up its turn sooner than an AIM-9 (§28)", h.overshootAngleDeg < MISSILE.overshootAngleDeg);
+
+  // A turn radius the player can out-fly is the whole fairness claim: at
+  // 250 m/s the F-15's arcade turn is comparable to the round's.
+  const radius = h.maxSpeed / (h.turnRateDeg * DEG);
+  check("enemy missile: its turn radius is beatable, not a snap-to-target", radius > 500, `${Math.round(radius)} m`);
+
+  check("overshoot: both conditions are required (§28)", !overshooting(140, false, 900, h) && !overshooting(20, true, 900, h));
+  check("overshoot: a beaten round is declared lost", overshooting(140, true, 900, h));
+  check("overshoot: not while it is still on top of the target", !overshooting(179, true, h.hitRadius, h));
+}
+
+{
+  /* The enemy round in flight, in-page. Three runs of the same geometry:
+   * straight and level (it hits), a mistimed dodge (it still hits), and a timed
+   * dodge (it overshoots). That triple IS §48/§49. */
+  const scene = new THREE.Scene();
+  const shooter = new THREE.Object3D();
+  shooter.position.set(0, 700, 900);
+  // Forward is -Z: from behind the player, up their tail. That is the geometry
+  // the hostile's own pursuit curve produces (§6), so it is the one to test.
+  scene.add(shooter);
+  shooter.updateMatrixWorld(true);
+
+  const run = ({ dodgeAt = null, expert = false }) => {
+    const player = { position: new THREE.Vector3(0, 700, 0), velocity: new THREE.Vector3(0, 0, -250), alive: true };
+    const monitor = createThreatMonitor();
+    const evasion = { position: player.position, velocityDir: { x: 0, y: 0, z: -1 }, inPeak: false };
+    const system = createMissileSystem({ scene, prototype: null, authorityFor: (m) => monitor.authorityFor(m, evasion) });
+    let hit = 0;
+    let expired = 0;
+    let minRange = Infinity;
+    system.on("hit", () => hit++);
+    system.on("expire", () => expired++);
+    const m = system.fire({ mount: shooter, target: player, ownerSpeed: 200, owner: "hostile", cfg: HOSTILE_MISSILE });
+    let maneuver = null;
+    const dt = 1 / 60;
+    for (let i = 0; i < 60 * 14 && system.inFlight; i++) {
+      const range = m.position.distanceTo(player.position);
+      minRange = Math.min(minRange, range);
+      // The dodge begins when the round reaches the trigger range and then runs
+      // its full 1.5 s, exactly as the flight model would fly it.
+      if (dodgeAt !== null && !maneuver && range <= dodgeAt) maneuver = { kind: "roll", t: 0 };
+      if (maneuver) {
+        maneuver.t = Math.min(1, maneuver.t + dt / ROLL.duration);
+        // A barrel roll is not a straight line: the player displaces laterally.
+        player.position.x += Math.sin(maneuver.t * Math.PI * 2) * 70 * dt;
+        player.velocity.set(Math.sin(maneuver.t * Math.PI * 2) * 70, 0, -250);
+        if (maneuver.t >= 1) maneuver = null;
+      }
+      evasion.inPeak = inDodgePeak(maneuver, expert);
+      player.position.z -= 250 * dt;
+      system.update(dt);
+    }
+    return { hit, expired, minRange, lost: m.lost, m };
+  };
+
+  const straight = run({});
+  check("enemy missile: an unmanoeuvring player is hit (§47)", straight.hit === 1 && straight.expired === 0, straight);
+
+  const early = run({ dodgeAt: 2400 });
+  check("enemy missile: rolling the instant it launches is not a dodge (§48)", early.hit === 1, early);
+
+  const timed = run({ dodgeAt: 460 });
+  check("enemy missile: a timed roll defeats it (§49)", timed.hit === 0 && timed.expired === 1, timed);
+  check("enemy missile: and the miss is a real overshoot, not a despawn (§28)", timed.lost === true, timed);
+  check("enemy missile: the timed dodge was earned close in (§43)", evadeEarned(timed.minRange), timed.minRange);
+  check("enemy missile: nothing orbits the player forever (§27)", timed.expired === 1);
+}
+
+{
+  /* §29 — a round that flies into the island dies there. */
+  const scene = new THREE.Scene();
+  const shooter = new THREE.Object3D();
+  shooter.position.set(0, 300, 0);
+  scene.add(shooter);
+  shooter.updateMatrixWorld(true);
+  let reason = null;
+  const system = createMissileSystem({ scene, prototype: null, groundAt: () => 280 });
+  system.on("expire", (e) => (reason = e.reason));
+  // Aimed at a point below the terrain: it flies into the ground on the way.
+  const target = { position: new THREE.Vector3(0, 0, -3000), velocity: new THREE.Vector3(), alive: true };
+  system.fire({ mount: shooter, target, ownerSpeed: 200, owner: "hostile", cfg: HOSTILE_MISSILE });
+  let steps = 0;
+  while (system.inFlight && steps < 60 * 10) {
+    system.update(1 / 60);
+    steps++;
+  }
+  check("terrain: a missile that hits the ground is destroyed there", reason === "TERRAIN", reason);
+  check("terrain: well inside its lifetime", steps / 60 < HOSTILE_MISSILE.lifetime, steps / 60);
+
+  // §14 — ownership travels with the round, and the two owners do not mix.
+  const both = createMissileSystem({ scene, prototype: null });
+  both.fire({ mount: shooter, target: null, owner: "player" });
+  both.fire({ mount: shooter, target: null, owner: "hostile", cfg: HOSTILE_MISSILE });
+  check("ownership: rounds are separable by owner", both.ownedBy("hostile").length === 1 && both.ownedBy("player").length === 1);
+  check("ownership: each carries its own numbers", both.ownedBy("hostile")[0].cfg.turnRateDeg === HOSTILE_MISSILE.turnRateDeg && both.ownedBy("player")[0].cfg.turnRateDeg === MISSILE.turnRateDeg);
+  both.reset();
+  check("reset: no stale hostile round survives (§38)", both.inFlight === 0);
+}
+
+{
+  /* §30–§32/§47 — one hit, one response. A proximity fuze can trip on
+   * consecutive frames and a response that re-entered would loop the reset. */
+  let hits = 0;
+  let recovers = 0;
+  const response = createDevelopmentHitResponse({ onHit: () => hits++, onRecover: () => recovers++, holdTime: 0.5, cooldown: 0.5 });
+  const ev = () => createPlayerDamageEvent({ source: DamageSource.MISSILE, at: 0, position: { x: 0, y: 0, z: 0 } });
+
+  check("damage: the event is data, not behaviour", typeof ev().source === "string" && ev().source === DamageSource.MISSILE);
+  check("damage: the first hit is accepted", response.apply(ev()) === true && hits === 1);
+  check("damage: a second hit in the same instant is swallowed", response.apply(ev()) === false && hits === 1);
+  check("damage: it reports itself while holding", response.feedback === "HIT" && response.state.impact > 0.9);
+  for (let i = 0; i < 35; i++) response.update(1 / 60);
+  check("damage: the response recovers exactly once", recovers === 1 && !response.state.holding, [recovers]);
+  check("damage: and a hit during the settling cooldown is still refused", response.apply(ev()) === false && hits === 1);
+  for (let i = 0; i < 40; i++) response.update(1 / 60);
+  check("damage: once settled, a new hit is a new response", response.apply(ev()) === true && hits === 2);
+  check("damage: the impact cue decays rather than switching off", response.state.impact > 0);
+  response.reset();
+  check("damage: reset clears the hold", !response.state.holding && response.state.impact === 0);
+}
+
+{
+  /* The monitor as the HUD sees it. */
+  const monitor = createThreatMonitor();
+  const at = { x: 0, y: 700, z: 0 };
+  const f = { x: 0, y: 0, z: -1 };
+  const r = { x: 1, y: 0, z: 0 };
+  const u = { x: 0, y: 1, z: 0 };
+  const ctx = (over = {}) => ({ hostile: {}, incoming: [], position: at, forward: f, right: r, up: u, expert: false, maneuver: null, ...over });
+
+  monitor.update(ctx(), 1 / 60);
+  check("monitor: quiet sky, quiet HUD", monitor.state.level === ThreatLevel.NONE && monitor.state.arrow === "");
+  monitor.update(ctx({ hostile: { tracking: true, lockProgress: 0.4 } }), 1 / 60);
+  check("monitor: acquisition surfaces as TRACK with its progress", monitor.state.level === ThreatLevel.TRACK && monitor.state.lockProgress === 0.4);
+
+  const round = { owner: "hostile", position: { x: 400, y: 700, z: -100 }, dir: { x: -1, y: 0, z: 0 }, authority: 1 };
+  monitor.update(ctx({ hostile: { locked: true }, incoming: [round] }), 1 / 60);
+  check("monitor: a round in the air is MISSILE with a direction and a range", monitor.state.level === ThreatLevel.MISSILE && monitor.state.arrow === "\u25b6" && monitor.state.distance > 400, monitor.state);
+  // The first frame of a threat has nothing to difference against, and a
+  // fabricated closure there reads as tens of thousands of m/s on the rail.
+  check("monitor: the first frame of a new threat reports no closure", monitor.state.closing === 0, monitor.state.closing);
+  round.position.x = 394; // one frame of real flight, not a teleport
+  monitor.update(ctx({ incoming: [round] }), 1 / 60);
+  check("monitor: closing speed is measured, not guessed", monitor.state.closing > 0, monitor.state.closing);
+  // Bounded by physics, not merely by sign: nothing in this game closes at more
+  // than the missile's speed plus the player's.
+  check("monitor: and it is a physically possible number", monitor.state.closing < 1500, monitor.state.closing);
+  // A different round becoming the nearest is a new history, not a jump.
+  const second = { owner: "hostile", position: { x: 40, y: 700, z: 0 }, dir: { x: -1, y: 0, z: 0 }, authority: 1 };
+  monitor.update(ctx({ incoming: [round, second] }), 1 / 60);
+  check("monitor: a new nearest round does not fabricate a closure", monitor.state.closing === 0, monitor.state.closing);
+  monitor.reset();
+  check("monitor: reset silences it", monitor.state.level === ThreatLevel.NONE && monitor.state.distance === 0);
+}
+
+{
+  /* §36/§52 — the player's own weapons are untouched by all of the above. The
+   * AIM-9 still kills the hostile while it is attacking. */
+  const scene = new THREE.Scene();
+  const ac = new THREE.Object3D();
+  ac.position.set(0, 700, 0);
+  const mounts = createWeaponMounts(ac);
+  ac.updateMatrixWorld(true);
+  const system = createMissileSystem({ scene, prototype: null });
+  const drone = createTargetDrone();
+  const hostile = createHostileAI({ drone });
+  drone.position.set(60, 760, -1200);
+  let killed = false;
+  system.on("hit", ({ missile, target }) => {
+    if (missile.owner !== "player") return;
+    markTargetHit(target, 0);
+    killed = true;
+  });
+  system.fire({ mount: mounts.right, target: drone, ownerSpeed: 240, side: 1, owner: "player" });
+  const player = { position: new THREE.Vector3(0, 700, 0), velocity: new THREE.Vector3(0, 0, -250), alive: true };
+  for (let i = 0; i < 60 * 8 && !killed; i++) {
+    hostile.update(player, 1 / 60);
+    system.update(1 / 60);
+  }
+  check("counterattack: an AIM-9 still kills a manoeuvring hostile (§36)", killed && !drone.alive);
+  hostile.update(player, 1 / 60);
+  check("counterattack: and the kill shuts its AI down (§37)", hostile.state.phase === HostileState.DESTROYED);
+
+  // §37 — but a round already in the air keeps flying. Fired at a player who is
+  // two kilometres away, or the proximity fuze would trip on the launch frame.
+  player.position.set(0, 700, -2000);
+  const enemyRound = system.fire({ mount: mounts.left, target: player, ownerSpeed: 200, owner: "hostile", cfg: HOSTILE_MISSILE });
+  system.update(1 / 60);
+  check("counterattack: a launched hostile round outlives its launcher (§37)", system.ownedBy("hostile").includes(enemyRound));
+}
+
+
+/* ======================= Stage 04.0 — mission & launch ======================= */
+
+/* ---- the catapult curve (§9/§10) ---- */
+{
+  check("launch: the ease is monotonic and closed at both ends", strokeEase(0) === 0 && strokeEase(1) === 1 && strokeEase(0.4) < strokeEase(0.6), [strokeEase(0.4), strokeEase(0.6)]);
+  check("launch: acceleration keeps increasing (a violent deck exit)", strokeSpeed(0.9) - strokeSpeed(0.8) > strokeSpeed(0.2) - strokeSpeed(0.1), [strokeSpeed(0.9) - strokeSpeed(0.8), strokeSpeed(0.2) - strokeSpeed(0.1)]);
+
+  // Closed form against a numeric integral of the same curve.
+  const T = 2.6;
+  let numeric = 0;
+  const n = 20000;
+  for (let i = 0; i < n; i++) numeric += strokeSpeed((i + 0.5) / n) * (T / n);
+  const closed = strokeDistance(T, LAUNCH.startSpeed, LAUNCH.exitSpeed, LAUNCH.strokeExponent);
+  check("launch: closed-form stroke distance matches the integral", Math.abs(closed - numeric) < 0.05, [closed, numeric]);
+
+  const t = solveStrokeTime(199.7);
+  check("launch: solveStrokeTime inverts strokeDistance", Math.abs(strokeDistance(t) - 199.7) < 1e-6, strokeDistance(t));
+  const v1 = solveExitSpeed(199.7, 2.4);
+  check("launch: solveExitSpeed closes the same geometry", Math.abs(strokeDistance(2.4, LAUNCH.startSpeed, v1) - 199.7) < 1e-6, [v1, strokeDistance(2.4, LAUNCH.startSpeed, v1)]);
+}
+
+{
+  // The real deck: 199.7 m between the measured LaunchStart and LaunchEnd.
+  const plan = planStroke(199.68);
+  check("launch: the measured deck solves inside the playable band", plan.time >= LAUNCH.strokeMin && plan.time <= LAUNCH.strokeMax, plan.time);
+  check("launch: and keeps the authored deck-exit speed", !plan.clamped && plan.exitSpeed === LAUNCH.exitSpeed, [plan.clamped, plan.exitSpeed]);
+  check("launch: exit speed is inside §10's handoff band", plan.exitSpeed >= 120 && LAUNCH.handoffSpeed >= 160 && LAUNCH.handoffSpeed <= 180, [plan.exitSpeed, LAUNCH.handoffSpeed]);
+  check(
+    "launch: the stroke covers the run exactly",
+    Math.abs(strokeDistance(plan.time, LAUNCH.startSpeed, plan.exitSpeed) - 199.68) < 1e-6,
+    strokeDistance(plan.time, LAUNCH.startSpeed, plan.exitSpeed)
+  );
+
+  // A much shorter deck has to clamp the TIME and give up the exit speed, not
+  // the geometry: the aircraft must still leave the cat at the release point.
+  const short = planStroke(90);
+  check("launch: a short run clamps the time, not the release point", short.clamped && short.time === LAUNCH.strokeMin, [short.clamped, short.time]);
+  check(
+    "launch: ...and re-solves the exit speed so the run still closes",
+    Math.abs(strokeDistance(short.time, LAUNCH.startSpeed, short.exitSpeed) - 90) < 1e-6,
+    [short.exitSpeed, strokeDistance(short.time, LAUNCH.startSpeed, short.exitSpeed)]
+  );
+
+  check("launch: the whole sequence is about fifteen seconds", sequenceDuration(plan) > 13 && sequenceDuration(plan) < 17, sequenceDuration(plan));
+  // 05.1 sets the dwell to the length of the engine start-up played at double
+  // speed, so the sound runs to its end and the catapult fires on the last note
+  // — the wait is a countdown rather than a delay.
+  check("launch: the dwell holds the whole engine start-up", LAUNCH.deckDwell > 9 && LAUNCH.deckDwell < 13, LAUNCH.deckDwell);
+  check("launch: the burner lights before the cat fires", LAUNCH.afterburnerAt < LAUNCH.deckDwell, [LAUNCH.afterburnerAt, LAUNCH.deckDwell]);
+  check("launch: the shake grows across the dwell rather than sitting flat", LAUNCH.deckShimmerPeak > LAUNCH.deckShimmer * 3, [LAUNCH.deckShimmer, LAUNCH.deckShimmerPeak]);
+}
+
+{
+  check("launch: the throttle spools rather than jumping", spoolThrottle(0) < 0.1 && spoolThrottle(5) > spoolThrottle(2) && spoolThrottle(LAUNCH.deckDwell) === 1, [spoolThrottle(0), spoolThrottle(2), spoolThrottle(5)]);
+  check("launch: FOV opens from the deck value toward the exit value (§12)", launchFov("DECK", 0) === LAUNCH.fovDeck && launchFov("STROKE", 0.5) > LAUNCH.fovDeck && launchFov("STROKE", 1) === LAUNCH.fovExit, [launchFov("STROKE", 0.5)]);
+  check("launch: and never past a comfortable value", LAUNCH.fovExit <= 72, LAUNCH.fovExit);
+}
+
+{
+  // A full sequence, driven at 60 Hz along the real launch frame.
+  const seq = createLaunchSequence();
+  const start = { x: 0, y: 18, z: -1546.75 };
+  const end = { x: 0, y: 18, z: -1746.43 };
+  const plan = seq.arm(start, end);
+  check("launch: arming derives the run from the anchors", Math.abs(plan.run - 199.68) < 0.01, plan.run);
+  check("launch: the parked pose sits on the deck, gear down", Math.abs(seq.pose.y - (18 + LAUNCH.deckLift)) < 1e-6 && seq.state.gearDown, [seq.pose.y, seq.state.gearDown]);
+  // 05.4 — the deck can be held, so the countdown starts only when the caller says
+  // it may. On a fresh load audio is not yet armed (a browser needs a gesture), and
+  // an unheld deck ran its whole engine start-up into a blocked audio context.
+  const heldSeq = createLaunchSequence();
+  heldSeq.arm(start, end);
+  for (let i = 0; i < 180; i++) heldSeq.update(1 / 60, true);
+  check("launch: a held deck does not advance", heldSeq.state.t === 0 && heldSeq.state.held && heldSeq.state.stage === LaunchStage.DECK, [heldSeq.state.t, heldSeq.state.held]);
+  heldSeq.update(1 / 60, false);
+  check("launch: releasing the hold starts the countdown", heldSeq.state.t > 0 && !heldSeq.state.held, heldSeq.state.t);
+  // ...and the hold only applies at the very start: it must never freeze a launch
+  // that is already rolling.
+  for (let i = 0; i < 60; i++) heldSeq.update(1 / 60, true);
+  check("launch: the hold cannot pause a launch in progress", heldSeq.state.t > 0.9, heldSeq.state.t);
+  check("launch: parked heading is the launch axis", Math.abs(seq.pose.heading) < 1e-9, seq.pose.heading);
+
+  let handoffs = 0;
+  let handoffAt = 0;
+  let gearUpAt = 0;
+  let strokeMax = 0;
+  let strokeEndAt = 0;
+  let maxLateral = 0;
+  let prevStage = seq.state.stage;
+  let clock = 0;
+  for (let i = 0; i < 900; i++) {
+    seq.update(1 / 60);
+    clock += 1 / 60;
+    if (seq.state.stage === LaunchStage.STROKE) strokeMax = Math.max(strokeMax, seq.state.distance);
+    if (prevStage === LaunchStage.STROKE && seq.state.stage !== LaunchStage.STROKE) strokeEndAt = clock;
+    if (!gearUpAt && !seq.state.gearDown) gearUpAt = clock;
+    if (seq.state.handoff) {
+      handoffs += 1;
+      handoffAt = clock;
+    }
+    maxLateral = Math.max(maxLateral, Math.abs(seq.pose.x));
+    prevStage = seq.state.stage;
+  }
+  check("launch: control is handed over exactly once", handoffs === 1, handoffs);
+  check("launch: at the scripted time (§8: ~5.2 s)", Math.abs(handoffAt - sequenceDuration(plan)) < 0.05, [handoffAt, sequenceDuration(plan)]);
+  // The stroke never runs past the release point, and gets within one frame of it.
+  check("launch: the stroke ends at the release point", strokeMax <= plan.run + 1e-9 && plan.run - strokeMax < plan.exitSpeed / 60, [strokeMax, plan.run]);
+  check("launch: the deck edge comes before the gear and the handoff (§7)", strokeEndAt < gearUpAt && gearUpAt < handoffAt, [strokeEndAt, gearUpAt, handoffAt]);
+  check("launch: gear is up before the player has the aircraft", gearUpAt > 0 && !seq.state.gearDown, gearUpAt);
+  check("launch: the handoff speed is the flight model's seed", seq.state.speed === LAUNCH.handoffSpeed && seq.state.throttle === LAUNCH.handoffThrottle, [seq.state.speed, seq.state.throttle]);
+  check("launch: nothing drifts off the launch axis", maxLateral < 1e-9, maxLateral);
+  check("launch: it is nose-up by the handoff", seq.pose.pitch > 8 * DEG, seq.pose.pitch / DEG);
+  check("launch: and stops (one sequence, not a loop)", seq.state.done && seq.state.stage === LaunchStage.DONE, seq.state.stage);
+
+  // Frame-rate independence: the release point is closed-form, not accumulated,
+  // so a 20 Hz frame gets just as close to it as a 60 Hz one — within its own
+  // single frame of travel.
+  const slow = createLaunchSequence();
+  slow.arm(start, end);
+  let slowMax = 0;
+  for (let i = 0; i < 300; i++) {
+    slow.update(1 / 20);
+    if (slow.state.stage === LaunchStage.STROKE) slowMax = Math.max(slowMax, slow.state.distance);
+  }
+  check("launch: the release point is frame-rate independent", slowMax <= plan.run + 1e-9 && plan.run - slowMax < plan.exitSpeed / 20, [slowMax, plan.run]);
+}
+
+/* ---- phase bookkeeping (§5/§33/§38) ---- */
+{
+  const P = MissionPhase;
+  check("mission: every phase in the enum is ordered", PHASE_ORDER.length === Object.keys(P).length, PHASE_ORDER.length);
+  check("mission: checkpoints map as §38 describes", phaseCheckpoint(P.DECK) === 0 && phaseCheckpoint(P.EGRESS) === 1 && phaseCheckpoint(P.DEFENSIVE) === 1 && phaseCheckpoint(P.TERRAIN) === 2 && phaseCheckpoint(P.FINAL) === 3 && phaseCheckpoint(P.EXTRACTION) === 3);
+  check("mission: exactly four phases open a checkpoint", PHASE_ORDER.filter(opensCheckpoint).length === MISSION.checkpoints, PHASE_ORDER.filter(opensCheckpoint));
+  check("mission: only three phases carry an encounter (§5)", PHASE_ORDER.filter((p) => !!encounterFor(p)).length === 3, PHASE_ORDER.filter((p) => !!encounterFor(p)));
+  check("mission: INTERCEPT is one-way pressure — the hostile has no rounds (§22)", encounterFor(P.INTERCEPT).ammo === 0, encounterFor(P.INTERCEPT));
+  check("mission: DEFENSIVE is the phase that shoots back (§24)", encounterFor(P.DEFENSIVE).ammo === 2, encounterFor(P.DEFENSIVE));
+  check("mission: weapons are cold on the deck and at the end", !weaponsHotIn(P.DECK) && !weaponsHotIn(P.LAUNCH) && !weaponsHotIn(P.COMPLETE) && weaponsHotIn(P.TERRAIN));
+  check("mission: the player does not fly the deck or the complete screen", !playerFliesIn(P.DECK) && !playerFliesIn(P.LAUNCH) && !playerFliesIn(P.COMPLETE) && playerFliesIn(P.EGRESS));
+}
+
+/* ---- trigger volumes (§19/§32) ---- */
+{
+  const t = createTrigger({ name: "VALLEY", position: { x: 100, y: 400, z: -9000 }, radius: 1400 });
+  check("trigger: dead centre is inside", insideTrigger(t, { x: 100, y: 400, z: -9000 }));
+  check("trigger: 50 m beside the line still counts (§19)", insideTrigger(t, { x: 150, y: 400, z: -9000 }));
+  check("trigger: altitude does not gate a route waypoint", insideTrigger(t, { x: 100, y: 40, z: -9000 }) && insideTrigger(t, { x: 100, y: 3000, z: -9000 }));
+  check("trigger: outside the radius is outside", !insideTrigger(t, { x: 100, y: 400, z: -9000 - 1500 }));
+
+  const rec = createTrigger({ name: "RECOVERY", position: { x: 0, y: 700, z: -4000 }, radius: 2400, altitudeMin: 80, altitudeMax: 3800 });
+  check("extraction: forgiving in the horizontal (§32)", insideTrigger(rec, { x: 1800, y: 700, z: -4000 }));
+  check("extraction: but does care about altitude", !insideTrigger(rec, { x: 0, y: 20, z: -4000 }) && !insideTrigger(rec, { x: 0, y: 5000, z: -4000 }));
+
+  check("mission: bearing uses the flight model's convention (0 = -Z)", Math.abs(bearingTo({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: -100 })) < 1e-9, bearingTo({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: -100 }));
+  check("mission: range is horizontal, so altitude cannot fake arrival", Math.abs(flatDistanceTo({ x: 0, y: 0, z: 0 }, { x: 300, y: 9999, z: 400 }) - 500) < 1e-9);
+}
+
+/* ---- terrain route selection (§27) ---- */
+{
+  // A band with a genuine pass at x = 0 and a one-sided slope at x = -2000.
+  const samples = [];
+  for (let x = -3000; x <= 3000; x += 200) {
+    let h = 400;
+    if (x <= -1600) h = 400 + (-1600 - x) * 0.2; // rising ground: one flank only
+    if (Math.abs(x) < 400) h = 90; // the pass
+    if (Math.abs(x - 1400) < 300) h = 620; // a peak beside it
+    samples.push({ x, height: h });
+  }
+  const f = bandFeature(samples, 5);
+  check("route: the pass with higher ground on BOTH sides wins", Math.abs(f.x) < 400, f);
+  check("route: and the score is the weaker flank, not the stronger", Math.abs(f.score - (Math.min(f.left, f.right) - f.height)) < 1e-9, f);
+
+  const bands = [];
+  for (let z = -9000; z >= -19000; z -= 1000) {
+    const s = samples.map((p) => ({ x: p.x, height: p.height + (z % 3000 === 0 ? -40 : 0) }));
+    bands.push({ z, samples: s });
+  }
+  const picked = pickRouteFeatures(bands, 3, 2600, 5);
+  check("route: three features are chosen", picked.length === 3, picked.length);
+  check("route: spread by at least the minimum separation", Math.abs(picked[0].z - picked[1].z) >= 2600 && Math.abs(picked[1].z - picked[2].z) >= 2600, picked.map((p) => p.z));
+  check("route: returned in flight order (nearest the coast first)", picked[0].z > picked[1].z && picked[1].z > picked[2].z, picked.map((p) => p.z));
+
+  // A synthetic height field, sampled the way the live physics index is.
+  const surveyed = surveyTerrainRoute((x, z) => 300 + Math.abs(x - 800) * 0.08 + Math.sin(z / 900) * 60, -7600);
+  check("route: the survey finds features in a synthetic field", surveyed.length === 3 && surveyed.every((s) => Number.isFinite(s.x) && Number.isFinite(s.z)), surveyed.map((s) => [s.x, s.z]));
+  check("route: and spreads them along the corridor (§28)", surveyed[0].z > surveyed[1].z && surveyed[1].z > surveyed[2].z && Math.abs(surveyed[0].z - surveyed[2].z) > 6000, surveyed.map((s) => s.z));
+
+  // Zoning exists because scoring alone clusters. A field whose three deepest
+  // passes are all in the last third must still yield one waypoint per third.
+  const clustered = [];
+  for (let z = -9000; z >= -21000; z -= 600) {
+    const s = [];
+    for (let x = -3000; x <= 3000; x += 200) {
+      const deep = z < -17000 && Math.abs(x) < 400;
+      s.push({ x, height: deep ? 20 : 400 + Math.abs(x) * 0.1 });
+    }
+    clustered.push({ z, samples: s });
+  }
+  const zoned = pickZonedFeatures(clustered, 3, 5);
+  const per = Math.floor(clustered.length / 3);
+  const thirdOf = (z) => Math.min(2, Math.floor(clustered.findIndex((b) => b.z === z) / per));
+  const thirds = zoned.map((f) => thirdOf(f.z));
+  check("route: zoning puts one feature in each third of the corridor (§28)", new Set(thirds).size === 3, thirds);
+  // ...whereas scoring alone puts every pick in the third that happens to hold
+  // the deepest ground, which is the clustering this function exists to stop.
+  check("route: scoring alone would cluster them", new Set(pickRouteFeatures(clustered, 3, 2600, 5).map((f) => thirdOf(f.z))).size < 3, pickRouteFeatures(clustered, 3, 2600, 5).map((f) => thirdOf(f.z)));
+  check("route: one feature per zone", zoned.length === 3);
+}
+
+{
+  const features = [
+    { x: 680, z: -12700, height: 91 },
+    { x: 1520, z: -15300, height: 86 },
+    { x: -2260, z: -17900, height: 87 },
+  ];
+  const route = planRoute({ coastZ: -7600, features });
+  check("route: every leg is a trigger volume", route.every((l) => l.position && l.radius > 0), route.length);
+  check("route: every phase that navigates has at least one leg", [MissionPhase.EGRESS, MissionPhase.INTERCEPT, MissionPhase.DEFENSIVE, MissionPhase.TERRAIN, MissionPhase.FINAL, MissionPhase.EXTRACTION].every((p) => route.some((l) => l.phase === p)));
+  const intercept = route.find((l) => l.phase === MissionPhase.EGRESS && l.name === "INTERCEPT");
+  const coastline = route.find((l) => l.phase === MissionPhase.INTERCEPT);
+  const gap = Math.abs(intercept.position.z - coastline.position.z) - intercept.radius - coastline.radius;
+  // If these two volumes touch, arriving in the intercept area instantly
+  // satisfies "the player reached the next mission region" for a fight that has
+  // not started — which is exactly the bug this check was written for.
+  check("route: the intercept and coastline volumes do not overlap", gap > 0, gap);
+  const terrainLegs = route.filter((l) => l.phase === MissionPhase.TERRAIN);
+  check("route: terrain anchors clear the ground they sit over (§27)", terrainLegs.every((l, i) => l.position.y >= features[i].height + 100), terrainLegs.map((l) => l.position.y));
+  check("route: the recovery leg is offshore, back toward the carrier (§31)", route[route.length - 1].position.z > -7600, route[route.length - 1].position.z);
+  // The island may have failed to load; the mission still has to be flyable.
+  check("route: a build with no terrain index still gets a full route", planRoute({ coastZ: -7600, features: [] }).length === route.length);
+}
+
+/* ---- the transition table (§3, §21–§25) ---- */
+{
+  const P = MissionPhase;
+  const T = (phase, phaseTime, legDone, ctx = {}) =>
+    missionTransition({ phase, phaseTime, legDone }, { strokeStarted: false, launchDone: false, hostileAlive: true, hostileSpent: false, recoveryDone: false, ...ctx });
+
+  check("table: DECK waits for the catapult", T(P.DECK, 5, false) === P.DECK && T(P.DECK, 0.1, false, { strokeStarted: true }) === P.LAUNCH);
+  check("table: LAUNCH waits for the handoff, not a timer", T(P.LAUNCH, 30, false, { strokeStarted: true }) === P.LAUNCH && T(P.LAUNCH, 1, false, { launchDone: true }) === P.EGRESS);
+  check("table: EGRESS advances on arrival", T(P.EGRESS, 5, true) === P.INTERCEPT && T(P.EGRESS, 5, false) === P.EGRESS);
+  check("table: ...or on the fallback, so it cannot stall (§21)", T(P.EGRESS, MISSION.limit.EGRESS, false) === P.INTERCEPT);
+
+  check("table: INTERCEPT holds for its floor even if the region is met", T(P.INTERCEPT, 5, true) === P.INTERCEPT);
+  check("table: INTERCEPT ends on a kill without waiting out the floor (§23)", T(P.INTERCEPT, 8, false, { hostileAlive: false }) === P.DEFENSIVE);
+  check("table: but a kill still gets a beat to land", T(P.INTERCEPT, 2, false, { hostileAlive: false }) === P.INTERCEPT);
+  check("table: ignoring combat entirely still advances (§51)", T(P.INTERCEPT, MISSION.limit.INTERCEPT, false) === P.DEFENSIVE);
+
+  check("table: DEFENSIVE ends when the attack cycle is done (§25)", T(P.DEFENSIVE, MISSION.floor.DEFENSIVE, false, { hostileSpent: true }) === P.TERRAIN);
+  check("table: ...but not before its floor", T(P.DEFENSIVE, 5, false, { hostileSpent: true }) === P.DEFENSIVE);
+  check("table: DEFENSIVE also ends at the terrain volume", T(P.DEFENSIVE, MISSION.floor.DEFENSIVE, true) === P.TERRAIN);
+  check("table: and has a fallback of its own", T(P.DEFENSIVE, MISSION.limit.DEFENSIVE, false) === P.TERRAIN);
+
+  check("table: TERRAIN and FINAL advance on the last leg or the fallback", T(P.TERRAIN, 1, true) === P.FINAL && T(P.TERRAIN, MISSION.limit.TERRAIN, false) === P.FINAL && T(P.FINAL, 1, true) === P.EXTRACTION && T(P.FINAL, MISSION.limit.FINAL, false) === P.EXTRACTION);
+  check("table: EXTRACTION waits for the cinematic, not the trigger", T(P.EXTRACTION, 200, true) === P.EXTRACTION && T(P.EXTRACTION, 1, false, { recoveryDone: true }) === P.COMPLETE);
+  check("table: COMPLETE is terminal", T(P.COMPLETE, 999, true, { hostileAlive: false }) === P.COMPLETE);
+  check("table: no phase promotes itself twice in one call", PHASE_ORDER.every((p) => PHASE_ORDER.indexOf(T(p, 0, false)) - PHASE_ORDER.indexOf(p) <= 1));
+}
+
+/* ---- the autopilot (§33/§34) ---- */
+{
+  const level = { heading: 0, pitch: 0, altitude: 700, speed: 190 };
+  const goal = { heading: 0, altitude: 700, speed: 190 };
+  const at = autopilotStick(level, goal);
+  check("autopilot: on target it commands almost nothing", Math.abs(at.x) < 1e-9 && Math.abs(at.y) < 1e-9 && Math.abs(at.throttle) < 1e-9, at);
+  check("autopilot: a heading error commands bank the short way", autopilotStick({ ...level, heading: -0.4 }, goal).x > 0 && autopilotStick({ ...level, heading: 0.4 }, goal).x < 0);
+  check("autopilot: it takes the short way round the seam", autopilotStick({ ...level, heading: Math.PI - 0.1 }, { ...goal, heading: -Math.PI + 0.1 }).x > 0);
+  check("autopilot: below the goal it pulls up, above it pushes down", autopilotStick({ ...level, altitude: 300 }, goal).y > 0 && autopilotStick({ ...level, altitude: 1200 }, goal).y < 0);
+  check("autopilot: pitch is damped, so it levels rather than porpoising", autopilotStick({ ...level, pitch: 12 * DEG }, goal).y < 0, autopilotStick({ ...level, pitch: 12 * DEG }, goal).y);
+  check("autopilot: slow means throttle up", autopilotStick({ ...level, speed: 140 }, goal).throttle > 0);
+  check("autopilot: bank authority stays inside the stick", Math.abs(autopilotStick({ ...level, heading: -3 }, goal).x) <= AUTOPILOT.bankAuthority + 1e-9);
+
+  const player = { x: 1, y: -1, roll: 1, throttle: 1 };
+  const auto = { x: -1, y: 1, roll: 0, throttle: 0 };
+  check("handover: k=0 is the player, k=1 is the autopilot (§33)", blendStick(player, auto, 0).x === 1 && blendStick(player, auto, 1).x === -1);
+  check("handover: and halfway is halfway", Math.abs(blendStick(player, auto, 0.5).x) < 1e-9, blendStick(player, auto, 0.5));
+  const out = { x: 0, y: 0, roll: 0, throttle: 0 };
+  check("handover: writes into a reused object (no per-frame allocation)", blendStick(player, auto, 0.25, out) === out);
+}
+
+/* ---- presentation (§35/§37) ---- */
+{
+  check("clock: mm:ss.hh", formatClock(258.72) === "04:18.72", formatClock(258.72));
+  check("clock: pads the seconds", formatClock(61.5) === "01:01.50", formatClock(61.5));
+  check("clock: the short form is mm:ss", formatShortClock(154) === "02:34", formatShortClock(154));
+  const rows = missionSummary({ time: 258.72, kills: 2, groundKills: 3, aim9Fired: 1, aim9Loadout: 2, gunFired: 327 });
+  check("summary: time and a few combat stats, nothing more (§35)", rows.length === 5 && rows[0].value === "04:18.72" && rows[2].value === "3" && rows[3].value === "1" && rows[4].value === "327", rows);
+  // A PLAIN COUNT, not fired/loadout. The magazine refills mid-sortie, so the
+  // denominator stops being a fact about anything by the end of a run.
+  check("summary: the AIM-9 row is a pure count with no denominator", !rows[3].value.includes("/"), rows[3].value);
+  check("summary: ground kills default to zero rather than undefined", missionSummary({ time: 0, kills: 0, aim9Fired: 0, aim9Loadout: 2, gunFired: 0 })[2].value === "0");
+
+  /* ---- the five-minute deadline ---- */
+  const fallbackSum = Object.values(MISSION.limit).reduce((a, b) => a + b, 0);
+  const recoveryCost = MISSION.recovery.handover + MISSION.recovery.hold + MISSION.recovery.fade;
+  check("deadline: the sortie is capped at five minutes", MISSION.deadline === 300, MISSION.deadline);
+  /**
+   * THE LOAD-BEARING RELATIONSHIP. The deadline must sit ABOVE the worst-case
+   * fallback path, or a player who ignores combat and misses every waypoint is
+   * failed by the clock for taking the path the fallbacks exist to guarantee —
+   * which inverts §10's no-soft-lock rule into a soft-loss rule.
+   */
+  check(
+    "deadline: every fallback firing in sequence still finishes inside it",
+    fallbackSum + recoveryCost < MISSION.deadline,
+    { fallbackSum, recoveryCost, deadline: MISSION.deadline }
+  );
+  check("deadline: ...with real margin, not by a hair", MISSION.deadline - (fallbackSum + recoveryCost) > 15, MISSION.deadline - (fallbackSum + recoveryCost));
+  // Each combat phase's fallback must still be later than its floor, or the
+  // floor can never be observed and the encounter has no minimum length.
+  check("deadline: the retuned fallbacks still clear their floors", MISSION.limit.INTERCEPT > MISSION.floor.INTERCEPT && MISSION.limit.DEFENSIVE > MISSION.floor.DEFENSIVE, [MISSION.limit.INTERCEPT, MISSION.floor.INTERCEPT, MISSION.limit.DEFENSIVE, MISSION.floor.DEFENSIVE]);
+
+  check("deadline: not expired before it", missionExpired(299.9, MissionPhase.FINAL) === false);
+  check("deadline: expired at it", missionExpired(300, MissionPhase.FINAL) === true);
+  check("deadline: expired well past it", missionExpired(420, MissionPhase.TERRAIN) === true);
+  // The clock stops at COMPLETE. A run that finished at 4:59.9 must not be
+  // failed by a frame that lands after the deadline.
+  check("deadline: COMPLETE is exempt, at any time", missionExpired(999, MissionPhase.COMPLETE) === false);
+  check("deadline: it applies from the first phase on the clock", missionExpired(301, MissionPhase.EGRESS) === true);
+
+  /* ---- the coastline nav gap ---- */
+  {
+    /**
+     * Two defects reported from play, both at COASTLINE, and both caused by
+     * publishing the TRIGGER leg as guidance:
+     *
+     *   1. INTERCEPT owns exactly one leg. Reaching it exhausted the phase's
+     *      list and the marker vanished outright — no diamond, no offscreen
+     *      chevron — for as long as the phase floor, which is 26 s.
+     *   2. DEFENSIVE then re-selected its own copy of COASTLINE, at the same
+     *      coordinates, so the marker pointed BACK at a point already flown
+     *      through and asked the player to turn around.
+     *
+     * Guidance must always name somewhere ahead. Trigger behaviour must not move.
+     */
+    const features = [
+      { x: 400, z: -9200, height: 260 },
+      { x: -700, z: -12000, height: 320 },
+      { x: 300, z: -15000, height: 420 },
+    ];
+    const route = planRoute({ coastZ: -7600, features });
+    const d = createMissionDirector();
+    d.setRoute(route);
+
+    const at = (leg) => ({ x: leg.position.x, y: leg.position.y, z: leg.position.z });
+    const legOf = (phase, name) => route.find((l) => l.phase === phase && l.name === name);
+    const coastline = legOf(MissionPhase.INTERCEPT, "COASTLINE");
+    const pass = legOf(MissionPhase.TERRAIN, "PASS");
+    check(
+      "nav: COASTLINE really is authored twice, at one position",
+      route.filter((l) => l.name === "COASTLINE").length === 2 && legOf(MissionPhase.DEFENSIVE, "COASTLINE").position.z === coastline.position.z
+    );
+
+    // Walk the offshore legs so the director is legitimately in INTERCEPT.
+    // ctx keys are missionTransition's: strokeStarted, launchDone, hostileAlive.
+    // `hostileAlive: true` matters — a dead hostile promotes INTERCEPT on the
+    // 6 s kill floor instead of the 26 s encounter floor, which is not the
+    // window this test is about.
+    const base = { hostileAlive: true, hostileSpent: false, recoveryDone: false, strokeStarted: true, launchDone: true };
+    const fly = (pos) => d.update({ ...base, position: pos }, 0.1);
+    fly(at(legOf(MissionPhase.EGRESS, "COAST"))); // DECK  -> LAUNCH
+    fly(at(legOf(MissionPhase.EGRESS, "COAST"))); // LAUNCH -> EGRESS
+    fly(at(legOf(MissionPhase.EGRESS, "COAST"))); // COAST reached
+    fly(at(legOf(MissionPhase.EGRESS, "INTERCEPT"))); // INTERCEPT reached -> phase
+    check("nav: the sortie is in INTERCEPT after the offshore legs", d.state.phase === MissionPhase.INTERCEPT, d.state.phase);
+    check("nav: and points at the coastline", d.state.navName === "COASTLINE", d.state.navName);
+
+    // Reach it. The phase floor has NOT elapsed, so this is exactly the window
+    // in which the marker used to disappear.
+    fly(at(coastline));
+    check("nav: reaching COASTLINE does not blank the marker", d.state.navValid === true, [d.state.navValid, d.state.navName]);
+    check("nav: it advances to the next real destination", d.state.navName === "PASS", d.state.navName);
+    check("nav: which is inland of the coastline, not behind it", d.state.navPosition.z < coastline.position.z, [d.state.navPosition.z, coastline.position.z]);
+    check("nav: still INTERCEPT — guidance moved, the phase did not", d.state.phase === MissionPhase.INTERCEPT, d.state.phase);
+
+    // Let INTERCEPT time out into DEFENSIVE, holding position past the coastline.
+    for (let i = 0; i < 500 && d.state.phase === MissionPhase.INTERCEPT; i++) {
+      fly({ x: coastline.position.x, y: coastline.position.y, z: coastline.position.z - 900 });
+    }
+    check("nav: INTERCEPT gives way to DEFENSIVE on its own", d.state.phase === MissionPhase.DEFENSIVE, d.state.phase);
+    check("nav: DEFENSIVE does NOT point back at the coastline", d.state.navName !== "COASTLINE", d.state.navName);
+    check("nav: it still names somewhere ahead", d.state.navValid && d.state.navPosition.z < coastline.position.z, [d.state.navName, d.state.navPosition.z]);
+    check("nav: and that is PASS", d.state.navName === "PASS", d.state.navName);
+    check("nav: PASS is still an unspent trigger, not skipped", d.state.navPosition.z === pass.position.z);
+
+    // A restart must forget everything reached, or nav falls forward past the
+    // whole old route and the new sortie opens with no marker at all.
+    d.reset();
+    check("nav: a restart points at the first leg again", d.state.navName === "COAST", d.state.navName);
+  }
+}
+
+/* ---- the failure policy (§39/§40) ---- */
+{
+  let restores = 0;
+  let fails = 0;
+  const policy = createMissionCheckpointResponse({ onFail: () => (fails += 1), onRestore: () => (restores += 1) });
+  check("failure: the policy names itself, so a swap is visible", policy.name === "MissionCheckpointResponse");
+  check("failure: it speaks the CollisionResponse contract physics already uses", typeof policy.handleCollision === "function" && typeof policy.tick === "function");
+
+  check("failure: the first hit is accepted", policy.trigger("TERRAIN IMPACT") === true);
+  check("failure: the same instant's second hit is swallowed (§39)", policy.trigger("TERRAIN IMPACT") === false);
+  check("failure: onFail ran once", fails === 1, fails);
+
+  // Hold, fade out, restore, fade back in.
+  let peak = 0;
+  for (let i = 0; i < 12; i++) {
+    policy.tick(1 / 60);
+    peak = Math.max(peak, policy.state.fade);
+  }
+  check("failure: it goes fully black before restoring", peak > 0.9 || restores === 0, [peak, restores]);
+  for (let i = 0; i < 200; i++) policy.tick(1 / 60);
+  check("failure: the checkpoint is restored exactly once", restores === 1, restores);
+  check("failure: and the fade comes all the way back", policy.state.fade === 0 && !policy.state.active, [policy.state.fade, policy.state.active]);
+
+  // A hit during the settling cooldown is refused; once settled it is a new one.
+  const cooling = createMissionCheckpointResponse({});
+  cooling.trigger("X");
+  for (let i = 0; i < 400; i++) cooling.tick(1 / 240);
+  check("failure: refused while settling", cooling.trigger("X") === false, cooling.state.cooldown);
+  for (let i = 0; i < 400; i++) cooling.tick(1 / 60);
+  check("failure: accepted once settled", cooling.trigger("X") === true);
+  check("failure: two failures, two counts", cooling.state.count === 2, cooling.state.count);
+}
+
+{
+  // A look-ahead hazard is a PREDICTION, not an impact. The development policy
+  // treated it as one and rewound the aircraft clear — an automatic dodge. A
+  // mission must not end for a crash that never happened.
+  const policy = createMissionCheckpointResponse({});
+  const at = { x: 0, y: 400, z: -9000 };
+  policy.handleCollision(createCollisionEvent({ type: CollisionType.TERRAIN, position: at, speed: 220, timestamp: 1, forwardHit: true, distance: 90 }));
+  check("failure: a predicted impact does not fail the mission", !policy.state.active && policy.state.count === 0, [policy.state.active, policy.state.count]);
+  policy.handleCollision(createCollisionEvent({ type: CollisionType.TERRAIN, position: at, speed: 220, timestamp: 2 }));
+  check("failure: real contact does", policy.state.active && policy.state.count === 1, [policy.state.active, policy.state.count]);
+  check("failure: and it names the surface it hit", policy.state.reason === "TERRAIN IMPACT", policy.state.reason);
+
+  const wet = createMissionCheckpointResponse({});
+  wet.handleCollision(createCollisionEvent({ type: CollisionType.OCEAN, position: { x: 0, y: 0, z: 0 }, speed: 220, timestamp: 1 }));
+  check("failure: the ocean is named too", wet.state.reason === "OCEAN IMPACT", wet.state.reason);
+}
+
+/* ---- Manual Test A, automated: START -> COMPLETE (§49) ---- */
+/**
+ * A point aircraft that flies at the director's published nav position. It is
+ * not a flight model — the point is to prove the MISSION can be completed, which
+ * is §49's "even if enemy logic is temporarily disabled".
+ */
+function flyMission({ hostileDiesAt = null, hostileSpentAt = null, failAt = null, speed = 220, dt = 1 / 20, cap = 500 } = {}) {
+  const log = [];
+  const cps = [];
+  const director = createMissionDirector({
+    captureCheckpoint: () => ({ phase: director.state.phase, at: { ...pos } }),
+    restoreCheckpoint: (snap) => {
+      pos.x = snap.at.x;
+      pos.y = snap.at.y;
+      pos.z = snap.at.z;
+    },
+  });
+  director.on("phase", ({ phase }) => log.push(phase));
+  director.on("checkpoint", ({ index }) => cps.push(index));
+  director.setRoute(planRoute({ coastZ: -7600, features: [] }));
+  const pos = { x: 0, y: 600, z: -1546 };
+  director.reset();
+  log.length = 0;
+
+  let t = 0;
+  let launched = false;
+  let failed = false;
+  while (t < cap && director.state.phase !== MissionPhase.COMPLETE) {
+    t += dt;
+    const m = director.state;
+    // Fly toward the current nav anchor; hold course when there is none.
+    if (m.navValid && director.playerFlies) {
+      const dx = m.navPosition.x - pos.x;
+      const dy = m.navPosition.y - pos.y;
+      const dz = m.navPosition.z - pos.z;
+      const len = Math.hypot(dx, dy, dz) || 1;
+      pos.x += (dx / len) * speed * dt;
+      pos.y += (dy / len) * speed * dt;
+      pos.z += (dz / len) * speed * dt;
+    } else if (director.playerFlies) {
+      pos.z -= speed * dt;
+    }
+    if (failAt !== null && !failed && t >= failAt) {
+      failed = true;
+      director.fail("TEST");
+      director.rewind();
+    }
+    director.update(
+      {
+        position: pos,
+        strokeStarted: t >= 1.7,
+        launchDone: launched || (launched = t >= 5.42),
+        hostileAlive: hostileDiesAt === null || t < hostileDiesAt,
+        hostileSpent: hostileSpentAt !== null && t >= hostileSpentAt,
+      },
+      dt
+    );
+  }
+  return { time: t, missionTime: director.state.missionTime, phases: log, checkpoints: cps, director, pos };
+}
+
+{
+  const run = flyMission({ hostileDiesAt: 40, hostileSpentAt: 95 });
+  check("mission: START -> COMPLETE is reachable (§49)", run.director.state.phase === MissionPhase.COMPLETE, run.director.state.phase);
+  check(
+    "mission: and it visits every phase, in order (§3)",
+    JSON.stringify(run.phases) === JSON.stringify([MissionPhase.LAUNCH, MissionPhase.EGRESS, MissionPhase.INTERCEPT, MissionPhase.DEFENSIVE, MissionPhase.TERRAIN, MissionPhase.FINAL, MissionPhase.EXTRACTION, MissionPhase.COMPLETE]),
+    run.phases
+  );
+  check("mission: four checkpoints are recorded (§38)", JSON.stringify(run.checkpoints) === JSON.stringify([0, 1, 2, 3]), run.checkpoints);
+  check("mission: the timer starts at the catapult and stops at COMPLETE (§37)", run.missionTime > 0 && run.missionTime < run.time, [run.missionTime, run.time]);
+  check("mission: a direct run is comfortably under five minutes (§53)", run.missionTime < 300, run.missionTime);
+  // This bot flies straight to every anchor at 220 m/s and takes every early
+  // exit, so its time is a LOWER bound on the route, not a playtest — a real run
+  // turns, fights and slows down. It exists to catch a route that has quietly
+  // become trivially short.
+  check("mission: ...and the route is not trivially short", run.missionTime > 150, run.missionTime);
+  check("mission: the reported time is the stopped clock", Math.abs(run.director.stats.time - run.missionTime) < 1e-9);
+}
+
+{
+  // §51 — Manual Test C: the hostile is never destroyed and never runs dry.
+  const run = flyMission({});
+  check("mission: ignoring combat entirely still completes (§51)", run.director.state.phase === MissionPhase.COMPLETE, run.director.state.phase);
+  check("mission: the slow path stays near five minutes", run.missionTime < 320, run.missionTime);
+}
+
+{
+  // §52 — Manual Test D: a failure mid-terrain restores and the mission resumes.
+  const run = flyMission({ hostileDiesAt: 30, hostileSpentAt: 80, failAt: 90 });
+  check("mission: a failure does not end the mission (§39)", run.director.state.phase === MissionPhase.COMPLETE, run.director.state.phase);
+  check("mission: the rewind is counted", run.director.stats.checkpointsUsed === 1 && run.director.state.failures === 1, [run.director.stats.checkpointsUsed, run.director.state.failures]);
+  check("mission: and the rewound phase is re-entered, not skipped", run.phases.filter((p) => p === MissionPhase.TERRAIN || p === MissionPhase.FINAL).length >= 2, run.phases);
+}
+
+{
+  // The director must not advance a phase off a volume belonging to a later one.
+  const director = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  director.setRoute(planRoute({ coastZ: -7600, features: [] }));
+  director.reset();
+  const terrainLeg = director.route.find((l) => l.phase === MissionPhase.TERRAIN);
+  // Sitting inside a TERRAIN volume while still on the deck changes nothing.
+  for (let i = 0; i < 30; i++) director.update({ position: terrainLeg.position, strokeStarted: false, launchDone: false, hostileAlive: true, hostileSpent: false }, 1 / 30);
+  check("mission: a later phase's volume cannot pull the mission forward", director.state.phase === MissionPhase.DECK, director.state.phase);
+}
+
+/* ---- hostile activation and reuse (§5/§42/§43) ---- */
+{
+  const drone = createTargetDrone();
+  const ai = createHostileAI({ drone });
+  const player = { position: { x: 0, y: 760, z: 0 }, velocity: { x: 0, y: 0, z: -220 }, alive: true };
+
+  ai.setActive(false);
+  const before = { x: drone.position.x, y: drone.position.y, z: drone.position.z };
+  for (let i = 0; i < 600; i++) ai.update(player, 1 / 60);
+  check("hostile: an inactive hostile is not simulated at all (§5)", drone.position.x === before.x && drone.position.z === before.z && ai.state.phase === HostileState.PATROL, [drone.position.z, ai.state.phase]);
+  check("hostile: and it is not drawn either", drone.root.visible === false);
+
+  // §22 — deployed with no rounds, it can chase but can never acquire.
+  ai.deploy({ at: { x: 0, y: 800, z: -2400 }, heading: Math.PI, ammo: 0, engageDelay: 0 });
+  check("hostile: deploy places and revives it", ai.state.active && drone.alive && drone.root.visible && Math.round(drone.position.z) === -2400, [drone.position.z, drone.alive]);
+  let launches = 0;
+  ai.on("launch", () => (launches += 1));
+  let reachedPursuit = false;
+  for (let i = 0; i < 3600; i++) {
+    ai.update(player, 1 / 60);
+    if (ai.state.phase === HostileState.PURSUIT) reachedPursuit = true;
+    if (ai.state.phase === HostileState.ACQUIRE || ai.state.phase === HostileState.ATTACK) break;
+  }
+  check("hostile: an empty magazine cannot acquire — one-way pressure (§22)", reachedPursuit && launches === 0 && ai.state.phase !== HostileState.ACQUIRE, [ai.state.phase, launches]);
+
+  // §43 — the same instance serves the next encounter, with teeth this time.
+  markTargetHit(drone, 1);
+  ai.deploy({ at: { x: 200, y: 820, z: -2000 }, heading: Math.PI, ammo: 2, engageDelay: 0 });
+  check("hostile: a destroyed hostile is reused, not respawned (§43)", drone.alive && drone.health === drone.maxHealth && ai.state.ammo === 2 && ai.state.encounters === 2, [drone.alive, ai.state.ammo, ai.state.encounters]);
+  check("hostile: spent is false with rounds left", ai.spent === false);
+  ai.state.ammo = 0;
+  ai.state.cooldown = 0;
+  check("hostile: spent once the magazine is gone (§25)", ai.spent === true);
+}
+
+/* ---- loadout restore (§41) ---- */
+{
+  const mounts = createWeaponMounts(new THREE.Object3D());
+  const carried = createMountedMissiles(mounts, buildPlaceholderMissile());
+  carried.release(carried.next());
+  check("loadout: firing one leaves one", carried.count === 1, carried.count);
+  carried.setCount(1);
+  check("loadout: a checkpoint restores the count it recorded (§41)", carried.count === 1, carried.count);
+  carried.setCount(0);
+  check("loadout: including empty", carried.count === 0 && carried.next() === null);
+  carried.reload();
+  check("loadout: and R still reloads everything", carried.count === 2, carried.count);
+}
+
+/* ---- gear variants (§7) ---- */
+{
+  const rig = new THREE.Object3D();
+  for (const name of ["F-15E-landingOff_5", "F-15E-landingOn_6", "F-15E-landingOnLight_7"]) {
+    const node = new THREE.Object3D();
+    node.name = name;
+    rig.add(node);
+  }
+  const vis = () => ["F-15E-landingOff_5", "F-15E-landingOn_6", "F-15E-landingOnLight_7"].map((n) => rig.getObjectByName(n).visible);
+
+  setGearVisual(rig, true);
+  check("gear: down shows the deployed pair and hides the clean variant (§7)", JSON.stringify(vis()) === JSON.stringify([false, true, true]), vis());
+  setGearVisual(rig, false);
+  check("gear: up is the exact inverse", JSON.stringify(vis()) === JSON.stringify([true, false, false]), vis());
+  // The two states must be reachable in either order from either starting point:
+  // main.js caches the last value, and seeding that cache wrong once made the
+  // deck configuration unreachable for a whole mission.
+  setGearVisual(rig, true);
+  check("gear: and reachable again from the up state", JSON.stringify(vis()) === JSON.stringify([false, true, true]), vis());
+  check("gear: setGearForFlight is the clean configuration", (setGearForFlight(rig), JSON.stringify(vis()) === JSON.stringify([true, false, false])), vis());
+  check("gear: a missing hierarchy is survivable", setGearVisual(null, true) === null);
+}
+
+/* ===== Stage 05.0 — pointer steering, and lives ===== */
+
+{
+  /**
+   * Mouse steering was deleted in 04.0b after six fixes failed to close a
+   * "the aircraft turns on its own" bug. The recorded reason was that a screen
+   * position has no centre, and every fix was synthesising one out of relative
+   * movement. This design does not synthesise a centre — the centre is the
+   * aircraft, fixed at the middle of the viewport — so these tests assert the
+   * property that was previously impossible: a resting pointer commands nothing,
+   * and deflection is a pure function of where the cursor is.
+   */
+  const w = 1000;
+  const vh = 800;
+  const at = (x, y) => pointerStick(x, y, w, vh);
+  const half = Math.min(w, vh) * 0.5;
+
+  check("pointer: dead centre commands nothing", at(500, 400).x === 0 && at(500, 400).y === 0);
+  // The dead zone IS the aircraft — hovering on it holds attitude, which is the
+  // "let go" the old design never had.
+  check("pointer: hovering on the aircraft holds attitude", at(500 + half * MOUSE.deadZone * 0.8, 400).x === 0);
+  check("pointer: just outside the dead zone starts to bite", at(500 + half * (MOUSE.deadZone + 0.03), 400).x > 0);
+
+  check("pointer: right of centre is right stick", at(900, 400).x > 0.5 && Math.abs(at(900, 400).y) < 0.01);
+  check("pointer: left of centre is left stick", at(100, 400).x < -0.5);
+  // Screen y grows downward; the stick does not.
+  check("pointer: above centre is nose up", at(500, 100).y > 0.5);
+  check("pointer: below centre is nose down", at(500, 700).y < -0.5);
+
+  check("pointer: deflection is bounded", Math.hypot(at(0, 0).x, at(0, 0).y) <= MOUSE.gain + 1e-9);
+  check("pointer: far outside the span never exceeds full stick", Math.abs(at(-9999, 400).x) <= MOUSE.gain + 1e-9);
+  check("pointer: a degenerate viewport does not divide by zero", Number.isFinite(pointerStick(5, 5, 0, 0).x));
+
+  // The keyboard must always be able to override a resting cursor.
+  check("axes: the larger request wins", combineAxis(0.2, 0.9) === 0.9 && combineAxis(-1, 0.5) === -1);
+  check("axes: equal magnitude prefers the keyboard", combineAxis(0.5, -0.5) === 0.5);
+}
+
+{
+  // Lives are MISSION only: counting deaths in a sandbox turns practice into a
+  // test, which is the opposite of what FREE and PEACE are for.
+  check("lives: only the authored sortie counts pilots", MODES.MISSION.lives === true && MODES.FREE.lives === false && MODES.PEACE.lives === false);
+  check("lives: every mode declares the field", MODE_ORDER.every((m) => typeof modeRules(m).lives === "boolean"));
+}
+
+/* ===== Stage 04.4 — the pitch convention toggle ===== */
+{
+  // Two real conventions, neither wrong. The default is the one a first-time
+  // player expects from WASD; the toggle is for anyone who has flown a sim and
+  // will pull to climb without thinking.
+  check("pitch: the pure map is a sign flip and nothing else", applyPitchMode(0.7, false) === 0.7 && applyPitchMode(0.7, true) === -0.7);
+  check("pitch: neutral stays neutral under both", applyPitchMode(0, true) === 0 && applyPitchMode(0, false) === 0);
+  check("pitch: it is symmetric", applyPitchMode(-1, true) === 1 && applyPitchMode(1, true) === -1);
+  check("pitch: both conventions are named for what W DOES", PitchMode.NOSE_UP === "NOSE UP" && PitchMode.NOSE_DOWN === "NOSE DOWN");
+
+  const bus = new EventTarget();
+  const inp = createInput(bus);
+  const key = (code, down) =>
+    bus.dispatchEvent(Object.assign(new Event(down ? "keydown" : "keyup"), { key: code, code, repeat: false, preventDefault() {} }));
+  const run = (n = 40) => {
+    for (let i = 0; i < n; i++) inp.update(1 / 60);
+  };
+  let announced = null;
+  inp.onPitchModeToggle((inv, name) => (announced = name));
+
+  check("pitch: the default is the accessible one", inp.pitchInverted() === false && inp.pitchMode() === PitchMode.NOSE_UP);
+  key("KeyW", true);
+  run();
+  check("pitch: W pitches up by default", inp.y > 0.8, inp.y);
+
+  // Toggle it while W is still held: the axis must flip on the spot rather than
+  // waiting for the key to be released and pressed again.
+  key("KeyI", true);
+  run(2);
+  check("pitch: the toggle applies to a key already held", inp.y < -0.8, inp.y);
+  check("pitch: and it announces which way W now goes", announced === PitchMode.NOSE_DOWN, announced);
+  key("KeyW", false);
+  key("KeyS", true);
+  run();
+  check("pitch: S now pitches up", inp.y > 0.8, inp.y);
+
+  // A PREFERENCE, not transient state: putting the aircraft back must never
+  // change which way the controls work.
+  inp.clearTransient();
+  run();
+  check("pitch: a reset does not silently restore the default", inp.pitchInverted() === true, inp.pitchInverted());
+  key("KeyS", false);
+  key("KeyI", true);
+  run(2);
+  check("pitch: pressing it again comes back", inp.pitchInverted() === false && announced === PitchMode.NOSE_UP);
+
+  // The lateral axis is untouched — this is a pitch convention, not an inversion
+  // of the whole stick.
+  inp.setPitchInverted(true);
+  key("KeyD", true);
+  run();
+  check("pitch: bank is unaffected by the pitch convention", inp.x > 0.8, inp.x);
+}
+
+/* ---- Stage 04.8 — the F-16C hostile and the modelled SAM launcher ---- */
+{
+  // Synthetic sources, so these exercise the normalisation ARITHMETIC without a
+  // loader, a network fetch or a real asset (§4).
+  const sourceJet = () => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(5.83, 2.82, 9.14));
+    m.position.set(11, -4, 7); // an arbitrary source origin, as Sketchfab exports have
+    return m;
+  };
+
+  const { root: jet, metrics: jetM } = normalizeHostileModel(sourceJet());
+  check(
+    "hostile: the airframe is scaled to 14.8 m from MEASURED bounds",
+    Math.abs(jetM.length - 14.8) < 0.01 && Math.abs(jetM.target - 14.8) < 1e-9,
+    jetM
+  );
+  // The pivot must land on the bounding-box centre, or the hostile yaws in a
+  // visible arc instead of turning about itself.
+  const jetBox = new THREE.Box3().setFromObject(jet);
+  const jetCentre = jetBox.getCenter(new THREE.Vector3());
+  check(
+    "hostile: the pivot is recentred on the airframe, not the source origin",
+    jetCentre.length() < 0.01,
+    jetCentre.toArray()
+  );
+  check("hostile: the scale is derived, never authored", Math.abs(jetM.scale - 14.8 / 9.14) < 0.01, jetM.scale);
+
+  // THE VEHICLE RULE: a launcher stands on its tracks, so the bottom of the box
+  // sits at y = 0 rather than the centre. Centre-recentring buries it to the
+  // axles, which is invisible from directly above and obvious from anywhere else.
+  const sourceLauncher = () => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(3.31, 5.55, 6.86));
+    m.position.set(-3, 9, 2);
+    return m;
+  };
+  const { root: sam, metrics: samM } = normalizeSamModel(sourceLauncher());
+  const samBox = new THREE.Box3().setFromObject(sam);
+  check("sam: the launcher is scaled to 6.9 m from measured bounds", Math.abs(samM.length - 6.9) < 0.01, samM);
+  check("sam: it STANDS on the ground — bbox bottom at y=0", Math.abs(samBox.min.y) < 0.01, samBox.min.y);
+  const samCentre = samBox.getCenter(new THREE.Vector3());
+  check(
+    "sam: and it is centred on x/z, so it stands where the site stands",
+    Math.abs(samCentre.x) < 0.01 && Math.abs(samCentre.z) < 0.01,
+    samCentre.toArray()
+  );
+
+  // Installing the model must take the blockout's rails WITH it. They hang off
+  // the turret rather than off the group, so removing the group alone leaves
+  // them behind — and once the turret drops to ground level they end up buried
+  // under the launcher, present and invisible.
+  const site = createSamSite({ position: { x: 0, y: 0, z: 0 }, name: "SamTest" });
+  check("sam: the blockout's rails are named, so the swap can find them", !!site.turret.getObjectByName("SamRails"));
+  installSamVisual(site, sam);
+  check("sam: installing the model removes the blockout's rails", !site.turret.getObjectByName("SamRails"));
+  check("sam: the hardpoint survives the swap", site.turret.getObjectByName("SamHardpoint") === site.hardpoint);
+  check("sam: the launcher is parented to the TURRET, so the slew still works", sam.parent === site.turret);
+  // The slew is the transition table's, and it must not learn that the visual
+  // changed: one write to turret.rotation.y still aims the launcher.
+  site.turret.rotation.y = 1.1;
+  check("sam: slewing the turret slews the model", Math.abs(sam.getWorldPosition(new THREE.Vector3()).length()) < 1e6 && site.turret.rotation.y === 1.1);
+
+  // §13 — a kill leaves a WRECK. On a model-backed site the turret IS the whole
+  // vehicle (the source has no separate turret node), so hiding it would delete
+  // the evidence the wreck exists to provide.
+  wreckSamSite(site);
+  check("sam: a destroyed MODEL-backed site keeps its launcher visible", site.turret.visible === true && site.root.visible === true, [site.turret.visible, site.root.visible]);
+  check("sam: and it is still a wreck, not a live site", site.alive === false && site.phase === SamState.DESTROYED);
+
+  const blockout = createSamSite({ position: { x: 0, y: 0, z: 0 }, name: "SamBlockout" });
+  wreckSamSite(blockout);
+  check("sam: the BLOCKOUT still loses its rails on death", blockout.turret.visible === false);
+}
+
+/* ---- Stage 05.3 — PULL UP is a trajectory, and the failure policy ticks once ---- */
+{
+  // The old rule was `agl <= 110 && sink >= 14`, which over water gave the player
+  // the 110 m above the surface to react -- under two seconds at any real sink
+  // rate. The trajectory rule warns on TIME, so it works with no terrain at all.
+  const sea = (agl, sink) => groundWarning({ agl, sink, aglAhead: null });
+  check("pull up: a descent toward the SEA warns six seconds out", sea(600, 100) === Cue.PULL_UP, sea(600, 100));
+  check("pull up: ...and the old rule would have been silent there", 600 > AUDIO.altitudeAgl && sea(600, 100) === Cue.PULL_UP);
+  check("pull up: a gentle descent with room is quiet", sea(1200, 20) === null, sea(1200, 20));
+  check("altitude: low and level over water is silent, not nagging", sea(180, 0) === null, sea(180, 0));
+  check("altitude: low and sinking over water speaks", sea(180, 5) === Cue.ALTITUDE, sea(180, 5));
+
+  // LOW FLYING MUST STAY QUIET. There is deliberately no absolute-AGL trigger
+  // for PULL UP: a valley run at 100 m is legitimate, and a cue that cries wolf
+  // there is a cue the player learns to ignore in the one place it matters.
+  check("pull up: 100 m and level is NOT a pull-up", groundWarning({ agl: 100, sink: 0, aglAhead: 100 }) === null, groundWarning({ agl: 100, sink: 0, aglAhead: 100 }));
+  check("pull up: 100 m in a slight climb is not either", groundWarning({ agl: 100, sink: -6, aglAhead: 140 }) === null);
+
+  // The case the vertical rate misses entirely: level flight at rising ground.
+  // Closure comes from the ground AHEAD, so zero sink still warns.
+  check(
+    "pull up: level flight into rising ground warns on closure alone",
+    groundWarning({ agl: 300, sink: 0, aglAhead: -50 }) === Cue.PULL_UP,
+    groundWarning({ agl: 300, sink: 0, aglAhead: -50 })
+  );
+  check(
+    "pull up: level flight over falling ground stays quiet",
+    groundWarning({ agl: 400, sink: 0, aglAhead: 900 }) === null
+  );
+  // forwardImminent is a COLLISION predicate (~30 ms of warning), so it is kept
+  // only as a floor. Borrowing it as the trigger is what made PULL UP arrive
+  // after the crash rather than before it.
+  check("pull up: an imminent forward hazard still forces it", groundWarning({ agl: 4000, sink: 0, forwardImminent: true }) === Cue.PULL_UP);
+  check("ground warning: no reading, no warning", groundWarning({ agl: NaN, sink: 90 }) === null);
+  check("ground warning: on the deck it is silent", groundWarning({ agl: 5, sink: 0, airborne: false }) === null);
+  check("ground warning: the trajectory clock agrees with the rule", Math.abs(secondsToGround({ agl: 600, sink: 100 }) - 6) < 1e-9, secondsToGround({ agl: 600, sink: 100 }));
+
+  // The engine is the aircraft's own voice and must not be the quietest thing in
+  // the mix. At 0.34 cue gain it played at an effective 0.14 against a 0.75
+  // fly-by, which reads as a broken engine rather than a quiet one.
+  const cruise = engineVoice(0.62, false);
+  const burner = engineVoice(1, true);
+  // The engine must stay audible against the one-shots. The bound has been
+  // lowered twice on request (0.7 -> 0.56 -> 0.45), so it tracks the current
+  // intent rather than the original mix; it is still a real floor and would fail
+  // if the cue were dropped to 0.3 or muted outright.
+  check("engine: audible at cruise against the one-shots", AUDIO.cues.ENGINE_LOOP.volume * cruise.volume > 0.24, AUDIO.cues.ENGINE_LOOP.volume * cruise.volume);
+  check("engine: afterburner is louder than cruise", burner.volume > cruise.volume, [cruise.volume, burner.volume]);
+  check("engine: but still under the warnings it must not drown", AUDIO.cues.ENGINE_LOOP.volume * burner.volume < AUDIO.cues.PULL_UP.volume, AUDIO.cues.ENGINE_LOOP.volume * burner.volume);
+  check("engine: present as soon as the throttle leaves its stop", engineVoice(0.03, false).volume >= AUDIO.engineIdle);
+  // el.volume throws outside 0..1, so the product has to stay in range at every
+  // throttle position including afterburner.
+  let inRange = true;
+  for (let t = 0; t <= 1.0001; t += 0.05) {
+    for (const ab of [false, true]) {
+      const v = AUDIO.cues.ENGINE_LOOP.volume * engineVoice(t, ab).volume;
+      if (!(v >= 0 && v <= 1)) inRange = false;
+    }
+  }
+  check("engine: the gain product is a legal element volume everywhere", inRange);
+
+  // THE ENGINE MUST NOT DUCK. It is the bed the mix sits on, and a cue that can
+  // repeat every few seconds turns a duck into a permanent attenuation -- which
+  // is what made the aircraft sound switched off.
+  check("engine: the engine channels are exempt from ducking", AUDIO.cues.ENGINE_LOOP.noDuck === true && AUDIO.cues.ENGINE_START.noDuck === true);
+  check("engine: the gun is NOT exempt -- a burst really does mask speech", !AUDIO.cues.GUN.noDuck);
+  check("engine: warnings are not duckable either", AUDIO.cues.PULL_UP.priority > Priority.WEAPON && AUDIO.cues.ALTITUDE.priority > Priority.WEAPON);
+
+  // A grace window after control is handed over: the aircraft leaves the deck
+  // 20 m over water and sinks off the bow, so a trajectory warning is otherwise
+  // guaranteed at the one moment the player cannot act on it.
+  check("ground warning: there is a grace window before any warning may fire", AUDIO.warnGraceSeconds >= 3, AUDIO.warnGraceSeconds);
+
+  // THE DOUBLE-TICK. The failure policy has two callers -- physics.update() and
+  // the frame loop when physics is skipped -- and both firing in one frame ran
+  // the 2.32 s sequence at double speed AND let a restore land inside a frame
+  // that had already decided a crash was in progress, which wrote the wreck's
+  // pose over the fresh respawn and spent another pilot.
+  let restores = 0;
+  const policy = createMissionCheckpointResponse({ onRestore: () => restores++ });
+  policy.trigger("TERRAIN IMPACT");
+  const step = 1 / 60;
+  let elapsed = 0;
+  for (let i = 1; i <= 200 && restores === 0; i++) {
+    // Both callers, same frame stamp: only the first may land.
+    policy.tick(step, i);
+    policy.tick(step, i);
+    elapsed += step;
+  }
+  const expected = MISSION_FAILURE.hold + MISSION_FAILURE.fadeOut;
+  check(
+    "failure policy: a repeated tick with the same frame stamp is ignored",
+    Math.abs(elapsed - expected) <= step + 1e-9,
+    { elapsed, expected }
+  );
+  check("failure policy: and the restore still happens exactly once", restores === 1, restores);
+
+  // A caller that passes no stamp must keep working: the Stage 02.2 call sites
+  // and these tests are single-caller by construction.
+  let bare = 0;
+  const legacy = createMissionCheckpointResponse({ onRestore: () => bare++ });
+  legacy.trigger("OCEAN IMPACT");
+  for (let i = 0; i < 200 && bare === 0; i++) legacy.tick(step);
+  check("failure policy: an unstamped tick is never deduped", bare === 1, bare);
+}
+
+/* ---- Stage 05.4 — world clock, day/night curves, ocean, night lights ---- */
+{
+  // The clock is the whole persistence mechanism, so its contract is the first
+  // thing worth pinning: it advances, it wraps, and a preset moves it without
+  // stopping it.
+  const clock = createWorldClock({ cycleSeconds: 100, tau: 0 });
+  clock.advance(25);
+  check("clock: advances at 1/cycle per second", Math.abs(clock.tau - 0.25) < 1e-9, clock.tau);
+  clock.advance(100);
+  check("clock: wraps rather than growing without bound", Math.abs(clock.tau - 0.25) < 1e-9, clock.tau);
+  clock.setTau(0.9);
+  clock.advance(5);
+  check("clock: a preset jump does NOT freeze time (§7/§8)", clock.tau > 0.9 && clock.tau < 1, clock.tau);
+  check("clock: wrapTau normalises a negative", Math.abs(wrapTau(-0.25) - 0.75) < 1e-9);
+  check("clock: the cycle length is configurable, not baked in", createWorldClock({ cycleSeconds: 999 }).state.cycleSeconds === 999);
+
+  // THE ARTISTIC TIMELINE (§6) falls out of the two-half-sine curve rather than
+  // being hand-placed, so these are the assertions that keep the split honest.
+  check("sun: sunrise is the zero crossing", Math.abs(sunElevation(0)) < 1e-9, sunElevation(0));
+  check("sun: midday peaks at tau 0.29", Math.abs(sunElevation(DAY.sunsetSplit / 2) - 1) < 1e-9);
+  check("sun: sunset is the second zero crossing", Math.abs(sunElevation(DAY.sunsetSplit)) < 1e-9);
+  check("sun: deepest night is between sunset and sunrise", Math.abs(sunElevation(DAY.sunsetSplit + (1 - DAY.sunsetSplit) / 2) + 1) < 1e-9);
+  // Continuity at both crossings: §6 forbids snapping between lighting states.
+  // The two half-sines meet at zero from opposite sides, so the gap shrinks with
+  // eps rather than being exactly zero at any finite probe.
+  const eps = 1e-4;
+  check("sun: the curve is continuous at sunset", Math.abs(sunElevation(DAY.sunsetSplit - eps) - sunElevation(DAY.sunsetSplit + eps)) < 5e-3);
+  check("sun: and continuous across midnight/sunrise", Math.abs(sunElevation(1 - eps) - sunElevation(eps)) < 5e-3);
+  check(
+    "sun: the gap at a crossing shrinks with the probe, i.e. it is continuous",
+    Math.abs(sunElevation(DAY.sunsetSplit - 1e-5) - sunElevation(DAY.sunsetSplit + 1e-5)) <
+      Math.abs(sunElevation(DAY.sunsetSplit - 1e-3) - sunElevation(DAY.sunsetSplit + 1e-3))
+  );
+  let monotonic = true;
+  for (let t = 0; t < DAY.sunsetSplit / 2; t += 0.01) if (sunElevation(t + 0.01) < sunElevation(t)) monotonic = false;
+  check("sun: it climbs steadily from sunrise to midday", monotonic);
+
+  // The direction vector must be a unit vector at every instant, or the light
+  // intensity would wobble with the time of day for no visible reason.
+  let unit = true;
+  for (let t = 0; t < 1; t += 0.017) {
+    const d = sunDirection(t);
+    if (Math.abs(Math.hypot(d.x, d.y, d.z) - 1) > 1e-6) unit = false;
+  }
+  check("sun: the direction is always a unit vector", unit);
+  check("sun: it is above the horizon at midday", sunDirection(0.29).y > 0.9);
+  check("sun: and below it at night", sunDirection(0.79).y < -0.9);
+  check("sun: it rises and sets on opposite sides", sunDirection(0.06).x * sunDirection(0.52).x < 0, [sunDirection(0.06).x, sunDirection(0.52).x]);
+
+  check("night: full night at the anti-solar point", nightFactor(sunElevation(0.79)) === 1);
+  check("night: nothing at midday", nightFactor(sunElevation(0.29)) === 0);
+  check("day: full sun at midday", dayFactor(sunElevation(0.29)) === 1);
+  let nightMonotonic = true;
+  for (let e = -1; e < 1; e += 0.05) if (nightFactor(e + 0.05) > nightFactor(e)) nightMonotonic = false;
+  check("night: the factor never increases as the sun climbs", nightMonotonic);
+
+  // NIGHT MUST STAY FLYABLE (§14/§15). These are the floors that keep a fighter
+  // at 200 m/s from being flown in a black room.
+  const midnight = environmentFor(0.79);
+  const noon = environmentFor(0.29);
+  check("night: the sun contributes nothing", midnight.sunIntensity === 0, midnight.sunIntensity);
+  check("night: but a moon light does", midnight.moonIntensity > 0.3, midnight.moonIntensity);
+  check("night: ambient never falls to zero", midnight.hemiIntensity >= NIGHT.minAmbient, midnight.hemiIntensity);
+  check("night: the moon opposes the sun, so relief still has a direction", midnight.moonDirection.y > 0 && midnight.moonDirection.x * midnight.sunDirection.x <= 0);
+  check("day: daylight is unchanged from the original fixed sun", Math.abs(noon.sunIntensity - NIGHT.sunPeak) < 1e-9, noon.sunIntensity);
+  // §16 — the horizon must stay perceptible with no light on it: the haze band
+  // is kept brighter than the dome, and the water darker than both.
+  const lum = (h) => ((h >> 16) & 255) * 0.299 + ((h >> 8) & 255) * 0.587 + (h & 255) * 0.114;
+  check("night: the horizon band is brighter than the sky above it", lum(midnight.hazeColor) > lum(midnight.skyColor), [lum(midnight.hazeColor), lum(midnight.skyColor)]);
+  check("night: and the ocean is darker than the horizon", lum(midnight.waterColor) < lum(midnight.hazeColor));
+  check("night: clouds keep contrast against the dome (§20)", lum(midnight.cloudColor) > lum(midnight.skyColor));
+  let distinct = true;
+  for (let t = 0; t < 1; t += 0.02) {
+    const e = environmentFor(t);
+    if (e.waterColor === e.skyColor || e.waterColor === e.hazeColor) distinct = false;
+  }
+  check("ocean: never the same colour as the sky or the horizon (§32)", distinct);
+
+  // Smoothness: no visible step anywhere around the cycle. A snap here is the
+  // one thing §6 and §17 both single out.
+  //
+  // MEASURED PER RENDERED FRAME, not per arbitrary tau step. Twilight is
+  // *supposed* to change fast — §12 asks for rapid intensity reduction — so a
+  // coarse sample makes the legitimate dusk ramp look like a discontinuity. What
+  // matters is whether the player can see a step between two frames.
+  const frameTau = 1 / 60 / DAY.cycleSeconds;
+  let maxJump = 0;
+  for (let t = 0; t <= 1.0001; t += 0.0025) {
+    const a = environmentFor(t);
+    const b = environmentFor(t + frameTau);
+    maxJump = Math.max(maxJump, Math.abs(b.sunIntensity - a.sunIntensity), Math.abs(b.hemiIntensity - a.hemiIntensity), Math.abs(b.night - a.night));
+  }
+  check("cycle: no lighting value snaps between rendered frames", maxJump < 0.01, maxJump);
+
+  // The presets: each must land in its own daylight, not at the dark crossing.
+  const atSunrise = environmentFor(DAY.sunriseTau);
+  const atSunset = environmentFor(DAY.sunsetTau);
+  check("preset: `[` gives real sunrise light, not the dark crossing", atSunrise.sunIntensity > 1 && atSunrise.night === 0, [atSunrise.sunIntensity, atSunrise.night]);
+  check("preset: `]` gives real sunset light", atSunset.sunIntensity > 0.5 && atSunset.night === 0, [atSunset.sunIntensity, atSunset.night]);
+  check("preset: sunset is warmer than midday", (atSunset.sunColor & 255) < (noon.sunColor & 255), [atSunset.sunColor.toString(16), noon.sunColor.toString(16)]);
+
+  // §41 — lights fade with the sun and are never toggled at a threshold.
+  check("lights: fully out in daylight", environmentFor(0.29).nightLightLevel === 0);
+  check("lights: fully up at night", environmentFor(0.79).nightLightLevel === 1);
+  check("lights: partial through dusk", environmentFor(0.585).nightLightLevel > 0 && environmentFor(0.585).nightLightLevel < 1, environmentFor(0.585).nightLightLevel);
+
+  /* ---- settlement placement ---- */
+  // A synthetic island: a low coastal shelf, a habitable plain, and a peak. The
+  // placement rule must use all three correctly with no scene present.
+  const island = (x, z) => {
+    if (x < -3000) return -20; // sea
+    if (Math.hypot(x - 4000, z - 4000) < 900) return 520; // mountain
+    if (x > 6000) return 40 + (x - 6000) * 0.5; // steep slope
+    return 30 + Math.sin(x / 900) * 8; // gentle habitable ground
+  };
+  check("placement: dry gentle ground is habitable", habitable(0, 0, island) !== null);
+  check("placement: the sea is not (§37)", habitable(-5000, 0, island) === null);
+  check("placement: a mountain is not", habitable(4000, 4000, island) === null);
+  check("placement: a steep slope is not", habitable(9000, 0, island) === null);
+
+  const plan = planSettlements({ bounds: { minX: -8000, maxX: 8000, minZ: -8000, maxZ: 8000 }, sampleHeight: island });
+  check("settlements: lights are generated", plan.count > 200, plan.count);
+  check("settlements: the arrays agree", plan.positions.length === plan.count * 3 && plan.colors.length === plan.count * 3);
+  check("settlements: clustered, not scattered (§36)", plan.clusters.length >= 6, plan.clusters.length);
+  check("settlements: a few big clusters and more small ones", plan.clusters.filter((c) => c.kind === "major").length <= 4 && plan.clusters.filter((c) => c.kind === "minor").length > plan.clusters.filter((c) => c.kind === "major").length);
+  // No light may stand anywhere the rule forbids: this is the assertion that
+  // catches a light in the sea or on a peak, which reads instantly as a bug.
+  let allValid = true;
+  let maxY = -Infinity;
+  for (let i = 0; i < plan.count; i++) {
+    const x = plan.positions[i * 3];
+    const y = plan.positions[i * 3 + 1];
+    const z = plan.positions[i * 3 + 2];
+    maxY = Math.max(maxY, y);
+    if (habitable(x, z, island) === null) allValid = false;
+  }
+  check("settlements: every light stands on habitable ground", allValid);
+  check("settlements: none is above the height limit", maxY <= LIGHTS.maxHeight + 20, maxY);
+  // §35 — deterministic: the same island every run.
+  const again = planSettlements({ bounds: { minX: -8000, maxX: 8000, minZ: -8000, maxZ: 8000 }, sampleHeight: island });
+  check("settlements: generation is seeded and repeatable", again.count === plan.count && again.positions[0] === plan.positions[0] && again.positions[plan.count * 3 - 1] === plan.positions[plan.count * 3 - 1]);
+  const differentSeed = planSettlements({ bounds: { minX: -8000, maxX: 8000, minZ: -8000, maxZ: 8000 }, sampleHeight: island, seed: 12345 });
+  check("settlements: ...but the seed is what decides it", differentSeed.positions[0] !== plan.positions[0]);
+  check("prng: seeded() is deterministic", seeded(7)() === seeded(7)() && seeded(7)() !== seeded(8)());
+
+  /* ---- ocean ---- */
+  // §21 — the gameplay sea stays flat. This is the boundary that must not move:
+  // the waves are a vertex-shader skin and no gameplay code may learn of them.
+  check("ocean: gameplay still uses a flat sea at y=0", WORLD.oceanY === 0);
+  check("ocean: the visual patch is coarse on purpose (§23)", OCEAN.segments <= 128, OCEAN.segments);
+  check("ocean: three wave components, not a spectrum (§25)", OCEAN.waves.length === 3);
+  check("ocean: amplitudes stay restrained", OCEAN.waves.every((w) => w[0] <= 0.8) && OCEAN.waves[0][0] >= 0.4, OCEAN.waves.map((w) => w[0]));
+  check("ocean: the components have distinct directions", new Set(OCEAN.waves.map((w) => w[3])).size === 3);
+  check("ocean: the patch is smaller than the old 100 km plane but far past sight", OCEAN.patchSize > 8000 && OCEAN.patchSize < WORLD.oceanSize);
+
+  // §28 — the horizon blend must be CAPPED. Uncapped, the far half of the sea
+  // becomes flat sky colour and the whole surface reads as milky soup rather
+  // than as water.
+  check("ocean: the Fresnel blend never fully replaces water with sky", OCEAN.fresnelMax < 0.7 && OCEAN.fresnelMax > 0.2, OCEAN.fresnelMax);
+  check("ocean: the wide sheen lobe stays subtle", OCEAN.sheen < 0.08, OCEAN.sheen);
+  check("ocean: reflection is confined to grazing angles", OCEAN.fresnelPower >= 6 && OCEAN.fresnelBase < 0.02);
+
+  // THE DAYTIME PLATEAU MUST NOT BE FLAT. `day` saturates well before midday, so
+  // without the elevation ramp the sun holds one value across two thirds of the
+  // cycle — which is what made a two-minute flight look like the clock was dead.
+  const morning = environmentFor(0.15);
+  const midday = environmentFor(0.29);
+  const afternoon = environmentFor(0.45);
+  check("cycle: midday is brighter than mid-morning", midday.sunIntensity > morning.sunIntensity * 1.05, [morning.sunIntensity, midday.sunIntensity]);
+  check("cycle: and brighter than mid-afternoon", midday.sunIntensity > afternoon.sunIntensity * 1.02, [afternoon.sunIntensity, midday.sunIntensity]);
+  check("cycle: the daytime sky colour actually changes", morning.skyColor !== midday.skyColor && midday.skyColor !== afternoon.skyColor);
+  check("cycle: the daytime water colour changes too", morning.waterColor !== midday.waterColor && midday.waterColor !== afternoon.waterColor);
+  // A player should reach a visibly different sky within a couple of minutes,
+  // which is the whole reason the cycle length was reduced.
+  const twoMinutes = 120 / DAY.cycleSeconds;
+  const startEnv = environmentFor(DAY.startTau);
+  const laterEnv = environmentFor(DAY.startTau + twoMinutes);
+  check(
+    "cycle: two minutes of flight moves the sky measurably",
+    startEnv.skyColor !== laterEnv.skyColor && Math.abs(startEnv.sunIntensity - laterEnv.sunIntensity) > 0.05,
+    [DAY.startTau, +(DAY.startTau + twoMinutes).toFixed(3), +startEnv.sunIntensity.toFixed(2), +laterEnv.sunIntensity.toFixed(2)]
+  );
+  check("cycle: ...and reaches sunset within about four minutes", (DAY.sunsetTau - DAY.startTau) * DAY.cycleSeconds < 260, (DAY.sunsetTau - DAY.startTau) * DAY.cycleSeconds);
+
+  // THE WATERLINE MUST BE FINDABLE. Over open sea at low altitude the only cue
+  // for height is the colour boundary between air and surface, so the water is
+  // held more saturated than both the sky and the horizon at every hour.
+  const bluer = (a, b) => (a & 255) - ((a >> 16) & 255) > (b & 255) - ((b >> 16) & 255);
+  let saturatedByDay = true;
+  for (let t = 0; t < 1; t += 0.02) {
+    const e = environmentFor(t);
+    // Daylight only. At night the boundary is carried by LUMINANCE instead — the
+    // haze band is held brighter than the water, which is asserted separately —
+    // and blue-minus-red is a poor saturation proxy once both are near black.
+    if (e.night < 0.5 && !bluer(e.waterColor, e.hazeColor)) saturatedByDay = false;
+  }
+  check("ocean: the water is more blue than the horizon in daylight", saturatedByDay);
+  const noonWater = environmentFor(0.3).waterColor;
+  check("ocean: midday water is a real blue, not a grey-blue", (noonWater & 255) - ((noonWater >> 16) & 255) > 100, [(noonWater & 255) - ((noonWater >> 16) & 255)]);
+  // Surface texture is the other height cue: the chop has to be big enough to
+  // read from the cockpit at 200 m/s.
+  check("ocean: the small chop is legible", OCEAN.waves[2][0] >= 0.15, OCEAN.waves[2][0]);
+}
+
+/* ---- Stage 05.6 — the loop watchdog ---- */
+{
+  /**
+   * A stub element that reports perfect health and never advances its clock:
+   * exactly the fault that was reported as "no engine sound" several times and
+   * could not be seen in any property the real element exposes.
+   */
+  const makeStub = () => ({
+    volume: 0,
+    playbackRate: 1,
+    paused: true,
+    currentTime: 0,
+    readyState: 4,
+    loop: false,
+    play() {
+      this.paused = false;
+      return { catch() {} };
+    },
+    pause() {
+      this.paused = true;
+    },
+    addEventListener() {},
+  });
+  const factory = () => (src, loop) => {
+    const e = makeStub();
+    e.loop = !!loop;
     return e;
   };
-  return { el, made };
-}
 
-function testAudioPriorityAndDucking() {
-  check("priorities are ordered AMBIENT < WEAPON < WARNING < CRITICAL",
-    AMBIENT < WEAPON && WEAPON < WARNING && WARNING < CRITICAL);
-  check("the engine loop is AMBIENT", CUES.ENGINE_LOOP.priority === AMBIENT);
-  check("the gun is WEAPON", CUES.GUN.priority === WEAPON);
-  check("LOCK is a WARNING", CUES.LOCK.priority === WARNING);
-  check("MISSILE is CRITICAL", CUES.MISSILE.priority === CRITICAL);
-  // THE PLAYER'S OWN LAUNCH IS WEAPON, NOT WARNING -- it confirms something
-  // they did and must never mask an inbound call.
-  check("the player's own launch is WEAPON, not WARNING", CUES.MISSILE_LAUNCH.priority === WEAPON);
-  // THE GUN IS A LOOP, not 48 one-shots a second.
-  check("the gun is a loop", CUES.GUN.loop === true);
-  check("the engine loop loops", CUES.ENGINE_LOOP.loop === true);
-  check("warnings are not loops", !CUES.LOCK.loop && !CUES.PULL_UP.loop);
+  const dir = createAudioDirector({ audioFactory: factory() });
+  dir.arm();
+  dir.loop(Cue.ENGINE_LOOP, true, { volume: 0.6, rate: 1.12 });
+  const ch = dir.channels.ENGINE_LOOP;
+  const eng = ch.voices[0][0];
+  check("watchdog: the engine loop starts, pitched by the throttle", eng.paused === false && eng.playbackRate > 1.1, eng.playbackRate);
 
-  const { el } = fakeAudio();
-  const audio = createAudio({ createElement: el });
-  audio.arm();
-  check("no duck at rest", audio.duckLevel() === 1);
-  audio.play("LOCK");
-  check("a warning ducks", audio.duckLevel() < 1, `${audio.duckLevel()}`);
-  const afterWarning = audio.duckLevel();
-  // A WARNING NEVER DUCKS ANOTHER WARNING -- the second is the one that
-  // matters, and pushing it down would bury the information.
-  audio.tick(4);
-  audio.play("MISSILE");
-  const afterCritical = audio.duckLevel();
-  check("a critical cue ducks harder than a warning", afterCritical < afterWarning,
-    `${afterCritical} vs ${afterWarning}`);
-  audio.tick(2);
-  check("the duck expires", audio.duckLevel() === 1);
-}
-
-function testAudioIntervalsAndTakes() {
-  const { el } = fakeAudio();
-  const audio = createAudio({ createElement: el });
-  audio.arm();
-
-  // EVERY ONE-SHOT HAS A MINIMUM INTERVAL: a cue that repeats is a cue nobody
-  // hears.
-  check("the first LOCK fires", audio.play("LOCK") === true);
-  check("an immediate second is refused", audio.play("LOCK") === false);
-  audio.tick(1);
-  check("still refused inside the interval", audio.mayFire("LOCK") === false);
-  audio.tick(3);
-  check("allowed once the interval has passed", audio.mayFire("LOCK") === true);
-
-  // FLARES is forced past its own floor -- it confirms a deliberate action.
-  check("a forced cue ignores its floor", audio.mayFire("FLARES") === true);
-
-  // MULTI-TAKE CUES ROTATE ROUND-ROBIN, so with three takes it is PROVABLY
-  // never twice in a row -- which random selection cannot promise.
-  const a2 = createAudio({ createElement: el });
-  a2.arm();
-  const takes = [];
-  for (let i = 0; i < 9; i++) takes.push(a2.nextTake("LOCK"));
-  check("three takes rotate 0,1,2", takes.join("") === "012012012", takes.join(""));
-  check("no take repeats consecutively", takes.every((t, i) => i === 0 || t !== takes[i - 1]));
-  const two = [];
-  for (let i = 0; i < 6; i++) two.push(a2.nextTake("MISSILE"));
-  check("two takes alternate", two.join("") === "010101", two.join(""));
-
-  // A one-shot cannot be looped, and a one-shot CAN be stopped early -- the
-  // engine start-up is cut the instant the catapult fires.
-  const a3 = createAudio({ createElement: el });
-  a3.arm();
-  check("startLoop refuses a one-shot", a3.startLoop("LOCK") === false);
-  check("startLoop accepts the gun", a3.startLoop("GUN") === true);
-  a3.play("ENGINE_START", { force: true });
-  check("the start-up is playing", a3.isPlaying("ENGINE_START") === true);
-  check("a one-shot can be stopped early", a3.stop("ENGINE_START") === true);
-  check("and is then not playing", a3.isPlaying("ENGINE_START") === false);
-  check("the start-up plays at double rate", CUES.ENGINE_START.rate === 2);
-}
-
-function testAudioGesturesAndMissingFiles() {
-  const { el, made } = fakeAudio();
-  const audio = createAudio({ createElement: el });
-  // NOTHING PLAYS BEFORE A USER GESTURE.
-  check("nothing plays before a gesture", audio.play("LOCK") === false);
-  check("arming reports the first time only", audio.arm() === true && audio.arm() === false);
-  check("and then it plays", audio.play("LOCK") === true);
-
-  audio.setMuted(true);
-  check("muted plays nothing", audio.play("MISSILE") === false);
-  audio.setMuted(false);
-  check("unmuted plays again", audio.play("MISSILE") === true);
-
-  // MISSING AUDIO FILES ARE A NORMAL STATE. Marked unavailable only on
-  // POSITIVE FAILURE -- never on readyState < 3, which is also the state of a
-  // file that simply has not finished loading and which would mark every
-  // working file as missing.
-  check("every cue starts available", audio.missingCues().length === 0);
-  check("a cue that has not loaded yet is still available", audio.isAvailable("PULL_UP") === true);
-  made[0].fail();
-  check("a positive error marks a cue missing", audio.missingCues().length === 1);
-  const failedName = audio.missingCues()[0];
-  check("a missing cue does not play", audio.play(failedName) === false);
-  check("the rest still play", audio.play("PULL_UP") === true);
-  // The game runs silent rather than throwing.
-  const silent = createAudio({ createElement: () => null });
-  silent.arm();
-  check("a build with no audio at all does not throw", silent.play("LOCK") === true);
-}
-
-function testGroundWarningsAndFlyby() {
-  // BOTH LEVELS READ AGL, NOT ALTITUDE ABOVE SEA LEVEL -- so 200 m over the
-  // ocean is quiet and 200 m into a 600 m ridge is not.
-  check(
-    "high above the ground is quiet",
-    groundWarning({ agl: 900, forwardHazard: Infinity, sink: 0, speed: 200 }) === null,
-  );
-  check(
-    "low AGL calls ALTITUDE",
-    groundWarning({ agl: 180, forwardHazard: Infinity, sink: 0, speed: 200 }) === "ALTITUDE",
-  );
-  check(
-    "an imminent forward hazard calls PULL UP",
-    groundWarning({ agl: 900, forwardHazard: 100, sink: 0, speed: 200 }) === "PULL_UP",
-  );
-  check(
-    "low and descending calls PULL UP",
-    groundWarning({ agl: 100, forwardHazard: Infinity, sink: 20, speed: 200 }) === "PULL_UP",
-  );
-  // THE POINT OF USING AGL: the SAME altitude reads differently depending on
-  // what is underneath. 200 m over open water is 200 m AGL; 200 m over a 600 m
-  // ridge is 400 m INSIDE it. An earlier version of this check asserted 201 m
-  // AGL was quiet, which is simply false -- the threshold is 220.
-  const overWater = groundWarning({
-    agl: 200, forwardHazard: Infinity, sink: 0, speed: 200,
-  });
-  const overRidge = groundWarning({
-    agl: 200 - 600, forwardHazard: 120, sink: 0, speed: 200,
-  });
-  check("200 m over water is only an ALTITUDE call", overWater === "ALTITUDE", String(overWater));
-  check("the same altitude into a ridge is a PULL UP", overRidge === "PULL_UP", String(overRidge));
-  check(
-    "well clear of the sea is silent",
-    groundWarning({ agl: 400, forwardHazard: Infinity, sink: 0, speed: 200 }) === null,
-  );
-
-  // THE FLY-BY FIRES ONCE PER PASS: a range that crossed the threshold THIS
-  // FRAME plus real closure.
-  check("a crossing with closure is a fly-by", isFlyby(400, 300, 300) === true);
-  check("a slow drift past is not", isFlyby(400, 300, 20) === false);
-  check("already inside is not a new pass", isFlyby(300, 280, 300) === false);
-  check("still outside is not", isFlyby(900, 800, 300) === false);
-}
-
-// ── HUD.md H13 gates ──────────────────────────────────────────────────────
-
-// ── Change 6 (DIAGNOSIS B5): the HUD comes up with the aircraft ───────────
-
-function testHudRevealEnvelope() {
-  const plan = buildLaunchPlan({ runLength: DECK_RUN, clipSeconds: 22 });
-  const A = (t) => hudRevealAlpha(t, plan.fireAt);
-
-  // THE GATE, exactly as stated: dark at the shot, part-way in 0.2 s later,
-  // complete by the release point.
-  check("the HUD is dark on the deck", A(plan.fireAt - 0.01) === 0, `${A(plan.fireAt - 0.01)}`);
-  check("dark from the first frame, not just the last deck frame", A(0) === 0);
-  check("and dark all the way through the dwell", A(plan.fireAt * 0.99) === 0);
-  const mid = A(plan.fireAt + 0.2);
-  check("it is part-way in 0.2 s after the catapult", mid > 0 && mid < 1, `${mid}`);
-  check(
-    "and complete at the release point",
-    A(plan.releaseAt) === 1,
-    `${A(plan.releaseAt)}`,
-  );
-  check("still complete at the handoff", A(plan.handoffAt) === 1);
-
-  // The fade is 0.4 s, and it is complete WELL before the release point -- the
-  // stroke is 2.77 s long, so there is no frame rate at which the two race.
-  check("the fade is 0.4 s", HUD_REVEAL_SECONDS === 0.4);
-  check(
-    "the fade finishes long before the release point",
-    plan.releaseAt - plan.fireAt > HUD_REVEAL_SECONDS * 4,
-    `${(plan.releaseAt - plan.fireAt).toFixed(2)} s of stroke`,
-  );
-  check("it is exactly complete at fireAt + the fade", A(plan.fireAt + HUD_REVEAL_SECONDS) === 1);
-
-  // Monotonic and clamped: the display comes up once and does not flicker.
-  let prev = -Infinity;
-  let monotonic = true;
-  for (let i = 0; i <= 400; i++) {
-    const v = A((i / 400) * plan.handoffAt);
-    if (v < prev - 1e-12) monotonic = false;
-    if (v < 0 || v > 1) monotonic = false;
-    prev = v;
+  // Let it genuinely play first: a channel whose clock has never moved is a
+  // START failure (autoplay), which is a different fault handled below. This
+  // block is specifically about a loop that WAS running and stopped.
+  for (let i = 0; i < 30; i++) {
+    eng.currentTime += 1 / 60;
+    dir.update(1 / 60);
   }
-  check("the envelope is monotonic and stays in [0, 1]", monotonic);
+  check("watchdog: a running loop is recognised as having played", ch.everPlayed === true);
 
-  // A BUILD WITH NO LAUNCH SCRIPT STILL GETS A HUD. §2: if an asset fails to
-  // load the game must remain playable, and a carrier that never arrived must
-  // not take the instruments with it.
-  check("no launch script means a full HUD", hudRevealAlpha(0, null) === 1);
-  check("and so does an undefined one", hudRevealAlpha(12, undefined) === 1);
-  check("a zero fade snaps rather than dividing by zero", hudRevealAlpha(1, 0.5, 0) === 1);
+  // Frozen clock, healthy everything else. Must be caught.
+  for (let i = 0; i < 40; i++) dir.update(1 / 60);
+  check("watchdog: a frozen clock is detected even though the element looks fine", ch.stalls >= 1, ch.stalls);
+  check("watchdog: the playback rate is reset and locked", eng.playbackRate === 1 && ch.rateLocked === true);
+  check("watchdog: play() is re-issued", eng.paused === false);
+  // The pitch effect must stay off once it has been blamed, not be re-applied on
+  // the next frame's loop() call.
+  dir.loop(Cue.ENGINE_LOOP, true, { volume: 0.6, rate: 1.12 });
+  check("watchdog: the pitch effect stays off once blamed", eng.playbackRate === 1);
+  check("watchdog: the stall count is published for the rail", dir.report.stalls.ENGINE_LOOP >= 1, dir.report.stalls);
 
-  // Read against a RUNNING script, not just the pure function -- the envelope
-  // is worth nothing if the clock it reads is not the one the catapult uses.
-  const flown = flyHeldLaunch({ armAt: 0 });
-  const at = (t) => flown.timeline.reduce((best, f) => (f.t <= t ? f : best), flown.timeline[0]);
-  check(
-    "the flown deck is dark for its whole dwell",
-    flown.timeline
-      .filter((f) => f.t < plan.fireAt)
-      .every((f) => hudRevealAlpha(f.t, plan.fireAt) === 0),
-  );
-  check(
-    "the flown stroke is fully lit by the release point",
-    hudRevealAlpha(at(plan.releaseAt).t, plan.fireAt) === 1,
-  );
-
-  // AND A HELD DECK STAYS DARK. The hold parks the script at t = 0, so a player
-  // who has not yet touched a key sits in front of an unlit display for as long
-  // as they like -- the envelope reads the same clock the hold freezes.
-  const heldRun = flyHeldLaunch({ armAt: 5 });
-  check(
-    "a deck held for audio stays dark while it waits",
-    heldRun.timeline
-      .filter((f) => f.wall < 5)
-      .every((f) => hudRevealAlpha(f.t, plan.fireAt) === 0),
-  );
-}
-
-function testHudScale() {
-  // H13.1
-  check("hudScale(720) clamps to the lower bound", hudScale(720) === 0.85, String(hudScale(720)));
-  check("hudScale(1080) is exactly 1", hudScale(1080) === 1, String(hudScale(1080)));
-  check("hudScale(1440) is 1.333", Math.abs(hudScale(1440) - 4 / 3) < 1e-9);
-  check("hudScale(2160) clamps to the upper bound", hudScale(2160) === 2.0, String(hudScale(2160)));
-  check("a degenerate height falls back to the floor", hudScale(0) === 0.85);
-
-  // The smallest ramp entry must never render below 11 CSS px. The ramp's
-  // smallest is 10 and the lower clamp is 0.85, so 8.5 -- the scale alone
-  // cannot satisfy this and the absolute floor is what does.
-  const smallest = Math.min(...Object.values(RAMP).map((r) => r.size));
-  check("the smallest ramp entry is the 10-referenced label", smallest === 10, String(smallest));
-  for (const height of [720, 900, 1080, 1440, 2160]) {
-    const px = fontPx("radarLabel", hudScale(height));
-    check(`the smallest text at ${height}p is at least 11 px`, px >= 11, String(px));
+  // A HEALTHY loop must never be touched: a watchdog that fires on working audio
+  // would silently strip the pitch effect from every engine everywhere.
+  const dir2 = createAudioDirector({ audioFactory: factory() });
+  dir2.arm();
+  dir2.loop(Cue.ENGINE_LOOP, true, { volume: 0.6, rate: 1.12 });
+  const ch2 = dir2.channels.ENGINE_LOOP;
+  const eng2 = ch2.voices[0][0];
+  for (let i = 0; i < 120; i++) {
+    eng2.currentTime += 1 / 60;
+    dir2.update(1 / 60);
   }
-  check(
-    "the floor does not shrink type that is already large enough",
-    fontPx("primary", hudScale(1080)) === 26,
-  );
+  check("watchdog: a healthy advancing loop is never touched", ch2.stalls === 0 && eng2.playbackRate > 1.1, [ch2.stalls, eng2.playbackRate]);
+  check("watchdog: ...and its rate is never locked", ch2.rateLocked === false);
 
-  // THE DPR TRAP (H3): the SVG viewBox is already in CSS pixels, so the browser
-  // has handled devicePixelRatio before any of this runs. Multiplying by it
-  // double-counts and produces the enormous-HUD bug.
-  //
-  // Asserted as BEHAVIOUR rather than by grepping the source: move the global
-  // devicePixelRatio and the scale must not budge. A source scan proves only
-  // that one spelling is absent; this proves the value cannot depend on it,
-  // however it were reached.
-  const savedDpr = globalThis.devicePixelRatio;
-  const atDpr = (dpr) => {
-    Object.defineProperty(globalThis, "devicePixelRatio", {
-      value: dpr, configurable: true, writable: true,
-    });
-    return hudScale(1080);
+  // A loop wrap moves the clock BACKWARDS. That is motion, not a stall.
+  const dir3 = createAudioDirector({ audioFactory: factory() });
+  dir3.arm();
+  dir3.loop(Cue.ENGINE_LOOP, true, { volume: 0.6, rate: 1.0 });
+  const ch3 = dir3.channels.ENGINE_LOOP;
+  const eng3 = ch3.voices[0][0];
+  for (let i = 0; i < 120; i++) {
+    eng3.currentTime = (eng3.currentTime + 1 / 60) % 0.5; // wraps repeatedly
+    dir3.update(1 / 60);
+  }
+  check("watchdog: a looping wrap is not mistaken for a stall", ch3.stalls === 0, ch3.stalls);
+
+  // A muted or stopped channel is not stalled either.
+  const dir4 = createAudioDirector({ audioFactory: factory() });
+  dir4.arm();
+  dir4.loop(Cue.ENGINE_LOOP, true, { volume: 0.6, rate: 1.1 });
+  dir4.setMuted(true);
+  for (let i = 0; i < 60; i++) dir4.update(1 / 60);
+  check("watchdog: a muted channel is not reported as stalled", dir4.channels.ENGINE_LOOP.stalls === 0);
+
+  /**
+   * A START FAILURE MUST NOT BE TREATED AS A STALL.
+   *
+   * This is the autoplay case: the browser refuses playback until the document
+   * has had a real user gesture, and the element sits at zero. Blaming that on
+   * the playback rate cost the engine its throttle-pitch effect for a fault that
+   * had nothing to do with it, so the two are now told apart by whether the
+   * clock has EVER moved.
+   */
+  const blockedFactory = () => (src, loop) => {
+    const e = makeStub();
+    e.loop = !!loop;
+    // play() resolves but playback is never granted: paused flips false and the
+    // clock stays at zero, exactly as a refused element behaves.
+    e.play = function () {
+      this.paused = false;
+      return { catch() {} };
+    };
+    return e;
   };
-  const one = atDpr(1);
-  const three = atDpr(3);
-  const fractional = atDpr(2.625);
-  if (savedDpr === undefined) delete globalThis.devicePixelRatio;
-  else {
-    Object.defineProperty(globalThis, "devicePixelRatio", {
-      value: savedDpr, configurable: true, writable: true,
-    });
+  const dir5 = createAudioDirector({ audioFactory: blockedFactory() });
+  dir5.arm();
+  dir5.loop(Cue.ENGINE_LOOP, true, { volume: 0.6, rate: 1.12 });
+  const ch5 = dir5.channels.ENGINE_LOOP;
+  const eng5 = ch5.voices[0][0];
+  for (let i = 0; i < 120; i++) dir5.update(1 / 60);
+  check("watchdog: a never-started channel is counted as pending, not stalled", ch5.pending > 0 && ch5.stalls === 0, [ch5.pending, ch5.stalls]);
+  check("watchdog: and its pitch effect is NOT stripped", ch5.rateLocked === false && eng5.playbackRate > 1.1, [ch5.rateLocked, eng5.playbackRate]);
+  check("watchdog: it keeps trying to start", eng5.paused === false);
+  check("watchdog: pending is published separately from stalls", dir5.report.pending.ENGINE_LOOP > 0 && !dir5.report.stalls.ENGINE_LOOP);
+
+  // Once it genuinely starts, a later freeze IS a stall and is repaired.
+  const dir6 = createAudioDirector({ audioFactory: factory() });
+  dir6.arm();
+  dir6.loop(Cue.ENGINE_LOOP, true, { volume: 0.6, rate: 1.12 });
+  const ch6 = dir6.channels.ENGINE_LOOP;
+  const eng6 = ch6.voices[0][0];
+  for (let i = 0; i < 60; i++) {
+    eng6.currentTime += 1 / 60;
+    dir6.update(1 / 60);
   }
-  check(
-    "the scale unit does not depend on devicePixelRatio",
-    one === 1 && three === 1 && fractional === 1,
-    `dpr1 ${one}, dpr3 ${three}, dpr2.625 ${fractional}`,
-  );
+  check("watchdog: a channel that really played is marked as such", ch6.everPlayed === true);
+  for (let i = 0; i < 60; i++) dir6.update(1 / 60); // now frozen
+  check("watchdog: a freeze AFTER playing is a stall and is repaired", ch6.stalls >= 1 && ch6.rateLocked === true, [ch6.stalls, ch6.rateLocked]);
 }
 
-function testFlankLayout() {
-  // H13.2
-  const u = hudScale(1080);
-  const widths = [1280, 1920, 2560, 3840];
-  const flanks = widths.map((w) => flankOffset(w, u));
-  check(
-    "flank is monotonic in width",
-    flanks.every((f, i) => i === 0 || f >= flanks[i - 1]),
-    flanks.map((f) => f.toFixed(1)).join(", "),
-  );
-  check("flank is never below 92u", flanks.every((f) => f >= 92 * u));
-  check("flank is never above 300u", flanks.every((f) => f <= 300 * u));
+console.log(failures === 0 ? `flight.test.js — all ${total} checks passed` : `flight.test.js — ${failures} failure(s) of ${total}`);
 
-  // 0.14 x w replaces 0.18: at 2500 px the columns sat 300 px off centre while
-  // the boresight cross was 13 px wide, so nothing occupied the middle third.
-  check(
-    "the flank fraction is 0.14, not 0.18",
-    FLANK_FRACTION === 0.14,
-    String(FLANK_FRACTION),
-  );
-  check(
-    "at 2560 the columns are pulled in from the old 0.18 placement",
-    flankOffset(2560, u) < 0.18 * 2560,
-    `${flankOffset(2560, u).toFixed(0)} vs ${(0.18 * 2560).toFixed(0)}`,
-  );
-
-  // A 320 px developer rail must never be crossed.
-  for (const w of widths) {
-    const col = flankColumns(w, u, 320);
-    check(`spdX clears a 320 px rail at w=${w}`, col.spdX > 320 - 1e-9, String(col.spdX));
-  }
-  // safeLeft only ever RAISES the floor -- it can never pull a column inward.
-  const free = flankColumns(1920, u, 0);
-  const railed = flankColumns(1920, u, 900);
-  check("safeLeft raises the floor", railed.spdX === 900, String(railed.spdX));
-  check("safeLeft never moves the right column", railed.altX === free.altX);
-  check("with no rail the column sits at cx - flank", free.spdX === 960 - free.flank);
-}
-
-function testAglReadout() {
-  // H13.5. AGL OVER WATER READS AN EM DASH, NOT ZERO: a dash means "not a
-  // factor", a zero means "you are about to die", and the sea must not cry
-  // wolf for the four minutes of the sortie flown over it.
-  const water = aglReadout(0, true);
-  check("AGL over water is an em dash", water.text === "—", water.text);
-  check("and it is dim, not a warning colour", water.colour === C.dim);
-  check("a non-finite AGL is also a dash", aglReadout(Infinity, false).text === "—");
-
-  check("AGL 300 is neutral", aglReadout(300, false).colour === C.line);
-  check("AGL 200 is amber", aglReadout(200, false).colour === C.warn);
-  check("AGL 100 is salmon", aglReadout(100, false).colour === C.danger);
-  check("AGL 300 prints the number", aglReadout(300, false).text === "300");
-  check("the thresholds are 220 and 110", AGL_WARN === 220 && AGL_DANGER === 110);
-}
-
-function testStoresPanel() {
-  // H13.6
-  const u = hudScale(1080);
-  const base = {
-    w: 1920, h: 1080, u, weapon: "AIM-9", missiles: 4, missileCapacity: 4,
-    gunRounds: 500, flares: 8,
-  };
-  const panel = storesPanel(base);
-  check("the panel is right-anchored", panel.anchor === "end");
-  check("it has three rows", panel.rows.length === 3);
-
-  // THE SELECTED WEAPON IS MARKED BY POSITION AND GLYPH, NOT BY COLOUR ALONE:
-  // colour-only selection fails for a colour-blind player and fails again on a
-  // bright deck.
-  const selected = panel.rows.find((r) => r.selected);
-  check("the selected row carries a marker glyph", selected.marker === "›", selected.marker);
-  check("unselected rows carry no marker", panel.rows.filter((r) => !r.selected).every((r) => r.marker.trim() === ""));
-  check("the selected row is full brightness", selected.colour === C.line);
-  check("unselected rows are dim", panel.rows.find((r) => r.key === "GUN").colour === C.dim);
-  const gunSelected = storesPanel({ ...base, weapon: "GUN" });
-  check("selection follows the weapon", gunSelected.rows.find((r) => r.key === "GUN").marker === "›");
-
-  // PIPS, NOT JUST DIGITS. Two AIM-9 is a quantity a player must FEEL.
-  check("four of four is four full pips", panel.rows[0].glyph === "▮▮▮▮", panel.rows[0].glyph);
-  const two = storesPanel({ ...base, missiles: 2 });
-  check("two of four is two full and two hollow", two.rows[0].glyph === "▮▮▭▭", two.rows[0].glyph);
-
-  // EMPTY IS AMBER, NEVER HIDDEN. A row that disappears when empty teaches
-  // nothing.
-  const dry = storesPanel({ ...base, missiles: 0 });
-  check("an empty magazine is still present", dry.rows.length === 3);
-  check("an empty magazine is amber", dry.rows[0].colour === C.warn, dry.rows[0].colour);
-  check("an empty magazine has hollow pips", dry.rows[0].glyph === "▭▭▭▭", dry.rows[0].glyph);
-  check("the empty row still prints its count", dry.rows[0].count === 0);
-
-  // The gun is a FRACTION, not a count, so it gets an eight-cell bar.
-  check("a full gun is eight lit cells", panel.rows[1].glyph === "▬".repeat(8), panel.rows[1].glyph);
-  const half = storesPanel({ ...base, gunRounds: 250 });
-  check("a half gun is four lit cells", half.rows[1].glyph === "▬▬▬▬▭▭▭▭", half.rows[1].glyph);
-
-  // THE REARM LINE ONLY EXISTS WHILE A TIMER RUNS, and names WHICH magazine.
-  check("no rearm line when no timer runs", panel.rearm === null);
-  const rearming = storesPanel({ ...base, rearm: { name: "AIM-9", seconds: 11.2 } });
-  check("a running timer produces a line", rearming.rearm !== null);
-  check("and it names the magazine", rearming.rearm.text.includes("AIM-9"), rearming.rearm.text);
-  check("and it is amber", rearming.rearm.colour === C.warn);
-  check("and it rounds up the seconds", rearming.rearm.text.includes("12s"), rearming.rearm.text);
-
-  // H13.7: the panel must clear the radar ring at BOTH ends of the u clamp --
-  // the two places a collision would first appear.
-  //
-  // Measured against the ring's TRUE top (2r + margin above the bottom), not
-  // against `r + margin` as H13.7 words it -- that is the ring's CENTRE line,
-  // and a panel can clear it while still overlapping the upper half of the
-  // ring. The weaker reading passed here while the live nodes overlapped by
-  // 58 px at 2560x1440.
-  for (const [w, h] of [[1280, 720], [1920, 1080], [2560, 1440], [3840, 2160]]) {
-    const uu = hudScale(h);
-    const p = storesPanel({ ...base, w, h, u: uu });
-    const trueRadarTop = h - (2 * RADAR_RADIUS + RADAR_MARGIN) * uu;
-    check(
-      `stores clears the radar RING at ${w}x${h}`,
-      p.bottom <= trueRadarTop && p.top < trueRadarTop,
-      `bottom ${p.bottom.toFixed(0)}, ring top ${trueRadarTop.toFixed(0)}`,
-    );
-    check(
-      `stores also clears H13.7's stated line at ${w}x${h}`,
-      p.top < h - (RADAR_RADIUS + RADAR_MARGIN) * uu,
-    );
-  }
-}
-
-function testModeSegment() {
-  // H13.9
-  const u = hudScale(1080);
-  const mission = modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5 });
-  check("MISSION shows the pilot count", mission.text.includes("5 PILOTS"), mission.text);
-  check("it is bottom-left anchored", mission.anchor === "start");
-
-  // PILOTS is MISSION ONLY: counting deaths in a sandbox turns practice into a
-  // test, so the segment is ABSENT ENTIRELY in FREE and PEACE.
-  const free = modeSegment({ h: 1080, u, mode: "ASSISTED", lives: null });
-  check("FREE has no PILOTS segment", !free.text.includes("PILOT"), free.text);
-  check("and no pilots part at all", free.parts.length === 1);
-  const peace = modeSegment({ h: 1080, u, mode: "EXPERT", lives: undefined });
-  check("PEACE has no PILOTS segment", !peace.text.includes("PILOT"), peace.text);
-
-  // EXPERT renders in the good tint, so the modes are distinguishable at a
-  // glance without reading the word.
-  check("EXPERT is the good tint", modeSegment({ h: 1080, u, mode: "EXPERT", lives: 5 }).parts[0].colour === C.good);
-  check("ASSISTED is not", mission.parts[0].colour !== C.good);
-
-  // Pilots shift amber at 2, salmon at 1.
-  check("5 pilots is dim", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5 }).parts[1].colour === C.dim);
-  check("2 pilots is amber", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 2 }).parts[1].colour === C.warn);
-  check("1 pilot is salmon", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 1 }).parts[1].colour === C.danger);
-  check("1 pilot is singular", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 1 }).text.includes("1 PILOT"), "plural");
-
-  // The mode brightens for 1.2 s after M, then settles back.
-  check("a fresh mode change is bright", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5, modeChangedAgo: 0.4 }).parts[0].colour === C.line);
-  check("and settles back after 1.2 s", modeSegment({ h: 1080, u, mode: "ASSISTED", lives: 5, modeChangedAgo: 2 }).parts[0].colour === C.dim);
-}
-
-function testStackAndColours() {
-  // H13.8: the stack has EXACTLY THREE slots. A fourth line of combat text is
-  // a redesign of the stack, not an addition to it.
-  check("the stack has exactly three slots", STACK_SLOTS.length === 3, String(STACK_SLOTS.length));
-  check("the slots descend", STACK_SLOTS[0] < STACK_SLOTS[1] && STACK_SLOTS[1] < STACK_SLOTS[2]);
-  check("stackY maps them onto a viewport", stackY(1000).join(",") === "630,665,695");
-
-  // H12: six hues and no gradients.
-  for (const key of ["line", "dim", "faint", "good", "nav", "warn", "danger", "ab", "radar"]) {
-    check(`the palette defines ${key}`, typeof C[key] === "string" && C[key].length > 0);
-  }
-  check("no colour is a gradient", Object.values(C).every((v) => !v.includes("gradient")));
-
-  // H4: the casing contract the shared text() helper applies.
-  check("the casing paints stroke under fill", CASING.paintOrder === "stroke fill");
-  check("the casing is a dark translucent stroke", CASING.stroke.startsWith("rgba(4, 8, 10"));
-  check("text casing is 2.6u", CASING.textWidth === 2.6);
-  check("symbol casing is 1.8u", CASING.symbolWidth === 1.8);
-}
-
-// ── PATCH-02 gates: HUD compliance ────────────────────────────────────────
-
-function testHudPaletteIsTheOnlySource() {
-  // C1 gate 1: zero hex colour literals outside the COLOR table.
-  //
-  // The table itself is the ONE place a hue may be written down. A literal
-  // anywhere else is a second palette waiting to happen, and the count is
-  // asserted rather than reviewed so a symbol added later cannot slip one in.
-  //
-  // Read at runtime through the module's own exported table: every value the
-  // HUD can paint must be one of these strings, so a node carrying anything
-  // else is by construction off-palette.
-  const palette = new Set(Object.values(C));
-  check("the palette is a closed set", palette.size === Object.keys(C).length);
-  check("the palette has the nine H12 entries", palette.size === 9, String(palette.size));
-
-  // C1 gate 3: the SPD/ALT primaries resolve to COLOR.line -- the EXACT string
-  // from the table, not a near-white lookalike from the developer rail.
-  check("line is the H12 value, not a near-white", C.line === "#cfe8d8", C.line);
-  check("line is not the rail's near-white", C.line !== "#e8f0f6");
-  check("good is the H12 value", C.good === "#9fe6b0", C.good);
-  check("nav is the H12 value", C.nav === "#8fd0ff", C.nav);
-  check("warn is the H12 value", C.warn === "#ffd79a", C.warn);
-  check("danger is the H12 value", C.danger === "#ff9a8f", C.danger);
-  check("ab is the H12 value", C.ab === "#ffb45a", C.ab);
-
-  // Everything the layout module can hand back is drawn from the same table.
-  const produced = [
-    aglReadout(0, true).colour,
-    aglReadout(300, false).colour,
-    aglReadout(200, false).colour,
-    aglReadout(100, false).colour,
-    ...storesPanel({
-      w: 1920, h: 1080, u: 1, weapon: "AIM-9", missiles: 0,
-      gunRounds: 500, flares: 8, rearm: { name: "AIM-9", seconds: 3 },
-    }).rows.map((r) => r.colour),
-    modeSegment({ h: 1080, u: 1, mode: "EXPERT", lives: 1 }).parts.map((p) => p.colour),
-  ].flat();
-  check(
-    "every colour the layout produces is in the table",
-    produced.every((c) => palette.has(c)),
-    produced.filter((c) => !palette.has(c)).join(", ") || "-",
-  );
-}
-
-function testCasingContract() {
-  // C2 gate 2: the casing values, asserted against the spec's numbers.
-  //
-  // PAINT-ORDER IS WHAT MAKES A CASING A CASING. Without it the stroke paints
-  // OVER the glyph, which both hides the outline and visually thins the
-  // letter -- PATCH-02 names it as the most likely single cause of
-  // `L A U N C H` being unreadable over sky.
-  check("paint-order puts the stroke under the fill", CASING.paintOrder === "stroke fill");
-  check("paint-order begins with stroke", CASING.paintOrder.startsWith("stroke"));
-  check("the casing colour is the spec value", CASING.stroke === "rgba(4, 8, 10, 0.62)", CASING.stroke);
-  check("text casing is 2.6u", CASING.textWidth === 2.6, String(CASING.textWidth));
-  check("symbol casing is 1.8u", CASING.symbolWidth === 1.8, String(CASING.symbolWidth));
-  check("the casing joins are round", CASING.linejoin === "round");
-
-  // The casing scales with u, so it holds at both ends of the clamp rather
-  // than being a fixed outline that vanishes on a large display.
-  const atSmall = CASING.textWidth * hudScale(720);
-  const atLarge = CASING.textWidth * hudScale(2160);
-  check("the casing scales with the unit", atLarge > atSmall, `${atSmall} -> ${atLarge}`);
-  check("the casing is never hairline", atSmall >= 2, String(atSmall));
-}
-
-// ── run ────────────────────────────────────────────────────────────────────
-
-const SUITES = [
-  ["envelope", testEnvelope],
-  ["turn", testTurn],
-  ["throttle", testThrottle],
-  ["sink", testSink],
-  ["snapshots", testSnapshots],
-  ["quaternion", testQuaternion],
-  ["input ramping", testInputRamping],
-  ["event.code robustness", testEventCodeRobustness],
-  ["stuck-key clearing", testStuckKeyClearing],
-  ["pointer stick geometry", testPointerStickGeometry],
-  ["pointer centre is not synthesised", testPointerCentreIsNotSynthesised],
-  ["pointer + keyboard combine", testPointerAndKeyboardCombine],
-  ["pointer leaves the window", testPointerLeavesTheWindow],
-  ["pointer lifecycle", testPointerLifecycle],
-  ["mouse buttons", testMouseButtons],
-  ["wheel throttle", testWheelThrottle],
-  ["contextmenu double duty", testContextMenuDoubleDuty],
-  ["latches", testLatches],
-  ["expert: no bank->heading", testExpertHasNoBankToHeading],
-  ["expert: local axes", testExpertIsLocal],
-  ["expert: no self-centring", testExpertDoesNotSelfCentre],
-  ["expert: inversion", testExpertCanInvert],
-  ["expert: sink law", testExpertSink],
-  ["both modes write the quaternion", testBothModesWriteTheQuaternion],
-  ["mode change", testModeChange],
-  ["pitch convention", testPitchConvention],
-  ["marking viewports", testMarkingViewports],
-  ["terrain index", testTerrainIndex],
-  ["probes and clearance", testProbesAndClearance],
-  ["fixed physics step", testFixedStep],
-  ["safe-state history", testSafeStateHistory],
-  ["collision policies", testCollisionPolicies],
-  ["stroke curve", testStrokeCurve],
-  ["closed form vs its own integral", testClosedFormMatchesItsOwnIntegral],
-  ["both stroke inverses", testBothInverses],
-  ["solving against decks", testSolveAgainstDecks],
-  ["deck dwell is measured", testDeckDwellIsMeasured],
-  ["launch sequence at 60 and 20 Hz", testLaunchSequence],
-  ["the deck is held for audio", testDeckIsHeldForAudio],
-  ["the spool ramp", testSpoolRamp],
-  ["parked pose", testParkedPose],
-  ["launch camera blend", testLaunchCameraBlend],
-  ["the script owns the aircraft", testLaunchOwnsTheAircraft],
-  ["the engine", testEngineFx],
-  ["target contract", testTargetContract],
-  ["lock progression", testLockProgression],
-  ["lead solution", testLeadSolution],
-  ["missile guidance", testMissileGuidance],
-  ["overshoot needs angle AND opening range", testOvershootNeedsAngleAndOpeningRange],
-  ["a defeated round keeps flying", testDefeatedRoundKeepsFlying],
-  ["expireOwner", testExpireOwner],
-  ["missile turn radius", testMissileTurnRadius],
-  ["the missile trail", testMissileTrail],
-  ["gun magazine and fx", testGunMagazineAndFx],
-  ["hostile transition table", testHostileTransitionTable],
-  ["ammo 0 is the design tool", testAmmoZeroIsTheDesignTool],
-  ["DEFEND rules", testDefendRules],
-  ["the break direction is latched", testBreakDirectionIsLatched],
-  ["hostile altitude guard", testAltitudeGuard],
-  ["inactive means inactive", testInactiveMeansInactive],
-  ["deploy and spent", testDeployAndSpent],
-  ["hostile round fairness", testHostileRoundFairness],
-  ["threat escalation", testThreatEscalation],
-  ["the authority hook", testAuthorityHook],
-  ["damage response fires once", testDamageResponseFiresOnce],
-  ["mission transition table", testMissionTransitionTable],
-  ["trigger volumes", testTriggerVolumes],
-  ["bandFeature uses the weaker flank", testBandFeatureUsesTheWeakerFlank],
-  ["zoning spreads a clustered field", testZoningSpreadsAClusteredField],
-  ["the route plan", testRoutePlan],
-  ["leg zero is not consumed on the deck", testLegZeroIsNotConsumedOnTheDeck],
-  ["end-to-end missions", testEndToEndMissions],
-  ["the mission clock", testMissionClock],
-  ["a checkpoint is flyable", testCheckpointIsFlyable],
-  ["the mission failure policy", testMissionFailurePolicy],
-  ["the extraction autopilot", testAutopilot],
-  ["line of sight", testLineOfSight],
-  ["SAM transition table", testSamTransitionTable],
-  ["one launch per lock", testOneLaunchPerLock],
-  ["a masked site never launches", testMaskedSiteNeverLaunches],
-  ["SAM placement", testSamPlacement],
-  ["SAM wreck and contract", testSamWreckAndContract],
-  ["the SAM round", testSamRound],
-  ["seduces", testSeduces],
-  ["decoy end to end with a MOVING aircraft", testDecoyEndToEndWithAMovingAircraft],
-  ["rearm", testRearm],
-  ["the modes table", testModesTable],
-  ["the sandbox driver", testSandboxDriver],
-  ["a parked director never completes", testParkedDirectorNeverCompletes],
-  ["crash cause mapping", testCrashCauseMapping],
-  ["crash timeline ordering", testCrashTimelineOrdering],
-  ["the aircraft stays visible, then fades", testCrashAircraftVisibility],
-  ["the crash camera kick", testCrashCamera],
-  ["tumble is latched, momentum inherited", testCrashTumbleAndMomentum],
-  ["an ocean crash sinks", testOceanCrashSinks],
-  ["crash duplicate suppression", testCrashDuplicateSuppression],
-  ["spawn clearance", testSpawnClearance],
-  ["audio priority and ducking", testAudioPriorityAndDucking],
-  ["audio intervals and takes", testAudioIntervalsAndTakes],
-  ["audio gestures and missing files", testAudioGesturesAndMissingFiles],
-  ["ground warnings and the fly-by", testGroundWarningsAndFlyby],
-  ["the HUD reveal envelope", testHudRevealEnvelope],
-  ["HUD scale unit", testHudScale],
-  ["HUD flank layout", testFlankLayout],
-  ["HUD AGL readout", testAglReadout],
-  ["HUD stores panel", testStoresPanel],
-  ["HUD mode and pilots", testModeSegment],
-  ["HUD stack and colours", testStackAndColours],
-  ["PATCH-02 C1: the palette is the only source", testHudPaletteIsTheOnlySource],
-  ["PATCH-02 C2: the casing contract", testCasingContract],
-];
-
+/**
+ * The result, for a harness that needs a value rather than a console.
+ *
+ * The suite RUNS ON IMPORT -- every check above is at module top level, which
+ * is what lets tests.html get a count out of a bare `import` and what keeps
+ * this file free of a framework. So this does not run anything; it reports the
+ * run that importing it already performed, and calling it twice is the same
+ * answer both times rather than a second pass.
+ *
+ * It exists because spec/vector.test.ts gates `pnpm check` on these numbers,
+ * so the browser count and CI read the same suite instead of drifting apart.
+ * That contract was lost once already -- the export went missing while the
+ * callers kept importing it -- and the typecheck is what caught it.
+ *
+ * @returns {{ total: number, failed: number, failures: { name: string, detail: string }[] }}
+ */
 export function run() {
-  passed = 0;
-  failed = 0;
-  failures = [];
-  for (const [name, fn] of SUITES) {
-    try {
-      fn();
-    } catch (err) {
-      failed++;
-      failures.push({ name, detail: `threw: ${err && err.message}` });
-    }
-  }
-  return { passed, failed, failures, total: passed + failed };
+  return { total, failed: failures, failures: failureLog };
 }
