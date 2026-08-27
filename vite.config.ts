@@ -50,7 +50,20 @@ export default defineConfig({
       // chokidar raises that as an unhandled error rather than skipping the
       // file. So the failure mode of ADDING AN ASSET was the whole dev server
       // exiting with a stack trace about a file the build never reads.
-      ignored: ["**/assets/**", "**/dist/**"],
+      // Widened after this recurred on `instructions/` -- a spec document being
+      // written killed the server the same way a model did. Ignoring one
+      // directory at a time treats instances; the CLASS is "anything the
+      // browser never fetches". Nothing below reaches a page: assets/ holds
+      // untracked sources that `pnpm assets` derives public/ from, and the
+      // rest is prose.
+      ignored: [
+        "**/assets/**",
+        "**/dist/**",
+        "**/instructions/**",
+        "**/reflections/**",
+        "**/*.md",
+        "**/.git/**",
+      ],
     },
   },
 
