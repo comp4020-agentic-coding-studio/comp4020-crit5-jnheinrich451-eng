@@ -1329,14 +1329,16 @@ window.addEventListener("keydown", (e) => {
      * pressing K got silence either way and no feedback, and reasonably
      * concluded the binding was dead.
      *
-     * It edits the player's REMEMBERED preference, because the pause is already
-     * forcing silence; `mutedBeforePause` is what gets restored on resume, so
-     * that is the value the keypress has to change. Feedback goes on the pause
-     * overlay, since the HUD is not being updated while paused.
+     * It now toggles the REAL mute rather than a remembered copy of it. That
+     * copy only existed because pause used to force silence through `setMuted`
+     * and had to put the player's setting back afterwards; pause freezes the
+     * voices instead and never touches mute, so there is one value again and
+     * the keypress edits it directly. Feedback goes on the pause overlay, since
+     * the HUD is not being updated while paused.
      */
     if (k === "k") {
-      mutedBeforePause = !mutedBeforePause;
-      if (pauseHintEl) pauseHintEl.textContent = mutedBeforePause ? "Esc to resume \u00b7 audio off" : "Esc to resume";
+      const nowMuted = audio.toggleMute();
+      if (pauseHintEl) pauseHintEl.textContent = nowMuted ? "Esc to resume \u00b7 audio off" : "Esc to resume";
       e.preventDefault();
     }
     return;
@@ -1767,20 +1769,20 @@ function setPaused(on) {
   paused = on;
   if (pauseEl) pauseEl.hidden = !paused;
   /**
-   * Silence while paused, and restore what the player had. The engine loop is a
-   * continuous sound: leaving it running behind a pause screen is the single most
-   * obvious way to make a pause feel broken. `setMuted` pauses the looping
-   * channels outright, so this also stops the gun mid-burst.
+   * FREEZE the audio, do not mute it. This used to call `setMuted(true)` and
+   * restore the player's own mute afterwards, which handled the engine loop and
+   * the gun -- both looping channels -- and silently skipped every one-shot,
+   * because mute only stops loops.
    *
-   * The player's own mute (K) is remembered and re-applied, so pausing never
-   * silently turns their audio back on.
+   * The deck is where that showed: the engine start-up is a one-shot, so it kept
+   * playing behind the pause screen, finished, and left the countdown to resume
+   * into silence. `audio.setPaused` carries the full account.
+   *
+   * Mute is now left entirely alone. It is the player's setting, it survives a
+   * pause untouched, and pause no longer has to remember and restore something
+   * it never owned.
    */
-  if (paused) {
-    mutedBeforePause = audio.isMuted ? audio.isMuted() : audio.state.muted;
-    audio.setMuted(true);
-  } else {
-    audio.setMuted(mutedBeforePause);
-  }
+  audio.setPaused(paused);
   // Steering is a stick; a paused game must not be flown by a moving cursor.
   //
   // RESTORE it on resume rather than leaving it off. This line used to pass a
@@ -1788,10 +1790,12 @@ function setPaused(on) {
   // steering -- the game kept flying, the cursor did nothing, and the cause was
   // three systems away from the symptom.
   input.setPointerEnabled(!paused && pointerAllowed);
-  if (pauseHintEl) pauseHintEl.textContent = mutedBeforePause ? "Esc to resume \u00b7 audio off" : "Esc to resume";
+  // Read the LIVE mute state: pause no longer changes it, so there is nothing to
+  // remember, and a stored copy would only be a second source of truth.
+  const muted = audio.isMuted ? audio.isMuted() : audio.state.muted;
+  if (pauseHintEl) pauseHintEl.textContent = muted ? "Esc to resume \u00b7 audio off" : "Esc to resume";
   return paused;
 }
-let mutedBeforePause = false;
 
 function step() {
   const now = performance.now();

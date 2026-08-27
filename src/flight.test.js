@@ -5345,6 +5345,84 @@ const holdStep = (d, pos, dt) =>
   check("watchdog: a freeze AFTER playing is a stall and is repaired", ch6.stalls >= 1 && ch6.rateLocked === true, [ch6.stalls, ch6.rateLocked]);
 }
 
+/**
+ * PAUSE FREEZES EVERY VOICE, NOT JUST THE LOOPING ONES.
+ *
+ * Reported from play: pausing on the deck froze the picture while the engine
+ * start-up kept running. `setMuted` opens with `if (!ch.row.loop) continue` --
+ * correct for mute, because silencing a loop means stopping it and a one-shot is
+ * over in a moment anyway -- and pause was implemented by calling it. So the
+ * one-shot played on behind the pause screen, finished, and the countdown
+ * resumed into silence.
+ *
+ * §17.14 -- assert the MECHANISM. "Audio is quiet while paused" would have
+ * passed with the bug fully present, because the pause screen is quiet either
+ * way once the clip has run out. What has to hold is that the clip is still
+ * THERE afterwards, at the position it was interrupted at.
+ */
+{
+  const el = () => {
+    const e = {
+      paused: true,
+      currentTime: 0,
+      volume: 1,
+      playbackRate: 1,
+      readyState: 4,
+      networkState: 1,
+      loop: false,
+      play() {
+        e.paused = false;
+        return { catch() {} };
+      },
+      pause() {
+        e.paused = true;
+      },
+      addEventListener() {},
+      cloneNode: () => el(),
+    };
+    return e;
+  };
+  const dir = createAudioDirector({ audioFactory: () => el() });
+  dir.arm();
+
+  // A one-shot in flight, part-way through, exactly like the deck start-up.
+  dir.play(Cue.ENGINE_START);
+  const start = dir.channels.ENGINE_START.voices[0][0];
+  start.currentTime = 4.2;
+  check("pause: the engine start-up is a ONE-SHOT, which is the whole point", !AUDIO.cues.ENGINE_START.loop);
+  check("pause: ...and it is playing before the pause", start.paused === false);
+
+  // ...and a loop, which the old code did handle.
+  dir.loop(Cue.ENGINE_LOOP, true, { volume: 0.5 });
+  const loop = dir.channels.ENGINE_LOOP.voices[0][0];
+  check("pause: a looping channel is playing too", loop.paused === false);
+
+  dir.setPaused(true);
+  check("pause: the loop stops", loop.paused === true);
+  check("pause: and so does the ONE-SHOT — the case mute skips", start.paused === true, start.paused);
+  check("pause: the one-shot keeps its position rather than being reset", Math.abs(start.currentTime - 4.2) < 1e-9, start.currentTime);
+
+  // The deck clock is frozen while paused, so the audio clock must be too: §9
+  // couples them, `deckDwell` IS the start-up's length at its playback rate.
+  dir.setPaused(false);
+  check("pause: resuming restarts the one-shot", start.paused === false);
+  check("pause: ...from where it stopped, so no silence is introduced", Math.abs(start.currentTime - 4.2) < 1e-9, start.currentTime);
+  check("pause: and the loop comes back", loop.paused === false);
+
+  // Mute is a separate state and pause must not touch it, in either direction.
+  const dir2 = createAudioDirector({ audioFactory: () => el() });
+  dir2.arm();
+  dir2.setMuted(true);
+  dir2.setPaused(true);
+  dir2.setPaused(false);
+  check("pause: a muted player is still muted after a pause", dir2.state.muted === true);
+  const dir3 = createAudioDirector({ audioFactory: () => el() });
+  dir3.arm();
+  dir3.setPaused(true);
+  dir3.setPaused(false);
+  check("pause: ...and an unmuted one is not silently muted by it", dir3.state.muted === false);
+}
+
 console.log(failures === 0 ? `flight.test.js — all ${total} checks passed` : `flight.test.js — ${failures} failure(s) of ${total}`);
 
 /**

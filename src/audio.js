@@ -430,6 +430,8 @@ export function createAudioDirector({ cfg = AUDIO, audioFactory = null, gestureT
     duckLevel: 1,
     plays: 0,
     suppressed: 0,
+    /** True between setPaused(true) and setPaused(false). See setPaused. */
+    paused: false,
   };
 
   Object.defineProperty(state, "silent", {
@@ -653,6 +655,60 @@ export function createAudioDirector({ cfg = AUDIO, audioFactory = null, gestureT
     return state;
   }
 
+  /**
+   * PAUSE IS NOT MUTE, and conflating them is what produced the bug this fixes.
+   *
+   * `setMuted` deliberately touches only LOOPING channels — `if (!ch.row.loop)
+   * continue` — because silencing a loop means stopping it, while a one-shot
+   * that is already in flight is over in a moment either way. That is right for
+   * the mute key and wrong for a pause.
+   *
+   * Reported from play: pausing on the deck froze the picture while the engine
+   * start-up kept running. It is a one-shot, so mute skipped it entirely; it
+   * played on behind the pause screen and finished. Then on resume the sound was
+   * gone and the countdown was not, so the deck sat in silence until the
+   * catapult fired.
+   *
+   * That gap is not cosmetic — §9 couples the two deliberately: `deckDwell` IS
+   * the length of the start-up at its playback rate, so the catapult fires on
+   * the recording's last note. Freeze one clock and not the other and the pair
+   * cannot re-align; the longer the pause, the wider the silence.
+   *
+   * So pause freezes EVERY voice that is actually sounding — loops and one-shots
+   * alike — and resumes exactly those on the way out. Nothing is restarted from
+   * the beginning and nothing is skipped, because an element's own currentTime
+   * is the position, and pausing it is what stops that position advancing.
+   *
+   * Mute is untouched by this and survives a pause on its own: they are separate
+   * states, which is the point.
+   */
+  const suspended = [];
+  function setPaused(on) {
+    state.paused = !!on;
+    if (state.paused) {
+      suspended.length = 0;
+      for (const name of Object.keys(channels)) {
+        for (const take of channels[name].voices) {
+          for (const el of take) {
+            // `paused === false` rather than `!el.paused`: a stub voice in a
+            // headless harness has no such property, and must not be collected.
+            if (el && el.paused === false && el.pause) {
+              suspended.push(el);
+              el.pause();
+            }
+          }
+        }
+      }
+    } else {
+      for (const el of suspended) {
+        const p = el.play && el.play();
+        if (p && p.catch) p.catch(() => {});
+      }
+      suspended.length = 0;
+    }
+    return state.paused;
+  }
+
   function setMuted(on) {
     state.muted = !!on;
     for (const name of Object.keys(channels)) {
@@ -740,6 +796,7 @@ export function createAudioDirector({ cfg = AUDIO, audioFactory = null, gestureT
     arm,
     reset,
     setMuted,
+    setPaused,
     toggleMute: () => setMuted(!state.muted),
     get report() {
       return report();
