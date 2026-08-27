@@ -29,6 +29,12 @@ import {
   autopilotStick, blendStick, buildRoute, captureCheckpoint, createMission,
 } from "./mission.js";
 import { applyFlightState } from "./flight.js";
+import {
+  SAM_MISSILE, createSamNetwork, lineOfSight, placeSites,
+} from "./sam.js";
+import { createFlares } from "./flares.js";
+import { createRearm } from "./rearm.js";
+import { MISSION, createSandbox, nextMode, rulesFor } from "./modes.js";
 import { quatForward } from "./flight.js";
 import { buildTerrainIndex, createPhysics } from "./physics.js";
 import { benchmarkIndex } from "./physics-benchmark.js";
@@ -133,7 +139,16 @@ const missiles = createMissileSystem({
   // THE single counter-measure hook (§14). The barrel roll attaches here and
   // the missile never learns what a barrel roll is. Stage 8 composes terrain
   // masking and flares onto this same function.
-  authorityFor: (m) => authorityFor(m, evasion),
+  // THE COMPOSED HOOK (§13). main.js is the only layer that knows where the
+  // ground is, so terrain masking composes onto stage 6's barrel roll here --
+  // and the missile still knows nothing about terrain, flares or rolls.
+  authorityFor: (m) => {
+    const base = authorityFor(m, evasion);
+    if (m.owner !== "sam") return base;
+    return lineOfSight(m.position, state.position, (x, z) => physics.groundAt(x, z))
+      ? base
+      : Math.min(base, 0.1);
+  },
   onEvent: (event) => {
     if (event.kind !== "hit") return;
     fx.burst(event.round.position, 30);
@@ -177,6 +192,35 @@ const completeEl = document.getElementById("complete");
 const completeRows = document.getElementById("complete-rows");
 
 // Deploy the stage-6 hostile per phase (§7). One instance, three encounters.
+let mode = MISSION;
+const sandbox = createSandbox();
+const flares = createFlares();
+const rearm = createRearm({
+  onRefill: (name) => {
+    message = `${name} REARMED`;
+    messageUntil = clock + 1.8;
+  },
+});
+const sams = createSamNetwork({
+  onLaunch: (sam) => {
+    missiles.fire({
+      config: SAM_MISSILE,
+      owner: "sam",
+      position: {
+        x: sam.target.position.x,
+        y: sam.target.position.y + 14,
+        z: sam.target.position.z,
+      },
+      // LAUNCHES UPWARD WITH ZERO INHERITED SPEED, which is what makes the
+      // trail read as a ground launch rather than as a round appearing.
+      direction: { x: 0, y: 1, z: 0 },
+      speed: 0,
+      target: playerTarget,
+    });
+  },
+  onWreck: (sam) => wreckSam(sam),
+});
+
 const ENCOUNTERS = {
   [INTERCEPT]: { ammo: 0, engageDelay: 3.0 },
   [DEFENSIVE]: { ammo: 2, engageDelay: 2.0 },
@@ -341,6 +385,14 @@ function restartSortie() {
   if (completeEl) completeEl.hidden = true;
   if (fadeEl) fadeEl.style.opacity = "0";
   policies.forEach((p) => p.resetAll?.() ?? p.reset?.());
+  flares.resetAll();
+  rearm.reset();
+  sandbox.resetAll();
+  // A full restart resets the sites. They do NOT respawn mid-sortie: six is a
+  // finite thing to clear, and a player who spent four minutes clearing the
+  // valley has earned an empty valley.
+  sams.reset();
+  for (const [sam, mesh] of samMeshes) restoreSamMesh(sam, mesh);
   if (launchClipSeconds !== null && carrierAnchors) startLaunch(launchClipSeconds);
   else rig.reset(state);
 }
@@ -366,6 +418,17 @@ function buildMission() {
       onPhaseChange(to, from);
     },
   });
+  // Two per inland leg, flanking the corridor. A site with nowhere to stand is
+  // DROPPED, not floated.
+  const inland = route.legs.filter((l) => l.phase === TERRAIN);
+  const placed = placeSites(inland, (x, z) => physics.groundAt(x, z));
+  sams.deploy(placed.map((p) => ({ x: p.x, y: p.y + 6, z: p.z })));
+  console.log(
+    `SAM sites: ${placed.length} of ${inland.length * 2} stood on land ` +
+      `(${placed.map((p) => `${p.leg}${p.side > 0 ? "R" : "L"}@${p.ground.toFixed(0)}m`).join(", ")})`,
+  );
+  buildSamMeshes();
+
   routeHelper = createRouteHelper(route);
   world.scene.add(routeHelper);
 }
@@ -505,6 +568,13 @@ window.addEventListener("keydown", (event) => {
   }
   if (event.code === "KeyP" && physicsDebug) physicsDebug.toggle();
   if (event.code === "KeyJ") hud.setVisible(!hud.isVisible());
+  if (event.code === "KeyT") {
+    // T cycles AND restarts: every mode starts on the deck, and half a mission
+    // in the wrong ruleset is not a state worth supporting.
+    mode = nextMode(mode);
+    console.log(`mode -> ${mode}`);
+    restartSortie();
+  }
   if (event.code === "KeyN" && routeHelper) {
     routeHelper.visible = !routeHelper.visible;
   }
@@ -673,6 +743,27 @@ function step(now) {
   playerTarget.velocity.y = forward.y * state.speed;
   playerTarget.velocity.z = forward.z * state.speed;
 
+  // The sandbox driver: one hostile at a time, and nothing at all in PEACE.
+  if (
+    sandbox.update(dt, {
+      mode,
+      handedOff: launch ? launch.hasHandedOff() : false,
+      hostileAlive: hostile.isActive() && hostile.target.alive,
+    })
+  ) {
+    const side = hostile.ai.encounters % 2 === 0 ? 1 : -1;
+    hostile.deploy({
+      at: {
+        x: state.position.x + forward.x * 2400 + side * 900,
+        y: Math.max(400, state.position.y + 140),
+        z: state.position.z + forward.z * 2400,
+      },
+      heading: 0,
+      ammo: 2,
+      engageDelay: 2,
+    });
+  }
+
   if (!scripted && input.consumeLatch("evade")) evasion.request(state.mode);
   evasion.update(dt);
   damage.tick(dt);
@@ -696,13 +787,45 @@ function step(now) {
       });
     }
   }
+  // ── ground threats ─────────────────────────────────────────────────────
+  const rules = rulesFor(mode);
+  if (rules.sams && !scripted) {
+    sams.update(dt, {
+      playerState: state,
+      sampleHeight: (x, z) => physics.groundAt(x, z),
+    });
+    for (const a of sams.acquisitions()) acquisitions.push(a);
+    for (const sam of sams.liveSites()) candidates.push(sam.target);
+  }
+  updateSamMeshes();
+
+  // ── flares ─────────────────────────────────────────────────────────────
+  if (!scripted && input.consumeLatch("flares")) {
+    if (flares.dispense(state, forward, clock) > 0) {
+      message = "FLARES";
+      messageUntil = clock + 1.1;
+    }
+  }
+  flares.update(dt, clock);
+  // Offered to every hostile round: the round's TARGET is swapped, never a
+  // flag set. missile.js needs no changes at all.
+  flares.offerTo(missiles.rounds, state.position);
+
+  // ── rearm ──────────────────────────────────────────────────────────────
+  rearm.update(dt, {
+    "AIM-9": weapons
+      ? { isEmpty: () => weapons.count === 0, refill: () => weapons.reload() }
+      : null,
+    GUN: { isEmpty: () => gun.isEmpty(), refill: () => gun.reset() },
+  });
+
   const t = threatMonitor.update(dt, state, acquisitions, missiles.rounds);
   threat = t.label;
 
   // ── the mission ────────────────────────────────────────────────────────
   phaseCueAge += dt;
   let navLeg = null;
-  if (mission) {
+  if (mission && rules.phases) {
     const result = mission.update(dt, {
       position: state.position,
       fired: launch ? launch.elapsed() >= launch.plan.fireAt : false,
@@ -748,6 +871,7 @@ function step(now) {
       bank: state.bank,
       pitch: state.pitch,
       missiles: weapons ? weapons.count : 0,
+      flares: flares.remaining,
       gunRounds: gun.rounds,
       weapon,
       mode: state.mode,
@@ -760,7 +884,14 @@ function step(now) {
       threatLevel: t.level,
       message,
       position: state.position,
-      nav: navLeg,
+      heading: state.heading,
+      // GROUND CONTACTS APPEAR ONLY WHILE A SITE IS ACTUALLY EMITTING.
+      // Showing every SAM the moment the player is in range would hand them
+      // the whole threat map and quietly undo the terrain-masking mechanic --
+      // flying the valley keeps the radar clean, and a square lighting up
+      // means the same thing as the warning in the player's ear.
+      contacts: radarContacts(),
+      nav: rules.nav ? navLeg : null,
       phaseCue,
       phaseCueAge,
     });
@@ -817,6 +948,8 @@ function paintRail(axes) {
     `DECK RUN  ${carrierAnchors ? carrierAnchors.runLength.toFixed(1) + " m" : "--"}`,
     `WEAPON    ${weapon}   AIM-9 ${weapons ? weapons.count : "--"}   GUN ${gun.rounds}`,
     `HOSTILE   ${hostile.isActive() ? hostile.ai.state + " ammo " + hostile.ai.ammo : "off"}  threat ${threat || "--"}`,
+    `MODE      ${mode}  sams ${sams.liveSites().length}/${sams.sites.length}  flares ${flares.remaining}`,
+    `REARM     ${rearm.active().length ? rearm.active().map((n) => `${n} ${rearm.remaining(n).toFixed(0)}s`).join("  ") : "--"}`,
     `EVADE     ${evasion.isRolling() ? "ROLLING" : "--"}  defeated ${evasion.defeatedCount()}  hits ${damage.hitsTaken()}`,
     `TRACK     ${targeting.state().lockState} ${(targeting.state().lockProgress * 100).toFixed(0)}%  rounds ${missiles.rounds.length}`,
     `SHAKE     ${rig.shakeLevel().toFixed(3)}`,
@@ -890,6 +1023,79 @@ function createRouteHelper(route) {
     group.add(ring);
   }
   return group;
+}
+
+// ── SAM meshes and wrecks ────────────────────────────────────────────────
+const samMeshes = new Map();
+const contactList = [];
+
+function buildSamMeshes() {
+  for (const sam of sams.sites) {
+    const group = new THREE.Group();
+    const base = new THREE.Mesh(
+      new THREE.CylinderGeometry(7, 9, 5, 8),
+      new THREE.MeshStandardMaterial({ color: 0x4a5148, roughness: 0.8 }),
+    );
+    base.position.y = 2.5;
+    const turret = new THREE.Mesh(
+      new THREE.BoxGeometry(3.2, 2.2, 9),
+      new THREE.MeshStandardMaterial({ color: 0x5d6659, roughness: 0.7 }),
+    );
+    turret.position.y = 6.5;
+    turret.rotation.x = -0.5;
+    group.add(base, turret);
+    group.position.set(
+      sam.target.position.x, sam.target.position.y - 6, sam.target.position.z,
+    );
+    world.scene.add(group);
+    samMeshes.set(sam, { group, base, turret });
+  }
+}
+
+function updateSamMeshes() {
+  for (const [sam, mesh] of samMeshes) {
+    if (sam.wrecked) continue;
+    const flash = Math.max(0, 1 - (clock - sam.target.hitAt) / 0.18);
+    mesh.base.material.emissive.setRGB(flash, flash * 0.4, 0);
+  }
+}
+
+/**
+ * A wreck STAYS IN THE WORLD: tinted, tilted, turret hidden. Not a deletion --
+ * a destroyed installation should be visible evidence that the player did
+ * something. Visibility is set EXPLICITLY, because the generic kill path hides
+ * dead targets.
+ */
+function wreckSam(sam) {
+  const mesh = samMeshes.get(sam);
+  if (!mesh) return;
+  mesh.group.visible = true;
+  mesh.turret.visible = false;
+  mesh.base.material.color.setHex(0x2a2622);
+  mesh.base.material.emissive.setRGB(0, 0, 0);
+  mesh.group.rotation.z = 0.32;
+  fx.burst(sam.target.position, 40);
+}
+
+function restoreSamMesh(sam, mesh) {
+  mesh.group.visible = true;
+  mesh.turret.visible = true;
+  mesh.base.material.color.setHex(0x4a5148);
+  mesh.group.rotation.z = 0;
+}
+
+function radarContacts() {
+  contactList.length = 0;
+  if (hostile.isActive() && hostile.target.alive) {
+    contactList.push({ position: hostile.target.position, ground: false });
+  }
+  if (drone.target.alive) {
+    contactList.push({ position: drone.target.position, ground: false });
+  }
+  for (const sam of sams.emitting()) {
+    contactList.push({ position: sam.target.position, ground: true });
+  }
+  return contactList;
 }
 
 let hostileMesh = null;

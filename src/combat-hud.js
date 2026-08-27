@@ -144,6 +144,43 @@ export function createCombatHud(host, camera) {
   });
   world.append(bracket, diamond, pipper, rangeText);
 
+  // ── the radar (stage 8) ──────────────────────────────────────────────────
+  // A heading-up polar plot, bottom-right. 6 km outer range -- the hostile's
+  // own detection range plus a margin, so "on the radar" and "in the fight"
+  // mean the same thing.
+  //
+  // NO SWEEP AND NO SCAN LINE. Contacts appear the instant they are detected
+  // and vanish the instant they are not. A rotating beam would imply a sensor
+  // model this game does not have, and would make the display a MEMORY rather
+  // than a statement about the present.
+  //
+  // DETECTION ONLY: nothing here says anything about tracking or lock. The
+  // bracket and the lock diamond already carry that, and duplicating it gives
+  // the player two places to read one fact and a chance for them to disagree.
+  // One colour, two shapes.
+  const RADAR_RANGE = 6000;
+  const RADAR_R = 74;
+  const radar = el("g");
+  fixed.append(radar);
+  const radarRings = [
+    el("circle", { fill: "none", stroke: COLOURS.green, "stroke-width": 1, opacity: 0.3 }),
+    el("circle", { fill: "none", stroke: COLOURS.green, "stroke-width": 1, opacity: 0.18 }),
+  ];
+  const ownShip = el("path", { fill: "none", stroke: COLOURS.green, "stroke-width": 1.6 });
+  radar.append(...radarRings, ownShip);
+  // Blips are POOLED and contacts gathered into ONE REUSED ARRAY -- a fresh
+  // list per frame would allocate sixty times a second for nothing.
+  const blipPool = [];
+  const contactScratch = [];
+  function blip(i) {
+    if (!blipPool[i]) {
+      const b = el("path", { fill: "none", stroke: COLOURS.amber, "stroke-width": 1.6 });
+      blipPool[i] = b;
+      radar.append(b);
+    }
+    return blipPool[i];
+  }
+
   const projected = new THREE.Vector3();
   // Damped screen positions, so world-tracked markers do not jitter frame to
   // frame as the camera shake moves under them.
@@ -350,6 +387,57 @@ export function createCombatHud(host, camera) {
       } else {
         phaseCue.textContent = "";
       }
+
+      // ── radar ──────────────────────────────────────────────────────────
+      const rcx = w - RADAR_R - 26;
+      const rcy = h - RADAR_R - 26;
+      radarRings[0].setAttribute("cx", rcx);
+      radarRings[0].setAttribute("cy", rcy);
+      radarRings[0].setAttribute("r", RADAR_R);
+      radarRings[1].setAttribute("cx", rcx);
+      radarRings[1].setAttribute("cy", rcy);
+      radarRings[1].setAttribute("r", RADAR_R / 2);
+      ownShip.setAttribute(
+        "d",
+        `M${rcx} ${rcy - 7} L${rcx + 5} ${rcy + 5} L${rcx} ${rcy + 2} L${rcx - 5} ${rcy + 5} Z`,
+      );
+
+      contactScratch.length = 0;
+      for (const c of view.contacts ?? []) contactScratch.push(c);
+
+      // Rotate into the AIRCRAFT frame with the project's convention: forward
+      // is (-sin h, -cos h) and right is its perpendicular (-f.z, f.x), so
+      // "up" on the display is always where the nose points.
+      const fx = -Math.sin(view.heading);
+      const fz = -Math.cos(view.heading);
+      const rx = -fz;
+      const rz = fx;
+      let drawn = 0;
+      for (const c of contactScratch) {
+        const dx = c.position.x - view.position.x;
+        const dz = c.position.z - view.position.z;
+        const range = Math.hypot(dx, dz);
+        // OUT OF RANGE IS ABSENT, NOT CLAMPED TO THE RIM: an edge-held ghost
+        // implies knowledge the aircraft does not have.
+        if (range > RADAR_RANGE) continue;
+        const ahead = (dx * fx + dz * fz) / RADAR_RANGE;
+        const right = (dx * rx + dz * rz) / RADAR_RANGE;
+        const bx = rcx + right * RADAR_R;
+        const by = rcy - ahead * RADAR_R;
+        const node = blip(drawn++);
+        show(node);
+        const d = 4;
+        node.setAttribute(
+          "d",
+          c.ground
+            // amber SQUARE for a ground contact, amber DIAMOND for an air one.
+            // Amber, not salmon: "something is there" is a warning, not a
+            // danger, and salmon means a lock or a live round everywhere else.
+            ? `M${bx - d} ${by - d} h${d * 2} v${d * 2} h${-d * 2} Z`
+            : `M${bx} ${by - d} L${bx + d} ${by} L${bx} ${by + d} L${bx - d} ${by} Z`,
+        );
+      }
+      for (let i = drawn; i < blipPool.length; i++) hide(blipPool[i]);
 
       if (view.lead && view.weapon === "GUN") {
         const raw = project(view.lead, w, h);

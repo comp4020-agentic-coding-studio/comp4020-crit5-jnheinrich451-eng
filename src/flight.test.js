@@ -62,6 +62,15 @@ import {
   surveyTerrainRoute, volumesOverlap,
 } from "./mission.js";
 import {
+  ACQUISITION_SECONDS, PROBE_SCALES, SAM_MISSILE,
+  createSamNetwork, lineOfSight, placeSites, samTransition,
+} from "./sam.js";
+import { FLARE_CFG, createFlares, seduces } from "./flares.js";
+import { createRearm } from "./rearm.js";
+import {
+  ALWAYS, FREE, MISSION, PEACE, createSandbox, nextMode, rulesFor,
+} from "./modes.js";
+import {
   EASE,
   HANDOFF_SPEED,
   HANDOFF_THROTTLE,
@@ -3395,6 +3404,510 @@ function testAutopilot() {
   check("k is clamped", blendStick(player, auto, 9, {}).x === auto.x);
 }
 
+// ── stage 8: ground threats, countermeasures, modes ───────────────────────
+
+// A ridge running along X, peaking at z = -1000, 400 m tall.
+const ridgeAt = (x, z) => {
+  const d = Math.abs(z + 1000);
+  return d >= 500 ? 0 : 400 * (1 - d / 500);
+};
+
+function testLineOfSight() {
+  const flatGround = () => 0;
+  const low = { x: 0, y: 100, z: 0 };
+  const far = { x: 0, y: 100, z: -2000 };
+
+  check("clear over flat ground", lineOfSight(low, far, flatGround) === true);
+  // The ridge sits between them at 400 m; both ends are at 100 m.
+  check("a ridge blocks the line", lineOfSight(low, far, ridgeAt) === false);
+  // From above the ridge, clear again.
+  check(
+    "clear again from above the ridge",
+    lineOfSight({ ...low, y: 900 }, { ...far, y: 900 }, ridgeAt) === true,
+  );
+
+  // A GRAZE COUNTS AS COVER: the 10 m margin is in the player's favour, so a
+  // line passing just over the crest is still called blocked.
+  const grazing = lineOfSight(
+    { x: 0, y: 405, z: 0 }, { x: 0, y: 405, z: -2000 }, ridgeAt,
+  );
+  check("a graze counts as cover", grazing === false, `${grazing}`);
+  check(
+    "well clear of the crest is visible",
+    lineOfSight({ x: 0, y: 460, z: 0 }, { x: 0, y: 460, z: -2000 }, ridgeAt) === true,
+  );
+
+  // SKIPS THE ENDPOINTS: a site standing ON the ground would otherwise report
+  // ITSELF as an obstruction and never see anything at all.
+  const onTheGround = { x: 0, y: 0, z: -3000 };
+  check(
+    "a site standing on the ground is not blocked by its own ground",
+    lineOfSight(onTheGround, { x: 0, y: 800, z: -3000 }, flatGround) === true,
+  );
+
+  check("solid ground blocks everything", lineOfSight(low, far, () => 9000) === false);
+  // NO SAMPLER MEANS VISIBLE: a build whose terrain failed to load must be
+  // playable, not accidentally invulnerable.
+  check("no sampler means visible", lineOfSight(low, far, null) === true);
+}
+
+const SAM = (over = {}) => ({ state: "SEARCH", stateTime: 0, lossTimer: 0, ...over });
+const SCTX = (over = {}) => ({
+  alive: true, playerAlive: true, range: 2000, visible: true, rounds: 3, ...over,
+});
+
+function testSamTransitionTable() {
+  const T = samTransition;
+
+  check("death wins", T(SAM({ state: "LOCK" }), SCTX({ alive: false })) === "DESTROYED");
+  check("DESTROYED is terminal", T(SAM({ state: "DESTROYED" }), SCTX()) === "DESTROYED");
+
+  check("SEARCH holds with nothing visible", T(SAM(), SCTX({ visible: false })) === "SEARCH");
+  check("SEARCH acquires what it can see", T(SAM(), SCTX()) === "TRACK");
+  check("SEARCH ignores anything beyond detection", T(SAM(), SCTX({ range: 9000 })) === "SEARCH");
+  // The inner 450 m is a DEAD ZONE: flying straight over the top is a valid
+  // second answer, and a nice one to discover.
+  check("the inner dead zone is safe", T(SAM(), SCTX({ range: 300 })) === "SEARCH");
+  check("beyond the envelope is safe", T(SAM(), SCTX({ range: 4800 })) === "SEARCH");
+
+  check("TRACK builds", T(SAM({ state: "TRACK", stateTime: 0.5 }), SCTX()) === "TRACK");
+  check("TRACK promotes at 1.15 s", T(SAM({ state: "TRACK", stateTime: 1.2 }), SCTX()) === "LOCK");
+  check("LOCK builds", T(SAM({ state: "LOCK", stateTime: 0.5 }), SCTX()) === "LOCK");
+  check("LOCK promotes at 1.35 s", T(SAM({ state: "LOCK", stateTime: 1.4 }), SCTX()) === "LAUNCH");
+  check("LAUNCH holds for its delay", T(SAM({ state: "LAUNCH", stateTime: 0.2 }), SCTX()) === "LAUNCH");
+  check("LAUNCH releases after 0.45 s", T(SAM({ state: "LAUNCH", stateTime: 0.5 }), SCTX()) === "RELOAD");
+  check("RELOAD holds", T(SAM({ state: "RELOAD", stateTime: 5 }), SCTX()) === "RELOAD");
+  check("RELOAD returns to SEARCH after 9 s", T(SAM({ state: "RELOAD", stateTime: 9.1 }), SCTX()) === "SEARCH");
+
+  // A SPENT SITE MUST NEVER ACQUIRE AGAIN -- still a target, still worth a
+  // kill, but no longer a threat. Otherwise it sits in LOCK forever with
+  // nothing to fire.
+  check("a spent site does not acquire", T(SAM(), SCTX({ rounds: 0 })) === "SEARCH");
+  check("a spent site drops a track", T(SAM({ state: "TRACK", stateTime: 2 }), SCTX({ rounds: 0 })) === "SEARCH");
+  check("a spent site drops a lock", T(SAM({ state: "LOCK", stateTime: 2 }), SCTX({ rounds: 0 })) === "SEARCH");
+
+  // THE LOSS GRACE holds a lock through a flicker of terrain, but not beyond.
+  check(
+    "a flicker does not drop the lock",
+    T(SAM({ state: "LOCK", stateTime: 0.5, lossTimer: 0.3 }), SCTX({ visible: false })) === "LOCK",
+  );
+  check(
+    "beyond the grace the lock is dropped",
+    T(SAM({ state: "LOCK", stateTime: 0.5, lossTimer: 0.9 }), SCTX({ visible: false })) === "SEARCH",
+  );
+  // Leaving the ENVELOPE breaks a lock the same way.
+  check(
+    "leaving the envelope breaks a lock",
+    T(SAM({ state: "LOCK", stateTime: 0.5, lossTimer: 0.9 }), SCTX({ range: 6000 })) === "SEARCH",
+  );
+
+  // Acquisition is deliberately slow: 2.95 s from first sighting to a round in
+  // the air. That, plus the reload, is the entire difficulty dial.
+  check(
+    "acquisition takes about 2.95 s end to end",
+    Math.abs(ACQUISITION_SECONDS - 2.95) < 1e-9,
+    `${ACQUISITION_SECONDS}`,
+  );
+}
+
+function testOneLaunchPerLock() {
+  // §8: firing on both "LOCK with an expired timer" AND the LAUNCH state
+  // spends TWO rounds per engagement, because they are the same frame.
+  const launches = [];
+  const net = createSamNetwork({ onLaunch: (s) => launches.push(s) });
+  net.deploy([{ x: 0, y: 100, z: -2000 }]);
+  const player = createFlightState({ position: { x: 0, y: 900, z: 0 } });
+
+  for (let t = 0; t < 6; t += 1 / 60) {
+    net.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
+  }
+  check("exactly one launch per engagement", launches.length === 1, `${launches.length}`);
+  check("exactly one round was spent", net.sites[0].rounds === 2, `${net.sites[0].rounds}`);
+
+  // Three engagements empty it, and then it never fires again.
+  for (let t = 0; t < 60; t += 1 / 60) {
+    net.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
+  }
+  check("a site fires at most its magazine", launches.length <= 3, `${launches.length}`);
+  check("a spent site stays in SEARCH", net.sites[0].rounds === 0 && net.sites[0].state === "SEARCH");
+}
+
+function testMaskedSiteNeverLaunches() {
+  // A MASKED SITE NEVER LAUNCHES, however long the player loiters. This is the
+  // mechanic: low flight is safe because the ground is genuinely in the way,
+  // not because of a minimum-safe-altitude constant.
+  const launches = [];
+  const net = createSamNetwork({ onLaunch: () => launches.push(1) });
+  // The site is beyond the ridge from the player.
+  net.deploy([{ x: 0, y: 10, z: -2000 }]);
+  const player = createFlightState({ position: { x: 0, y: 60, z: 0 } });
+
+  for (let t = 0; t < 30; t += 1 / 60) {
+    net.update(1 / 60, { playerState: player, sampleHeight: ridgeAt });
+  }
+  check("a masked site never launches", launches.length === 0, `${launches.length}`);
+  check("and never leaves SEARCH", net.sites[0].state === "SEARCH", net.sites[0].state);
+
+  // Climb over the ridge and it acquires.
+  const high = createFlightState({ position: { x: 0, y: 1400, z: 0 } });
+  for (let t = 0; t < 6; t += 1 / 60) {
+    net.update(1 / 60, { playerState: high, sampleHeight: ridgeAt });
+  }
+  check("climbing into view produces a launch", launches.length === 1, `${launches.length}`);
+}
+
+function testSamPlacement() {
+  const legs = [{ name: "PASS", x: 0, z: -3000 }, { name: "VALLEY", x: 0, z: -6000 }];
+
+  // Land everywhere: both flanks stand.
+  const onLand = placeSites(legs, () => 120);
+  check("two sites per leg on good ground", onLand.length === 4, `${onLand.length}`);
+  check("they flank the corridor on both sides", (() => {
+    const sides = new Set(onLand.map((s) => s.side));
+    return sides.has(-1) && sides.has(1);
+  })());
+
+  // ALL SEA: every site is DROPPED, not floated. Five sites on land beat six
+  // with one in the water.
+  const atSea = placeSites(legs, () => 0);
+  check("a site with nowhere to stand is dropped", atSea.length === 0, `${atSea.length}`);
+
+  // Land only on one side: it probes OUTWARD and takes the first position
+  // standing on ground at least 30 m above sea level.
+  const oneSided = placeSites(legs, (x) => (x < 0 ? 200 : 0));
+  check("only the side with land is used", oneSided.length === 2, `${oneSided.length}`);
+  check("and it is the land side", oneSided.every((s) => s.side === -1));
+
+  // The probe scales let it reach land further out than the nominal flank.
+  const farLand = placeSites(legs, (x) => (Math.abs(x) > 1800 ? 90 : 0));
+  check(
+    "probing outward finds land beyond the nominal flank",
+    farLand.length === 4,
+    `${farLand.length}`,
+  );
+  check("the probe scales start at the nominal offset", PROBE_SCALES[0] === 1.0);
+}
+
+function testSamWreckAndContract() {
+  const net = createSamNetwork({});
+  net.deploy([{ x: 0, y: 100, z: -2000 }]);
+  const sam = net.sites[0];
+
+  // THE STAGE-5 TARGET CONTRACT, unchanged -- which is what makes targeting,
+  // the gun, the missile and the HUD bracket work on ground targets for free.
+  check("a site publishes the target contract", isTargetable(sam.target));
+  for (const field of ["position", "velocity", "alive", "health", "radius", "label"]) {
+    check(`a site publishes ${field}`, field in sam.target);
+  }
+  // A SAM's velocity is ZERO, so the lead solution collapses to its position.
+  const lead = leadSolution({ x: 0, y: 900, z: 0 }, sam.target);
+  check(
+    "the lead solution on a SAM is the SAM itself",
+    Math.abs(lead.point.z - sam.target.position.z) < 1e-6,
+  );
+
+  // A wreck: still a target, no longer a threat.
+  const wrecks = [];
+  const net2 = createSamNetwork({ onWreck: (s) => wrecks.push(s) });
+  net2.deploy([{ x: 0, y: 100, z: -2000 }]);
+  const player = createFlightState({ position: { x: 0, y: 900, z: 0 } });
+  damageTarget(net2.sites[0].target, 999, 0);
+  net2.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
+  check("a killed site produces a wreck", wrecks.length === 1);
+  check("a wreck is DESTROYED", net2.sites[0].state === "DESTROYED");
+  check("a wreck is no longer a live site", net2.liveSites().length === 0);
+  check("a wreck is not emitting", net2.emitting().length === 0);
+  // It is still in the world -- not a deletion.
+  check("a wreck is still in the site list", net2.sites.length === 1);
+
+  for (let t = 0; t < 20; t += 1 / 60) {
+    net2.update(1 / 60, { playerState: player, sampleHeight: () => 0 });
+  }
+  check("a wreck never acquires again", net2.emitting().length === 0);
+}
+
+function testSamRound() {
+  const r = turnRadius(SAM_MISSILE);
+  check(
+    "the SAM round has the widest turn of the three",
+    r > turnRadius(HOSTILE_MISSILE) && r > turnRadius(AIM9),
+    `sam ${r.toFixed(0)}, hostile ${turnRadius(HOSTILE_MISSILE).toFixed(0)}, aim9 ${turnRadius(AIM9).toFixed(0)}`,
+  );
+  check("its radius is near §14's ~1146 m", r > 1050 && r < 1250, `${r.toFixed(0)}`);
+  check(
+    "so a hard crossing manoeuvre still beats it",
+    r > TURN_RADIUS_REF,
+    `round ${r.toFixed(0)} vs aircraft ${TURN_RADIUS_REF}`,
+  );
+
+  // IT LAUNCHES UPWARD WITH ZERO INHERITED SPEED, which is what makes the
+  // trail read as a ground launch.
+  const sys = createMissileSystem({});
+  const round = sys.fire({
+    config: SAM_MISSILE, owner: "sam",
+    position: { x: 0, y: 20, z: 0 }, direction: { x: 0, y: 1, z: 0 },
+    speed: 0, target: null,
+  });
+  check("it leaves the ground going UP", round.velocity.y > 0 && Math.abs(round.velocity.x) < 1e-9);
+  check("and inherits no lateral speed", Math.abs(round.velocity.z) < 1e-9);
+}
+
+function testSeduces() {
+  check("inside the radius decoys", seduces(200, 900) === true);
+  check("outside the radius does not", seduces(500, 900) === false);
+  // A COMMITTED round cannot be decoyed -- the answer is the barrel roll.
+  check("a committed round cannot be decoyed", seduces(50, 100) === false);
+  // A flare further away than the target is a distraction, not a decoy.
+  check("a flare further than the target loses", seduces(800, 400) === false);
+
+  // KEEP minStandoff WELL BELOW seduceRadius. The cloud sits ~200 m astern a
+  // second after release, so a standoff near that distance cancels the radius
+  // out and the mechanic never fires at all. Assert the RELATIONSHIP.
+  check(
+    "minStandoff is well below seduceRadius",
+    FLARE_CFG.minStandoff < FLARE_CFG.seduceRadius * 0.6,
+    `${FLARE_CFG.minStandoff} vs ${FLARE_CFG.seduceRadius}`,
+  );
+}
+
+function testDecoyEndToEndWithAMovingAircraft() {
+  // §8 IS EMPHATIC ABOUT THIS: a STATIC aircraft never leaves its flares
+  // behind, so the cloud never reaches the chaser's path and the mechanic
+  // looks broken while being perfectly correct.
+  const flares = createFlares();
+  const sys = createMissileSystem({});
+  const state = createFlightState({ position: { x: 0, y: 900, z: 0 }, speed: 220 });
+  const player = {
+    label: "PLAYER", alive: true, health: 100, maxHealth: 100, radius: 8,
+    hitAt: -Infinity, position: state.position, velocity: { x: 0, y: 0, z: -220 },
+  };
+
+  // A STERN CHASE: the round is behind and closing.
+  const round = sys.fire({
+    config: HOSTILE_MISSILE, owner: "hostile",
+    position: { x: 0, y: 900, z: 1400 },
+    direction: { x: 0, y: 0, z: -1 }, speed: 300, target: player,
+  });
+  const originalTarget = round.target;
+
+  flares.dispense(state, { x: 0, y: 0, z: -1 }, 0);
+  check("a burst is dispensed", flares.flares.length === 3, `${flares.flares.length}`);
+
+  let seduced = false;
+  for (let t = 0; t < 3 && !seduced; t += 1 / 60) {
+    // THE AIRCRAFT KEEPS FLYING, which is what leaves the cloud behind.
+    updateFlight(state, stick(), 1 / 60);
+    flares.update(1 / 60, t);
+    flares.offerTo(sys.rounds, state.position);
+    sys.update(1 / 60, t);
+    if (round.target && round.target.label === "FLARE") seduced = true;
+  }
+  check("a stern-chasing round is decoyed", seduced, `target ${round.target?.label}`);
+  // RE-TARGETED, NOT FLAGGED. A "lost" flag would freeze the heading of a
+  // round already pointed at the player, so it would arrive anyway.
+  check("the round's TARGET was swapped", round.target !== originalTarget);
+  check("it was not merely flagged lost", round.givenUp !== true);
+  check("it is chasing an actual flare", round.target.label === "FLARE");
+
+  // A HEAD-ON shot arrives before the flares are near it: panicking early
+  // buys nothing.
+  const f2 = createFlares();
+  const sys2 = createMissileSystem({});
+  const s2 = createFlightState({ position: { x: 0, y: 900, z: 0 }, speed: 220 });
+  const p2 = { ...player, position: s2.position };
+  const headOn = sys2.fire({
+    config: HOSTILE_MISSILE, owner: "hostile",
+    position: { x: 0, y: 900, z: -2200 },
+    direction: { x: 0, y: 0, z: 1 }, speed: 300, target: p2,
+  });
+  f2.dispense(s2, { x: 0, y: 0, z: -1 }, 0);
+  let headOnSeduced = false;
+  for (let t = 0; t < 2; t += 1 / 60) {
+    updateFlight(s2, stick(), 1 / 60);
+    f2.update(1 / 60, t);
+    f2.offerTo(sys2.rounds, s2.position);
+    sys2.update(1 / 60, t);
+    if (headOn.target && headOn.target.label === "FLARE") headOnSeduced = true;
+  }
+  check("a head-on shot is not decoyed", headOnSeduced === false);
+
+  // A BURNT-OUT FLARE STOPS BEING A TARGET, and the missile's existing "no
+  // live target" branch then stops guidance -- no change in missile.js.
+  const f3 = createFlares();
+  const s3 = createFlightState({ position: { x: 0, y: 900, z: 0 } });
+  f3.dispense(s3, { x: 0, y: 0, z: -1 }, 0);
+  const flare = f3.flares[0];
+  check("a fresh flare is alive", flare.alive === true);
+  f3.update(1 / 60, FLARE_CFG.burn + 0.1);
+  check("a burnt-out flare stops being a target", flare.alive === false);
+
+  // Flares are INFRARED: they defeat a missile, never a radar LOCK.
+  check("the dispenser is finite", createFlares().remaining === FLARE_CFG.count);
+  const f4 = createFlares();
+  const s4 = createFlightState();
+  f4.dispense(s4, { x: 0, y: 0, z: -1 }, 0);
+  check("a burst spends perBurst flares", f4.remaining === FLARE_CFG.count - FLARE_CFG.perBurst);
+  check("the cooldown blocks an immediate second burst", f4.dispense(s4, { x: 0, y: 0, z: -1 }, 0) === 0);
+}
+
+function testRearm() {
+  const refills = [];
+  const rearm = createRearm({ seconds: 20, onRefill: (n) => refills.push(n) });
+  let missiles = 2;
+  let rounds = 500;
+  const weapons = {
+    "AIM-9": { isEmpty: () => missiles === 0, refill: () => (missiles = 2) },
+    GUN: { isEmpty: () => rounds === 0, refill: () => (rounds = 500) },
+  };
+
+  // A PARTLY-SPENT magazine never starts a timer. START AT EMPTY, NOT AT THE
+  // FIRST SHOT -- otherwise the player fires one AIM-9, waits, and is handed a
+  // third round, and the loadout stops meaning anything.
+  missiles = 1;
+  rearm.update(1, weapons);
+  check("a partly-spent magazine starts no timer", rearm.isCycling("AIM-9") === false);
+
+  missiles = 0;
+  rearm.update(1 / 60, weapons);
+  check("reaching empty starts the timer", rearm.isCycling("AIM-9") === true);
+  check("the gun is untouched", rearm.isCycling("GUN") === false);
+
+  for (let t = 0; t < 19; t += 1 / 60) rearm.update(1 / 60, weapons);
+  check("it has not refilled early", missiles === 0);
+  for (let t = 0; t < 2; t += 1 / 60) rearm.update(1 / 60, weapons);
+  check("it refills after 20 s", missiles === 2, `${missiles}`);
+  check("the refill fired once", refills.length === 1, `${refills.length}`);
+  check("and the timer is gone", rearm.isCycling("AIM-9") === false);
+
+  // INDEPENDENT TIMERS, so one weapon is always coming back.
+  missiles = 0;
+  rearm.update(1 / 60, weapons);
+  for (let t = 0; t < 10; t += 1 / 60) rearm.update(1 / 60, weapons);
+  rounds = 0;
+  rearm.update(1 / 60, weapons);
+  check("both timers run at once", rearm.active().length === 2);
+  check(
+    "and they are at different points",
+    Math.abs(rearm.remaining("AIM-9") - rearm.remaining("GUN")) > 5,
+    `${rearm.remaining("AIM-9")} vs ${rearm.remaining("GUN")}`,
+  );
+
+  // AN EXTERNAL REFILL CANCELS A RUNNING CYCLE -- a checkpoint restore or a
+  // restart -- so a timer cannot later top up an already-full magazine.
+  missiles = 2;
+  rearm.update(1 / 60, weapons);
+  check("an external refill cancels the cycle", rearm.isCycling("AIM-9") === false);
+  check("the other weapon keeps its timer", rearm.isCycling("GUN") === true);
+}
+
+function testModesTable() {
+  for (const mode of [MISSION, FREE, PEACE]) {
+    const r = rulesFor(mode);
+    for (const key of ["phases", "timer", "nav", "hostiles", "sams", "respawn"]) {
+      check(`${mode} defines ${key}`, key in r);
+    }
+  }
+  check("MISSION runs phases, a timer and nav", (() => {
+    const r = rulesFor(MISSION);
+    return r.phases && r.timer && r.nav;
+  })());
+  check("FREE has no phases, timer or nav", (() => {
+    const r = rulesFor(FREE);
+    return !r.phases && !r.timer && !r.nav;
+  })());
+  check("PEACE has no hostiles and no sams", (() => {
+    const r = rulesFor(PEACE);
+    return !r.hostiles && !r.sams;
+  })());
+
+  // LIVES ARE MISSION ONLY: FREE and PEACE are practice, and counting deaths
+  // in a sandbox turns it into a test.
+  check("MISSION has five lives", rulesFor(MISSION).lives === 5);
+  check("FREE has no life count", rulesFor(FREE).lives === null);
+  check("PEACE has no life count", rulesFor(PEACE).lives === null);
+
+  // Two rules identical across all three.
+  check("every mode flies the catapult", ALWAYS.launch === true);
+  // THE GROUND STILL KILLS YOU IN PEACE. "No hostiles" is not "no
+  // consequences" -- a sky with nothing to hit is a screensaver.
+  check("PEACE still has a failure state", ALWAYS.groundKills === true);
+  check("PEACE returns you to the carrier", rulesFor(PEACE).respawn === "carrier");
+  check("MISSION respawns crash-relative", rulesFor(MISSION).respawn === "crash-relative");
+
+  check("T cycles all three and returns", nextMode(nextMode(nextMode(MISSION))) === MISSION);
+}
+
+function testSandboxDriver() {
+  // PEACE SPAWNS NOTHING, however long you fly.
+  const peace = createSandbox();
+  let spawned = 0;
+  for (let t = 0; t < 120; t += 1 / 30) {
+    if (peace.update(1 / 30, { mode: PEACE, handedOff: true, hostileAlive: false })) spawned++;
+  }
+  check("PEACE spawns nothing in two minutes", spawned === 0, `${spawned}`);
+
+  // FREE: ONE AT A TIME, first arrival 8 s after handoff.
+  const free = createSandbox();
+  let first = null;
+  for (let t = 0; t < 20; t += 1 / 30) {
+    if (free.update(1 / 30, { mode: FREE, handedOff: true, hostileAlive: false })) {
+      first = t;
+      break;
+    }
+  }
+  check("FREE spawns after about 8 s", first !== null && first > 7 && first < 9, `${first}`);
+
+  // Nothing more arrives while one is alive.
+  let extra = 0;
+  for (let t = 0; t < 60; t += 1 / 30) {
+    if (free.update(1 / 30, { mode: FREE, handedOff: true, hostileAlive: true })) extra++;
+  }
+  check("nothing spawns while one is alive", extra === 0, `${extra}`);
+
+  // And a replacement arrives 12 s after the kill.
+  let second = null;
+  for (let t = 0; t < 20; t += 1 / 30) {
+    if (free.update(1 / 30, { mode: FREE, handedOff: true, hostileAlive: false })) {
+      second = t;
+      break;
+    }
+  }
+  check("a replacement arrives after about 12 s", second !== null && second > 11 && second < 13, `${second}`);
+
+  // Nothing spawns before the handoff -- every mode flies the catapult first.
+  const early = createSandbox();
+  let before = 0;
+  for (let t = 0; t < 30; t += 1 / 30) {
+    if (early.update(1 / 30, { mode: FREE, handedOff: false, hostileAlive: false })) before++;
+  }
+  check("nothing spawns before the handoff", before === 0);
+}
+
+function testParkedDirectorNeverCompletes() {
+  // In the sandbox modes the director PARKS rather than being bypassed: it
+  // still owns the deck and the catapult, then past the handoff stops
+  // advancing, stops timing and publishes no navigation.
+  const route = buildRoute({ carrierZ: -1600, coastZ: -7600, sampleHeight: null });
+  const m = createMission({ route });
+  m.park();
+
+  // Fly it all the way through every volume for a long time.
+  for (let t = 0; t < 300; t += 1 / 30) {
+    const leg = m.currentLeg();
+    m.update(1 / 30, {
+      position: leg ? { x: leg.x, y: 600, z: leg.z } : { x: 0, y: 600, z: -1600 },
+      fired: true, handedOff: true, magazineSpent: true, cinematicDone: true,
+    });
+  }
+  check(
+    "a parked director never completes a mission",
+    m.mission.phase !== COMPLETE,
+    m.mission.phase,
+  );
+  check("a parked director stops at EGRESS", m.mission.phase === EGRESS, m.mission.phase);
+  check("and publishes no completion time", m.mission.stopped === null);
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 const SUITES = [
@@ -3469,6 +3982,19 @@ const SUITES = [
   ["a checkpoint is flyable", testCheckpointIsFlyable],
   ["the mission failure policy", testMissionFailurePolicy],
   ["the extraction autopilot", testAutopilot],
+  ["line of sight", testLineOfSight],
+  ["SAM transition table", testSamTransitionTable],
+  ["one launch per lock", testOneLaunchPerLock],
+  ["a masked site never launches", testMaskedSiteNeverLaunches],
+  ["SAM placement", testSamPlacement],
+  ["SAM wreck and contract", testSamWreckAndContract],
+  ["the SAM round", testSamRound],
+  ["seduces", testSeduces],
+  ["decoy end to end with a MOVING aircraft", testDecoyEndToEndWithAMovingAircraft],
+  ["rearm", testRearm],
+  ["the modes table", testModesTable],
+  ["the sandbox driver", testSandboxDriver],
+  ["a parked director never completes", testParkedDirectorNeverCompletes],
 ];
 
 export function run() {
