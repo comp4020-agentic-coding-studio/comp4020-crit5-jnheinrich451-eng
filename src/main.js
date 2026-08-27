@@ -45,7 +45,7 @@ import { AUDIO, Cue, Priority, engineVoice, groundWarning, secondsToGround, flyb
 import { SAM, SAM_MISSILE, SamState, createSamSite, createSamNetwork, wreckSamSite, lineOfSight, loadSamLauncher, installSamVisual } from "./sam.js";
 import { FLARE, createFlareSystem } from "./flares.js";
 import { CRASH, CrashCause, causeFromReason, createCrashFx } from "./crash-fx.js";
-import { GameMode, MODES, SANDBOX, modeRules, nextMode, isSandbox, createSandbox } from "./modes.js";
+import { GameMode, MODES, SANDBOX, modeRules, nextMode, isSandbox, createSandbox, seedSamBatch, samBatchSpent } from "./modes.js";
 import { VAPOR, createVaporFx } from "./vapor-fx.js";
 import { ATMOS, createAtmosphere } from "./atmosphere.js";
 
@@ -215,12 +215,67 @@ const crashFx = createCrashFx({ scene });
 const _crashVel = new THREE.Vector3();
 
 let mode = GameMode.MISSION;
+/**
+ * The authored six, kept aside so switching back to MISSION restores the
+ * corridor rather than leaving whatever FREE fly last seeded.
+ */
+let samModelPrototype = null;
+let missionSites = [];
+/** The batch FREE fly is currently flying against. */
+let freeSites = [];
+
+/**
+ * Retire a batch. The sites are removed from the scene and dropped, wrecks
+ * included — the player is over 7 km away by the time this runs (samBatchSpent),
+ * so nothing visibly vanishes.
+ *
+ * Geometry and materials are NOT disposed: every launcher is a `clone(true)` of
+ * one loaded prototype, so they share those, and disposing them would take the
+ * next batch's meshes with them.
+ */
+function retireFreeSites() {
+  for (const site of freeSites) if (site.root && site.root.parent) site.root.parent.remove(site.root);
+  freeSites = [];
+}
+
 const sandbox = createSandbox({
   spawnHostile: () => deployHostile(MISSION.encounter.defensive),
   setHostile: (on) => {
     if (!on) hostileAi.setActive(false);
   },
-  setSams: (on) => samNet.setActive(on),
+  setSams: (on) => {
+    /**
+     * FREE fly starts with an EMPTY sky and seeds its own batches into it.
+     *
+     * Without this it inherits whatever `applyMode` restored — the mission's
+     * authored corridor — and flies against that until the first batch happens
+     * to place, which is a different mode depending on where you launched. An
+     * empty start is also honest: over open water there are no ground threats,
+     * and there should not be.
+     */
+    retireFreeSites();
+    samNet.setSites(on ? [] : missionSites);
+    samNet.setActive(on);
+  },
+  /**
+   * Returns HOW MANY sites it stood up, which is what lets the driver tell an
+   * ocean from a valley and back off instead of retrying every frame.
+   */
+  seedSams: (centre, heading) => {
+    if (!terrainIndexed) return 0; // no height field, nowhere to stand
+    const plan = seedSamBatch(centre, heading, groundAt, Math.random, SANDBOX);
+    // Retire the old batch only once the new one has somewhere to go. Clearing
+    // first would strip the valley the player is still flying through every
+    // time the prediction happened to land over water.
+    if (plan.length === 0) return 0;
+    retireFreeSites();
+    freeSites = plan.map((p) => createSamSite({ position: p, name: p.name }));
+    if (samModelPrototype) for (const site of freeSites) installSamVisual(site, samModelPrototype.clone(true));
+    for (const site of freeSites) combatRoot.add(site.root);
+    samNet.setSites(freeSites);
+    console.log("[free] SAM batch", freeSites.map((s) => `${s.root.name} @ ${Math.round(s.position.x)},${Math.round(s.position.y)},${Math.round(s.position.z)}`));
+    return freeSites.length;
+  },
 });
 
 /* ---- Stage 04.2: SAM launches and kills ---- */
@@ -278,6 +333,14 @@ function applyMode(next) {
   const rules = modeRules(mode);
   director.setSandbox(!rules.phases);
   sandbox.reset();
+  /**
+   * Put the authored corridor back on EVERY mode change. Only FREE fly replaces
+   * the site list, and it is the mode being left as often as the one being
+   * entered — without this, switching FREE -> MISSION flies the mission against
+   * whatever batch happened to be alive when the key was pressed.
+   */
+  retireFreeSites();
+  samNet.setSites(missionSites);
   samNet.setActive(false);
   hostileAi.setActive(false);
   hideFailed();
@@ -2096,7 +2159,19 @@ function step() {
   // Ground threats. Static, so there is no integration step — only acquisition,
   // line of sight and a launch.
   samNet.update(playerEntity, dt);
-  if (isSandbox(mode)) sandbox.update({ hostileAlive: hostileAi.state.active && drone.alive }, dt);
+  if (isSandbox(mode)) {
+    sandbox.update(
+      {
+        hostileAlive: hostileAi.state.active && drone.alive,
+        position: aircraftRoot.position,
+        heading: flightState.heading,
+        // Only FREE fly seeds batches. PEACE has no SAMs at all, and passing a
+        // spent flag it can never act on would just be noise.
+        samsSpent: modeRules(mode).sams && samBatchSpent(aircraftRoot.position, freeSites, SANDBOX),
+      },
+      dt
+    );
+  }
 
   // §5 — an inactive hostile is not a target, either. Handing targeting an empty
   // list is what stops the player locking a drone that is not in the mission yet.
@@ -2533,6 +2608,10 @@ Promise.all([
   if (samModel) for (const s of sites) installSamVisual(s, samModel.prototype.clone(true));
   else failures.push("SAM launcher: placeholder blockout in use");
   for (const s of sites) combatRoot.add(s.root);
+  // Kept for FREE fly: its batches clone the same prototype, and MISSION's
+  // corridor is restored from `missionSites` when the mode changes back.
+  samModelPrototype = samModel ? samModel.prototype : null;
+  missionSites = sites;
   samNet.setSites(sites);
   samNet.setActive(false);
   console.log("[sam] sites", samPlan.map((p) => `${p.name} @ ${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`));

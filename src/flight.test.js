@@ -75,7 +75,7 @@ import { LIGHTS, seeded, habitable, planSettlements, createCarrierLights } from 
 import { OCEAN } from "./ocean.js";
 import { breakDirection } from "./hostile.js";
 import { SAM, SAM_MISSILE, SamState, lineOfSight, inEngagementRange, samTransition, samThreatLevel, createSamSite, createSamNetwork, wreckSamSite, resetSamSite, normalizeSamModel, installSamVisual } from "./sam.js";
-import { GameMode, MODES, MODE_ORDER, SANDBOX, modeRules, nextMode, isSandbox, createSandbox } from "./modes.js";
+import { GameMode, MODES, MODE_ORDER, SANDBOX, modeRules, nextMode, isSandbox, createSandbox , predictAhead, seedSamBatch, samBatchSpent } from "./modes.js";
 import { planSamSites, safeSpawnAltitude } from "./mission.js";import { FLARE, seduces, ejectVelocity, createFlareSystem } from "./flares.js";
 import { CRASH, CRASH_VARIANT, CrashCause, causeFromReason, makeTumble, aircraftOpacity, kickAmplitude, screenFlashAlpha, followBlend, createCrashFx } from "./crash-fx.js";
 
@@ -5421,6 +5421,106 @@ const holdStep = (d, pos, dt) =>
   dir3.setPaused(true);
   dir3.setPaused(false);
   check("pause: ...and an unmuted one is not silently muted by it", dir3.state.muted === false);
+}
+
+/**
+ * FREE FLY SEEDS ITS OWN SAM BATCHES.
+ *
+ * MISSION's six authored sites do not respawn (§11) and that stands: clearing
+ * the corridor earns an empty valley, and the mission ENDS. FREE fly does not
+ * end, so a finite six leaves an empty sky a few minutes in — the same failure
+ * `hostileRespawn` already prevents for the fighter.
+ *
+ * A synthetic island, so the placement rule is exercised without a scene (§4):
+ * land inside a circle, open sea outside it.
+ */
+{
+  const island = (x, z) => (Math.hypot(x, z - 12000) < 6000 ? 120 : -5);
+  // Deterministic scatter. A random one cannot be asserted.
+  const rng = (seed) => () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+
+  // -- prediction ------------------------------------------------------------
+  // Heading 0 is -Z and forward is (-sin h, -cos h) (§5). Get that backwards and
+  // every batch lands BEHIND the player, which is the one failure that would
+  // make the whole feature look like it does nothing.
+  const north = predictAhead({ x: 0, z: 0 }, 0);
+  check("free/sam: the batch is seeded AHEAD, on the project's heading convention", north.z < 0 && Math.abs(north.x) < 1e-9, north);
+  check("free/sam: ...at the configured distance", Math.abs(Math.hypot(north.x, north.z) - SANDBOX.sam.ahead) < 1e-6, Math.hypot(north.x, north.z));
+  const east = predictAhead({ x: 0, z: 0 }, -Math.PI / 2);
+  check("free/sam: and it turns with the aircraft", east.x > 0 && Math.abs(east.z) < 1e-6, east);
+
+  // -- placement -------------------------------------------------------------
+  const onLand = seedSamBatch({ x: 0, z: 12000 }, Math.PI, island, rng(7));
+  check("free/sam: a batch is at most three sites", onLand.length <= SANDBOX.sam.perBatch, onLand.length);
+  check("free/sam: over land it places some", onLand.length > 0, onLand.length);
+  check("free/sam: every site stands on ground, never on the sea", onLand.every((p) => p.y >= SANDBOX.sam.minGroundY), onLand.map((p) => p.y));
+  check("free/sam: they are scattered, not stacked", new Set(onLand.map((p) => Math.round(p.x) + "," + Math.round(p.z))).size === onLand.length);
+
+  // §13's rule, applied to a batch: a site with nowhere to stand is DROPPED, not
+  // floated. Two on land beat three with one in the sea.
+  const atSea = seedSamBatch({ x: 0, z: -40000 }, Math.PI, island, rng(7));
+  check("free/sam: over open water it places NONE rather than floating them", atSea.length === 0, atSea.length);
+
+  // -- retirement ------------------------------------------------------------
+  const near = [{ alive: true, position: { x: 100, y: 0, z: 100 } }];
+  const far = [{ alive: true, position: { x: 0, y: 0, z: 30000 } }];
+  const dead = [{ alive: false, position: { x: 100, y: 0, z: 100 } }];
+  const here = { x: 0, y: 500, z: 0 };
+  check("free/sam: an empty batch is spent, so the cycle can start itself", samBatchSpent(here, []) === true);
+  check("free/sam: a live batch nearby is NOT replaced under the player", samBatchSpent(here, near) === false);
+  check("free/sam: a destroyed batch is spent", samBatchSpent(here, dead) === true);
+  check("free/sam: an IGNORED batch is only retired once it is far behind", samBatchSpent(here, far) === true);
+  check(
+    "free/sam: ...and the retirement range clears the SAM's own reach and the radar's",
+    SANDBOX.sam.clearRange > SAM.detectRange && SANDBOX.sam.clearRange > HUD.radarRange,
+    [SANDBOX.sam.clearRange, SAM.detectRange, HUD.radarRange]
+  );
+  // One survivor inside the range holds the whole batch, so a player who left
+  // one alive and turned back finds it still there.
+  const mixed = [dead[0], near[0]];
+  check("free/sam: one survivor in range holds the batch", samBatchSpent(here, mixed) === false);
+
+  // -- the driver ------------------------------------------------------------
+  let seeded = 0;
+  const box = createSandbox({ seedSams: () => (seeded += 1, 3), setSams: () => {}, setHostile: () => {} });
+  box.begin(GameMode.FREE);
+  box.update({ hostileAlive: true, position: here, heading: 0, samsSpent: true }, 1 / 60);
+  check("free/sam: the driver seeds when the batch is spent", seeded === 1, seeded);
+  box.update({ hostileAlive: true, position: here, heading: 0, samsSpent: false }, 1 / 60);
+  check("free/sam: ...and not while it is still live", seeded === 1, seeded);
+  check("free/sam: batches are counted for the rail", box.state.samBatches === 1, box.state.samBatches);
+
+  /**
+   * A SEED THAT PLACES NOTHING MUST NOT RETRY EVERY FRAME.
+   *
+   * Found by running it: launching from the carrier aims the prediction 5.2 km
+   * down the deck heading, which is still open water, so every ground probe
+   * failed and the batch came back empty. An empty batch is spent by
+   * definition, so the cycle re-seeded on the next frame and the next — 49
+   * attempts and zero sites by the time the aircraft reached EGRESS.
+   *
+   * §17.14 — assert the ATTEMPT COUNT, not "there are no sites". "No sites over
+   * water" is true whether the cycle asks once or sixty times a second.
+   */
+  let tries = 0;
+  const dry = createSandbox({ seedSams: () => (tries += 1, 0), setSams: () => {}, setHostile: () => {} });
+  dry.begin(GameMode.FREE);
+  for (let i = 0; i < 120; i++) dry.update({ hostileAlive: true, position: here, heading: 0, samsSpent: true }, 1 / 60);
+  check("free/sam: two seconds of open water costs ONE attempt, not 120", tries === 1, tries);
+  check("free/sam: ...and counts no batch, because none was placed", dry.state.samBatches === 0, dry.state.samBatches);
+  // Past the cooldown it tries again, so crossing a coastline starts seeding.
+  for (let i = 0; i < 60 * (SANDBOX.sam.retry + 1); i++) dry.update({ hostileAlive: true, position: here, heading: 0, samsSpent: true }, 1 / 60);
+  check("free/sam: but it does try again once the cooldown lapses", tries === 2, tries);
+
+  // PEACE has no SAMs at all, and MISSION is not a sandbox: neither may seed.
+  let peaceSeeded = 0;
+  const peace = createSandbox({ seedSams: () => (peaceSeeded += 1), setSams: () => {}, setHostile: () => {} });
+  peace.begin(GameMode.PEACE);
+  // main.js gates `samsSpent` on modeRules(mode).sams, which PEACE does not have.
+  peace.update({ hostileAlive: false, position: here, heading: 0, samsSpent: modeRules(GameMode.PEACE).sams }, 1 / 60);
+  check("free/sam: PEACE seeds nothing", peaceSeeded === 0, peaceSeeded);
+  check("free/sam: ...because PEACE has no SAMs to seed", modeRules(GameMode.PEACE).sams === false);
+  check("free/sam: and MISSION still owns its authored corridor", modeRules(GameMode.MISSION).sams === true && SANDBOX.samRespawn === null);
 }
 
 console.log(failures === 0 ? `flight.test.js — all ${total} checks passed` : `flight.test.js — ${failures} failure(s) of ${total}`);

@@ -963,9 +963,34 @@ Sandbox driver, deliberately tiny — no waves, no difficulty curve, no hidden
 score: one hostile at a time, respawning 12 s after a kill, first arrival 8 s after
 handoff.
 
-**SAM sites must not respawn.** Six is a finite thing to clear, and a player who
-spent four minutes clearing the valley has earned an empty valley. A respawning
-site makes that work meaningless.
+**SAM sites must not respawn in MISSION.** Six is a finite thing to clear, and a
+player who spent four minutes clearing the valley has earned an empty valley. A
+respawning site makes that work meaningless.
+
+**FREE fly seeds its own, because it never ends.** That reward only means
+something because the mission finishes; an endless mode with six finite sites is
+an empty sky a few minutes in — the same failure `hostileRespawn` already exists
+to prevent for the fighter. So FREE fly starts with an empty sky and seeds
+batches down the track the player is actually flying:
+
+- at most **three sites per batch**, seeded ~5.2 km ahead of the player's
+  current heading, scattered across and along that track rather than on world
+  axes, so a batch never reads as a grid
+- **a batch is retired only once the player is 7 km from all of it** — past the
+  SAM's own 5 km detection and the radar's 6 km ring, so a batch is never
+  swapped while it could still be fighting or still be on the display. Sites you
+  destroyed stay destroyed while you can still see where they were; sites you
+  ignored are not deleted out from under you either
+- a site with nowhere to stand is **dropped, not floated** (§13), so a batch is
+  "up to three", and over open water it is none
+- a seed that places nothing waits before retrying. Without that the empty batch
+  reads as spent and the cycle re-seeds every frame: measured, 49 attempts and
+  zero sites in the time it took to fly off the carrier
+
+The prediction is deliberately the crudest possible — position, heading, fixed
+distance. A turning player invalidates it immediately, which is correct: the
+batch is seeded once and stays put, and a prediction that tracked every input
+would chase the nose around and drop sites behind the aircraft.
 
 ---
 
