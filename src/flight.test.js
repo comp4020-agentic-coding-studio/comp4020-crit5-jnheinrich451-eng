@@ -5587,6 +5587,47 @@ const holdStep = (d, pos, dt) =>
   check("wing: FREE fly flies more than one, MISSION exactly one (§12)", SANDBOX.wing === 2 && MISSION.encounter.defensive.ammo === 2, SANDBOX.wing);
 }
 
+/**
+ * A SANDBOX MODE CARRIES NO MISSION FURNITURE, INCLUDING ON THE DECK.
+ *
+ * §11 — the director owns the deck and the catapult in every mode, then parks
+ * past the handoff. But parking happens on ENTRY to EGRESS, and DECK and LAUNCH
+ * come before it: FREE fly and PEACE flew the whole take-off with a NAV COAST
+ * diamond, name and range, and a DECK phase cue across the middle of the frame.
+ * Then it vanished at the handoff, which read as a glitch rather than a
+ * leftover.
+ *
+ * `parked` means "the director has stopped advancing". This is the different
+ * question — "was there ever a route" — so it is gated on `sandbox`.
+ */
+{
+  const mission = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  mission.setRoute(planRoute({ coastZ: -7600, features: [] }));
+  mission.reset();
+  const free = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  free.setSandbox(true);
+  free.setRoute(planRoute({ coastZ: -7600, features: [] }));
+  free.reset();
+
+  const pos = { x: 0, y: 20, z: -1546 };
+  const ctx = { position: pos, strokeStarted: false, launchDone: false, hostileAlive: true, hostileSpent: false };
+  mission.update(ctx, 1 / 60);
+  free.update(ctx, 1 / 60);
+
+  check("sandbox/hud: MISSION publishes a waypoint on the deck", mission.state.navValid === true && !!mission.state.navName, mission.state.navName);
+  check("sandbox/hud: a sandbox mode publishes NONE — before parking, not after", free.state.navValid === false && free.state.navName === null, free.state.navName);
+  check("sandbox/hud: ...and no range either, so the rail cannot print one", free.state.navRange === 0, free.state.navRange);
+  check("sandbox/hud: the suppression is not just `parked` — it applies on the DECK", free.state.phase === MissionPhase.DECK && free.state.parked === false, [free.state.phase, free.state.parked]);
+
+  // The phase cue is the other mission mark on that screen.
+  check("sandbox/hud: MISSION announces its phase", typeof mission.cue === "string", mission.cue);
+  check("sandbox/hud: a sandbox mode announces nothing", free.cue === null, free.cue);
+
+  // Through the launch, where the leftover was actually visible.
+  for (let i = 0; i < 60 * 3; i++) free.update({ ...ctx, strokeStarted: true }, 1 / 60);
+  check("sandbox/hud: still silent through LAUNCH", free.state.navValid === false && free.cue === null, [free.state.phase, free.state.navName, free.cue]);
+}
+
 console.log(failures === 0 ? `flight.test.js — all ${total} checks passed` : `flight.test.js — ${failures} failure(s) of ${total}`);
 
 /**

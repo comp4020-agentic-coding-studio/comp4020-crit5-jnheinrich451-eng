@@ -959,6 +959,21 @@ still owns the deck and the catapult, then past the handoff stops advancing, sto
 timing and publishes no navigation. Assert that a parked director never completes
 a mission by accident.
 
+**No mission furniture at all in a sandbox mode, including on the deck.** Parking
+happens on entry to EGRESS, and DECK and LAUNCH come before it — so gating the
+nav marker and the phase cue on `parked` leaves FREE fly and PEACE flying the
+whole take-off with a `NAV COAST` diamond, name and range, and a `DECK` cue
+across the middle of the frame. It then vanishes at the handoff, which reads as
+a glitch rather than as a leftover. Gate them on **`sandbox`**: `parked` means
+"the director has stopped advancing", and this is the different question, "was
+there ever a route".
+
+**Every hostile slot is deactivated on a restart, not just the lead.** A hostile
+AI's `reset()` restores its constructed default, which is active — so a restart
+hands the whole wing back on, and switching off only `wing[0]` leaves a wingman
+flying over the carrier during the catapult launch. That is a live target the
+player can lock before they have the aircraft, which §5 rules out.
+
 Sandbox driver, deliberately tiny — no waves, no difficulty curve, no hidden
 score. First arrival 8 s after handoff, and a replacement 12 s after a kill.
 

@@ -1016,7 +1016,7 @@ function missionFailed(reason = "OUT OF PILOTS") {
   missionFailure.reset();
   crashFx.reset();
   setAircraftOpacity(1);
-  hostileAi.setActive(false);
+  for (const w of wing) w.ai.setActive(false);
   samNet.setActive(false);
   targeting.clear();
   clearEncounterFx();
@@ -1038,7 +1038,14 @@ function restartMission() {
   placeOnDeck();
   applyReset();
   director.reset();
-  hostileAi.setActive(false);
+  /**
+   * THE WHOLE WING, not just the lead. `ai.reset()` restores the constructed
+   * default, which is `active: true`, so a restart hands every slot back on and
+   * only the ones switched off here stay off. Deactivating `wing[0]` alone left
+   * wing[1] flying on the deck: a live target during the catapult launch, which
+   * §5 rules out and which the player could lock before they had the aircraft.
+   */
+  for (const w of wing) w.ai.setActive(false);
   samNet.setActive(false);
   sandbox.reset();
   targeting.clear();

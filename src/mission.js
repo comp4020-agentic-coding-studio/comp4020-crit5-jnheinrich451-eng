@@ -805,6 +805,26 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
    * changes no phase timing.
    */
   function publishNav() {
+    /**
+     * §11 — A SANDBOX MODE HAS NO NAVIGATION, AT ANY PHASE.
+     *
+     * The director owns the deck and the catapult in every mode (no mode skips
+     * the launch), and past the handoff it parks. But parking happens on entry
+     * to EGRESS, which is a moment too late: DECK and LAUNCH still published a
+     * leg, so FREE fly and PEACE flew the whole take-off with a NAV COAST
+     * diamond, name and range on screen — directions to the first waypoint of a
+     * mission the player is not on. It then vanished at the handoff, which made
+     * it read as a glitch rather than as a leftover.
+     *
+     * Gating on `sandbox` rather than on `parked` is the fix: parked is "the
+     * director has stopped advancing", and this is "there was never a route".
+     */
+    if (state.sandbox) {
+      state.navValid = false;
+      state.navName = null;
+      state.navRange = 0;
+      return;
+    }
     let leg = legs[state.legIndex] || null;
     if (!leg || satisfied.has(legKey(leg))) leg = nextUnsatisfied();
     state.navValid = !!leg;
@@ -1056,9 +1076,17 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
     get checkpoints() {
       return checkpoints;
     },
-    /** Phase name to show for a couple of seconds after a transition (§17). */
+    /**
+     * Phase name to show for a couple of seconds after a transition (§17).
+     *
+     * Silent in a sandbox mode, for the same reason there is no nav there: §11's
+     * rules table says FREE and PEACE have no phases, so announcing DECK and
+     * LAUNCH across the middle of the frame is naming a structure the player is
+     * not inside. The director still HAS those phases -- it owns the deck and
+     * the catapult in every mode -- it just has nothing to say about them.
+     */
     get cue() {
-      return cueT > 0 ? cue : null;
+      return !state.sandbox && cueT > 0 ? cue : null;
     },
     /** Eased in and out, so the cue arrives and leaves rather than blinking. */
     get cueAlpha() {
