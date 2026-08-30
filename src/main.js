@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { FLIGHT, SPEED, THROTTLE, EXPERT, MODE, DEG, createFlightState, resetFlightState, toggleFlightMode, updateFlight, headingDegrees, bankDegrees, attitudeVectors, isExpert, requestRoll, quatForward, quatUp, quatFromEulerYXZ, getTargetSpeed, isAfterburner, captureFlightState, applyFlightState } from "./flight.js";
+import { FLIGHT, SPEED, THROTTLE, EXPERT, MODE, DEG, createFlightState, resetFlightState, toggleFlightMode, setFlightMode, flightModeForOutcome, updateFlight, headingDegrees, bankDegrees, attitudeVectors, isExpert, requestRoll, quatForward, quatUp, quatFromEulerYXZ, getTargetSpeed, isAfterburner, captureFlightState, applyFlightState } from "./flight.js";
 import { createInput } from "./input.js";
 import { createAircraftHierarchy, loadF15, setGearVisual } from "./aircraft.js";
 import { createChaseCamera, updateChaseCamera, snapChaseCamera, setChaseView, CHASE } from "./chase-camera.js";
@@ -802,7 +802,12 @@ director.on("phase", ({ phase }) => {
     for (const w of wing) w.ai.setActive(false);
     targeting.clear();
   }
-  if (phase === MissionPhase.COMPLETE) showComplete();
+  if (phase === MissionPhase.COMPLETE) {
+    // The run is over and the cinematic has ended (COMPLETE is only reached via
+    // recoveryDone), so nothing is mid-manoeuvre when the model changes under it.
+    setFlightMode(flightState, flightModeForOutcome("COMPLETE"));
+    showComplete();
+  }
   else hideComplete();
   // A sandbox mode has flown the launch and the director has parked: the sandbox
   // driver takes over from here.
@@ -1013,6 +1018,9 @@ function handoff() {
  * aircraft is left where it fell, and R restarts.
  */
 function missionFailed(reason = "OUT OF PILOTS") {
+  // Back to ASSISTED, so the next run -- or the next person at the keyboard --
+  // starts on the model a stranger can fly. See flightModeForOutcome.
+  setFlightMode(flightState, flightModeForOutcome("FAILED"));
   missionFailure.reset();
   crashFx.reset();
   setAircraftOpacity(1);

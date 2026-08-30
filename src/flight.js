@@ -327,6 +327,30 @@ export function resetFlightState(state) {
  * damps pitch and bank toward their targets rather than clamping them, so the
  * aircraft flies itself back inside the arcade envelope instead of snapping.
  */
+/**
+ * WHICH FLIGHT MODEL A RUN'S OUTCOME LEAVES YOU IN.
+ *
+ * Finishing the sortie promotes you to EXPERT; failing it puts you back in
+ * ASSISTED. The mode survives a restart (`resetFlightState` deliberately does
+ * not touch it), so the next run inherits what the last one earned.
+ *
+ * It is a promotion the player is never TOLD about, which is the point: §16
+ * forbids a legend, so the reward has to be flown rather than announced. The
+ * HUD already prints ASSISTED / EXPERT, so the change is visible without a word,
+ * and `M` still toggles either way at any time — nothing here locks a key.
+ *
+ * The demotion is the load-bearing half. A cold player handed EXPERT banks and
+ * finds the nose does not follow, which reads as a broken aeroplane rather than
+ * a harder one — and they have no way to know `M` exists. Dropping back to
+ * ASSISTED on a failure means the aircraft only ever gets harder for someone who
+ * has just proved they can fly it.
+ *
+ * Pure, so the rule is asserted without a scene (§4).
+ */
+export function flightModeForOutcome(outcome) {
+  return outcome === "COMPLETE" ? MODE.EXPERT : MODE.ASSISTED;
+}
+
 export function setFlightMode(state, mode, { reset = false } = {}) {
   state.mode = mode === MODE.EXPERT ? MODE.EXPERT : MODE.ASSISTED;
   if (reset) {

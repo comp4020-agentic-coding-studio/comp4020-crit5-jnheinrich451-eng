@@ -490,6 +490,22 @@ field at load (§10), not authored.
 Two modes, `M` toggles. Both must write the same quaternion, so the renderer and
 camera read one field regardless of mode.
 
+**The run's outcome sets the model for the next one.** Finishing the sortie
+promotes the player to EXPERT; failing it puts them back in ASSISTED. The mode
+survives a restart — `resetFlightState` deliberately does not touch it — so a
+run inherits what the last one earned.
+
+It is never announced. §16 forbids a legend, so the promotion has to be *flown*
+rather than read: the HUD's existing `ASSISTED` / `EXPERT` row is the only tell,
+and `M` still toggles either way at any time. Nothing here locks a key.
+
+The demotion is the load-bearing half. A cold player handed EXPERT banks, finds
+the nose does not follow, and reads it as a broken aeroplane rather than a
+harder one — and has no way to discover `M`. Dropping back on a failure means
+the aircraft only ever gets harder for someone who has just proved they can fly
+it, which matters most on a shared keyboard where the next person inherits
+whatever the last run left behind.
+
 **ASSISTED** — arcade coordinated turn. Euler angles; bank drives heading change;
 controls self-centre. Pitch is an angle the player holds. The aircraft cannot
 depart.

@@ -3,7 +3,7 @@
  * project yet, so this runs in-page: open index.html?test=1 and read the
  * console. Ports to vitest/jest unchanged — flight.js imports nothing.
  */
-import { createFlightState, updateFlight, forwardFromAngles, bankSinkRate, requestRoll, bankDegrees, getTargetSpeed, speedToThrottle, moveTowards, resetFlightState, wrapAngle, turnBank, setFlightMode, toggleFlightMode, isExpert, attitudeVectors, quat, quatForward, quatUp, quatMultiply, quatFromEulerYXZ, quatNormalize, MODE, EXPERT, CRUISE_THROTTLE, SPEED, THROTTLE, DEG, FLIGHT, ROLL } from "./flight.js";
+import { createFlightState, updateFlight, forwardFromAngles, bankSinkRate, requestRoll, bankDegrees, getTargetSpeed, speedToThrottle, moveTowards, resetFlightState, wrapAngle, turnBank, setFlightMode, flightModeForOutcome, toggleFlightMode, isExpert, attitudeVectors, quat, quatForward, quatUp, quatMultiply, quatFromEulerYXZ, quatNormalize, MODE, EXPERT, CRUISE_THROTTLE, SPEED, THROTTLE, DEG, FLIGHT, ROLL } from "./flight.js";
 import { framingTilt, fovForAspect, CHASE } from "./chase-camera.js";
 import * as THREE from "three";
 import { captureFlightState, applyFlightState } from "./flight.js";
@@ -5715,6 +5715,46 @@ const holdStep = (d, pos, dt) =>
   check("nav/pass: forgiven from range, not re-triggered", flatDistanceTo(pass.position, pos) > pass.radius, Math.round(flatDistanceTo(pass.position, pos)));
   // The route is not skipped: VALLEY and RIDGE were never flown, so they remain.
   check("nav/pass: the legs actually flown are the only ones forgiven", d.state.legIndex === 1, d.state.legIndex);
+}
+
+/**
+ * THE RUN'S OUTCOME SETS THE FLIGHT MODEL FOR THE NEXT ONE.
+ *
+ * Finish and you are promoted to EXPERT; fail and you are put back in ASSISTED.
+ * Never announced -- §16 forbids a legend -- so the reward is flown rather than
+ * read, and the HUD's existing ASSISTED / EXPERT row is the only tell.
+ *
+ * §17.14 -- the DEMOTION is the half that matters and the half a "does
+ * completion give you Expert?" check would miss. A cold player handed EXPERT
+ * banks, finds the nose does not follow, and reads it as a broken aeroplane;
+ * they have no way to know `M` exists. Dropping back on a failure is what keeps
+ * the aircraft only ever getting harder for someone who has just proved they
+ * can fly it -- which matters most on a shared keyboard, where the next person
+ * inherits whatever the last run left behind.
+ */
+{
+  check("outcome: finishing promotes you to EXPERT", flightModeForOutcome("COMPLETE") === MODE.EXPERT, flightModeForOutcome("COMPLETE"));
+  check("outcome: failing puts you back in ASSISTED", flightModeForOutcome("FAILED") === MODE.ASSISTED, flightModeForOutcome("FAILED"));
+  check("outcome: anything unrecognised is ASSISTED, never the harder model", flightModeForOutcome(null) === MODE.ASSISTED && flightModeForOutcome("") === MODE.ASSISTED && flightModeForOutcome("TIME") === MODE.ASSISTED);
+
+  // The mode has to SURVIVE a restart or the promotion is undone before it is
+  // ever felt: resetFlightState deliberately does not touch it.
+  const st = createFlightState();
+  setFlightMode(st, flightModeForOutcome("COMPLETE"));
+  check("outcome: the promotion is real", isExpert(st) === true);
+  resetFlightState(st);
+  check("outcome: ...and survives the restart that follows it", isExpert(st) === true, st.mode);
+  setFlightMode(st, flightModeForOutcome("FAILED"));
+  resetFlightState(st);
+  check("outcome: the demotion survives too", isExpert(st) === false, st.mode);
+
+  // M is not locked in either direction -- it is the way out of a model you did
+  // not ask for, so it must keep working whatever the last run did.
+  setFlightMode(st, flightModeForOutcome("COMPLETE"));
+  toggleFlightMode(st);
+  check("outcome: M still toggles out of a promotion", isExpert(st) === false);
+  toggleFlightMode(st);
+  check("outcome: ...and back into it", isExpert(st) === true);
 }
 
 console.log(failures === 0 ? `flight.test.js — all ${total} checks passed` : `flight.test.js — ${failures} failure(s) of ${total}`);
