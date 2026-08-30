@@ -1118,6 +1118,22 @@ Deploy it ~2400 m ahead, ~900 m to an alternating side, ~140 m above, facing bac
 down the player's course — a head-on pass announces an intercept and puts it on
 screen without a hunt.
 
+**INTERCEPT overrides that placement, and it is the only encounter that does**
+(~1700 m ahead, ~300 m to the side, ~70 m above). Reported twice as "the
+INTERCEPT phase has no hostile fighter" while the deploy was working perfectly:
+measured in the running game, the aircraft was present for the whole phase and
+merged to 59 m. It could not be *found*. 900 m off a 2400 m nose is 21° — the
+edge of the windscreen — where a 14.8 m airframe is about ten pixels of dark
+aeroplane against a dark coastline.
+
+The other two encounters are found by being shot at: TRACK, then LOCK, then a
+missile call. This one carries no rounds on purpose, so it makes no sound and
+raises no warning, and a radar diamond is the only other tell. The silence is
+the design, so the fix has to be geometric — same aircraft, same zero rounds,
+passing through the middle of the frame rather than the corner of it. Express it
+as a per-encounter override of the shared offsets (`deployOffsetFor`), so an
+encounter that names none of them inherits all three.
+
 ---
 
 ## 13. SAM sites (`sam.js`)

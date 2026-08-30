@@ -65,6 +65,7 @@ import {
   missionExpired,
   routeOverlaps,
   createMissionDirector,
+  deployOffsetFor,
 } from "./mission.js";
 import { MISSION_FAILURE, createMissionCheckpointResponse } from "./collision.js";
 import { setGearVisual, setGearForFlight, GEAR_NODES } from "./aircraft.js";
@@ -5599,6 +5600,55 @@ const holdStep = (d, pos, dt) =>
   check("free/sam: PEACE seeds nothing", peaceSeeded === 0, peaceSeeded);
   check("free/sam: ...because PEACE has no SAMs to seed", modeRules(GameMode.PEACE).sams === false);
   check("free/sam: and MISSION still owns its authored corridor", modeRules(GameMode.MISSION).sams === true && SANDBOX.samRespawn === null);
+}
+
+/**
+ * WHERE AN ENCOUNTER PUTS ITS AIRCRAFT.
+ *
+ * Reported twice as "INTERCEPT has no hostile fighter" while the deploy was in
+ * fact working: measured in the running game the aircraft was present for the
+ * whole phase and merged to 59 m. The defect was that it could not be FOUND --
+ * 900 m off a 2400 m nose is 21 degrees, and a 14.8 m airframe there is about
+ * ten pixels of dark aeroplane against a dark coastline.
+ *
+ * Every other encounter is found by being shot at. This one carries no rounds by
+ * design, so it makes no sound and raises no warning, and the geometry is the
+ * only thing left to fix. §17.14: assert the MECHANISM -- that the encounter
+ * that cannot announce itself is the one placed where it will be seen -- not the
+ * symptom, which was only ever "I did not notice it".
+ */
+{
+  const enc = MISSION.encounter;
+  const iOff = deployOffsetFor(enc.intercept);
+  const dOff = deployOffsetFor(enc.defensive);
+  const fOff = deployOffsetFor(enc.final);
+
+  check("encounter: DEFENSIVE inherits the shared offsets", dOff.ahead === enc.ahead && dOff.lateral === enc.lateral && dOff.above === enc.above, dOff);
+  check("encounter: FINAL inherits them too", fOff.ahead === enc.ahead && fOff.lateral === enc.lateral && fOff.above === enc.above, fOff);
+  check("encounter: an encounter naming nothing inherits every offset", (() => { const o = deployOffsetFor({ ammo: 1 }); return o.ahead === enc.ahead && o.lateral === enc.lateral && o.above === enc.above; })());
+  check("encounter: ...and a missing encounter does not throw", (() => { const o = deployOffsetFor(null); return o.ahead === enc.ahead; })());
+
+  // The whole point: INTERCEPT arrives nearer and straighter than the others.
+  check("encounter: INTERCEPT is deployed CLOSER than the shared offset", iOff.ahead < enc.ahead, [iOff.ahead, enc.ahead]);
+  check("encounter: ...and far more nearly head-on", iOff.lateral < enc.lateral * 0.5, [iOff.lateral, enc.lateral]);
+
+  // The number that actually decides whether it is on screen. A chase camera
+  // sees roughly +-30 degrees either side of the nose; the shared offset puts a
+  // hostile at the very edge of that, the intercept one puts it in the middle.
+  const offNose = (o) => Math.atan2(o.lateral, o.ahead) * (180 / Math.PI);
+  check("encounter: INTERCEPT merges inside 12 degrees of the nose", offNose(iOff) < 12, offNose(iOff).toFixed(1));
+  check("encounter: ...where the shared offset is beyond 18", offNose(dOff) > 18, offNose(dOff).toFixed(1));
+
+  // It must still be a MERGE, not a spawn on top of the player: the head-on pass
+  // is the thing that announces an intercept (§12).
+  check("encounter: INTERCEPT still deploys well clear of the player", iOff.ahead > 1200, iOff.ahead);
+  check("encounter: ...and inside the hostile's own detection range", iOff.ahead < HOSTILE.detectRange, [iOff.ahead, HOSTILE.detectRange]);
+  check("encounter: it stays above the sea", iOff.above > 0, iOff.above);
+
+  // Unchanged and load-bearing: zero rounds is what makes the phase one-way.
+  // Moving it closer must not have armed it.
+  check("encounter: INTERCEPT still carries NO rounds", enc.intercept.ammo === 0);
+  check("encounter: DEFENSIVE and FINAL still do", enc.defensive.ammo > 0 && enc.final.ammo > 0);
 }
 
 /**

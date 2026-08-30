@@ -22,6 +22,7 @@ import {
   safeSpawnAltitude,
   surveyTerrainRoute,
   encounterFor,
+  deployOffsetFor,
   autopilotStick,
   blendStick,
   bearingTo,
@@ -753,7 +754,9 @@ function clearEncounterFx() {
  */
 let waveSide = 1;
 function deployHostile(enc, w = wing[0]) {
-  const e = MISSION.encounter;
+  // The encounter may override the shared offsets; INTERCEPT does, because it is
+  // the one encounter that never shoots and so cannot be found by ear.
+  const e = deployOffsetFor(enc);
   quatForward(flightState.quat, _fwd);
   /**
    * Slot 0 keeps §12's alternation EXACTLY -- its own encounter count, which is

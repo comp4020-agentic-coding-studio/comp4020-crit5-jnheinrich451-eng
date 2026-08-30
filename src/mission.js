@@ -128,7 +128,27 @@ export const MISSION = {
     ahead: 2400, // metres in front of the player when it is (re)deployed
     lateral: 900,
     above: 140,
-    intercept: { ammo: 0, engageDelay: 3.0 }, // one-way pressure: the player attacks
+    /**
+     * INTERCEPT is deployed CLOSER and nearly head-on, and it is the only
+     * encounter that overrides the placement.
+     *
+     * Reported twice as "the INTERCEPT phase has no hostile fighter", and the
+     * report was fair even though the deploy was working perfectly: measured in
+     * the running game, the aircraft was there for the whole phase and merged to
+     * 59 m. It just could not be FOUND. At the shared offsets it arrives 900 m
+     * off a 2400 m nose -- 21 degrees, near the edge of the windscreen -- where
+     * a 14.8 m airframe is about ten pixels against a dark coastline.
+     *
+     * Every other encounter announces itself by shooting: TRACK, then LOCK, then
+     * a missile call. This one carries no rounds on purpose (below), so it makes
+     * no sound and raises no warning, and the only tell is a radar diamond. The
+     * fix has to be geometric, because the silence is the design.
+     *
+     * So it comes down the player's throat instead. Same aircraft, same zero
+     * rounds; it simply passes through the middle of the frame rather than the
+     * corner of it.
+     */
+    intercept: { ammo: 0, engageDelay: 3.0, ahead: 1700, lateral: 300, above: 70 }, // one-way pressure: the player attacks
     defensive: { ammo: 2, engageDelay: 2.0 }, // return fire — TRACK / LOCK / MISSILE
     final: { ammo: 1, engageDelay: 1.5 },
   },
@@ -242,6 +262,23 @@ export function encounterFor(phase, cfg = MISSION) {
   if (phase === P.DEFENSIVE) return cfg.encounter.defensive;
   if (phase === P.FINAL) return cfg.encounter.final;
   return null;
+}
+
+/**
+ * Where an encounter puts its aircraft, relative to the player.
+ *
+ * A pure rule with the config injected (§4), so the geometry is testable without
+ * a scene -- main.js only supplies the player's transform. An encounter that
+ * names none of these inherits the shared offsets, which is what DEFENSIVE and
+ * FINAL do: they are found by being shot at, and do not need the help.
+ */
+export function deployOffsetFor(enc, cfg = MISSION) {
+  const e = cfg.encounter;
+  return {
+    ahead: enc && enc.ahead !== undefined ? enc.ahead : e.ahead,
+    lateral: enc && enc.lateral !== undefined ? enc.lateral : e.lateral,
+    above: enc && enc.above !== undefined ? enc.above : e.above,
+  };
 }
 
 /** §33 — are the player's weapons live? */
