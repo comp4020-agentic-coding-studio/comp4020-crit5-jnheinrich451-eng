@@ -5628,6 +5628,71 @@ const holdStep = (d, pos, dt) =>
   check("sandbox/hud: still silent through LAUNCH", free.state.navValid === false && free.cue === null, [free.state.phase, free.state.navName, free.cue]);
 }
 
+/**
+ * A LEG FLOWN THROUGH UNDER AN EARLIER PHASE IS NOT DEMANDED AGAIN.
+ *
+ * Reported from play: reaching PASS did nothing, and once TERRAIN began the
+ * marker pointed backwards at it. DEFENSIVE's own leg is COASTLINE, already
+ * flown under INTERCEPT, so nav falls forward and sends the player to PASS —
+ * but the trigger only tests the CURRENT phase's leg, so arriving recorded
+ * nothing and TERRAIN opened with PASS astern.
+ *
+ * §17.14 — assert that TERRAIN does not ASK FOR PASS AGAIN. "The mission still
+ * completes" passes with the bug fully present: the bot in the suite hovers at
+ * its waypoint, so it is still inside PASS when TERRAIN starts and never
+ * notices. A player flies through and keeps going.
+ */
+{
+  const d = createMissionDirector({ captureCheckpoint: () => ({}), restoreCheckpoint: () => {} });
+  d.setRoute(planRoute({ coastZ: -7600, features: [] }));
+  d.reset();
+  const pass = d.route.find((l) => l.name === "PASS");
+  const pos = { x: 0, y: 600, z: -1546 };
+  const dt = 1 / 20;
+  let t = 0;
+  const step = () =>
+    d.update({ position: pos, strokeStarted: t >= 1.7, launchDone: t >= 5.42, hostileAlive: true, hostileSpent: false }, dt);
+
+  // Fly the route to DEFENSIVE, chasing whatever the diamond says.
+  while (t < 200 && d.state.phase !== MissionPhase.DEFENSIVE) {
+    t += dt;
+    const m = d.state;
+    if (m.navValid && d.playerFlies) {
+      const dx = m.navPosition.x - pos.x, dz = m.navPosition.z - pos.z;
+      const L = Math.hypot(dx, dz) || 1;
+      pos.x += (dx / L) * 210 * dt;
+      pos.z += (dz / L) * 210 * dt;
+    } else if (d.playerFlies) pos.z -= 210 * dt;
+    step();
+  }
+  check("nav/pass: DEFENSIVE is reached, and its own waterline is already behind", d.state.phase === MissionPhase.DEFENSIVE, d.state.phase);
+  check("nav/pass: so the diamond sends the player on to PASS", d.state.navName === "PASS", d.state.navName);
+
+  // Fly THROUGH PASS and keep going, which is what an aircraft does.
+  pos.x = pass.position.x;
+  pos.z = pass.position.z;
+  step();
+  for (let i = 0; i < 20 * 20; i++) { t += dt; pos.z -= 210 * dt; step(); }
+  // The diamond legitimately stays on PASS for the rest of DEFENSIVE: the
+  // mission has not consumed it yet, and it is still where the player is going.
+  check("nav/pass: the aircraft is well clear of PASS by now", flatDistanceTo(pass.position, pos) > pass.radius, Math.round(flatDistanceTo(pass.position, pos)));
+
+  // Run DEFENSIVE's floor out and let TERRAIN open.
+  while (t < 260 && d.state.phase === MissionPhase.DEFENSIVE) { t += dt; step(); }
+  check("nav/pass: TERRAIN opens", d.state.phase === MissionPhase.TERRAIN, d.state.phase);
+  // `selectLegs` publishes before the trigger runs, so PASS shows for exactly
+  // one frame and is then forgiven. What matters is that the player is not sent
+  // back for it -- and they cannot be re-triggering it, because they are
+  // kilometres away.
+  t += dt;
+  step();
+  check("nav/pass: it does NOT send the player back to PASS", d.state.navName !== "PASS", d.state.navName);
+  check("nav/pass: it asks for the next inland leg instead", d.state.navName === "VALLEY", d.state.navName);
+  check("nav/pass: forgiven from range, not re-triggered", flatDistanceTo(pass.position, pos) > pass.radius, Math.round(flatDistanceTo(pass.position, pos)));
+  // The route is not skipped: VALLEY and RIDGE were never flown, so they remain.
+  check("nav/pass: the legs actually flown are the only ones forgiven", d.state.legIndex === 1, d.state.legIndex);
+}
+
 console.log(failures === 0 ? `flight.test.js — all ${total} checks passed` : `flight.test.js — ${failures} failure(s) of ${total}`);
 
 /**

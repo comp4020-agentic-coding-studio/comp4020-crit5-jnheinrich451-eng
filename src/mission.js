@@ -736,6 +736,14 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
    */
   function armCurrentLeg() {
     const leg = legs[state.legIndex];
+    // A leg already flown through needs no arming: the guard exists to stop a
+    // PLACEMENT handing out credit, and this was earned in the air. Without it a
+    // respawn inside such a leg strands it — `armed` false and `inside` true,
+    // so neither branch of the trigger can fire.
+    if (leg && (satisfied.has(legKey(leg)) || flownThrough.has(legKey(leg)))) {
+      armed = true;
+      return;
+    }
     armed = !(placedAt && leg && insideTrigger(leg, placedAt));
   }
 
@@ -773,6 +781,20 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
    * point they had already flown through.
    */
   const satisfied = new Set();
+  /**
+   * Legs the aircraft has genuinely flown through, as opposed to legs the
+   * MISSION has consumed. The two are not the same, and that gap is the bug.
+   *
+   * Reported from play: reaching PASS did nothing, and once TERRAIN began the
+   * marker pointed backwards at it. During DEFENSIVE's 30 s floor its own leg is
+   * COASTLINE — already flown under INTERCEPT — so nav falls forward and sends
+   * the player to PASS. They fly to it, through it, and nothing records that,
+   * because the trigger only tests the CURRENT PHASE's leg. TERRAIN then opens
+   * with PASS kilometres astern. Measured with a turn-rate-limited bot at
+   * 240 m/s: twelve seconds of flying back, and a player who carries on inland
+   * never returns at all.
+   */
+  const flownThrough = new Set();
   const legKey = (l) => `${l.name}@${Math.round(l.position.x)},${Math.round(l.position.z)}`;
 
   /** The first leg in route order the player has not yet reached. */
@@ -889,6 +911,38 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
 
     // Leg progression: broad volumes, checked against the CURRENT leg only, so
     // flying through a later volume early cannot skip the route.
+    /**
+     * RECORD WHERE THE AIRCRAFT HAS BEEN — narrowly.
+     *
+     * This phase's own legs always: `legIndex` still walks them in order, so
+     * recording them out of order cannot skip anything, it only saves flying one
+     * twice.
+     *
+     * The NEXT phase's first leg only once this phase's own legs are done. That
+     * restriction is load-bearing, and two earlier attempts died without it,
+     * both caught by the suite rather than by reading:
+     *
+     *   - recording every leg banks RECOVERY during EGRESS, because the sortie
+     *     comes home to where it started and the two volumes sit 200 m apart.
+     *     The direct run fell from ~150 s to 96.8 s.
+     *   - recording the next phase's legs unconditionally banks SEAWARD while
+     *     the player is at PASS, because those two overlap by design — 1517 m
+     *     apart, PASS's centre inside SEAWARD's volume. FINAL then had nothing
+     *     left to fly.
+     *
+     * Gating on `legDone` closes both: a phase with unflown legs of its own
+     * records nothing beyond itself, so the only leg that can ever be banked
+     * early is the doorway the player was actually sent to.
+     */
+    if (ctx.position && !placedAt) {
+      for (const l of legs) if (insideTrigger(l, ctx.position)) flownThrough.add(legKey(l));
+      if (state.legDone) {
+        const i = PHASE_ORDER.indexOf(state.phase);
+        const doorway = route.find((l) => l.phase === PHASE_ORDER[i + 1]);
+        if (doorway && insideTrigger(doorway, ctx.position)) flownThrough.add(legKey(doorway));
+      }
+    }
+
     // A placement stops suppressing credit once the aircraft has flown clear of
     // it. Checked before the trigger, so the frame the player earns their way
     // out is the frame the guard lifts.
@@ -918,7 +972,7 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
        * its own coordinates — PASS, VALLEY, RIDGE, SEAWARD, RECOVERY — still has
        * to be reached, in order, exactly once.
        */
-      const alreadyFlown = satisfied.has(legKey(leg));
+      const alreadyFlown = satisfied.has(legKey(leg)) || flownThrough.has(legKey(leg));
       const inside = alreadyFlown || insideTrigger(leg, ctx.position);
       // Arms on the way OUT: a leg the aircraft was placed inside becomes
       // available again the moment it is left, so flying back in still counts.
@@ -1041,6 +1095,7 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
     // A fresh sortie has reached nothing. Must precede selectLegs(), which
     // publishes nav and would otherwise fall forward past the whole old route.
     satisfied.clear();
+    flownThrough.clear();
     selectLegs();
     if (captureCheckpoint) {
       checkpoints[0] = { index: 0, phase: MissionPhase.DECK, missionTime: 0, snapshot: captureCheckpoint() };

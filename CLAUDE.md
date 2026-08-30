@@ -760,6 +760,28 @@ and DEFENSIVE would otherwise inherit a waypoint kilometres behind the player an
 never end. Nav already skipped it; the trigger has to agree, or the two disagree
 and the phase stalls.
 
+**That applies to a leg flown under the previous phase too, and it is narrower
+than it sounds.** Reported from play: reaching PASS did nothing, and once
+TERRAIN began the marker pointed backwards at it. DEFENSIVE's own leg is the
+already-flown COASTLINE, so nav falls forward and sends the player to PASS —
+which the trigger never records, because it only tests the current phase's leg.
+Measured at 240 m/s: twelve seconds of flying back, and a player who carries on
+inland never returns.
+
+So the director records where the aircraft has actually been, and the trigger
+reads that too. The scoping is what makes it safe, and two wider versions were
+tried and rejected because the route revisits its own airspace on purpose:
+
+- record **this phase's own legs** freely — `legIndex` still walks them in
+  order, so nothing can be skipped, only saved from being flown twice
+- record the **next phase's first leg only once this phase's legs are done** —
+  its doorway, not its route
+
+Recording everything banks RECOVERY during EGRESS (200 m from COAST) and the run
+falls to 96 s. Recording the next phase unconditionally banks SEAWARD while the
+player is at PASS, because those two overlap by 1517 m. A placement never
+records: being put somewhere is not flying through it.
+
 ### The five-minute deadline
 
 **The sortie is capped at 300 s of mission clock.** Past it the recovery window
