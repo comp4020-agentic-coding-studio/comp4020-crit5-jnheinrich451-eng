@@ -1724,6 +1724,32 @@ optimistic and is corrected by a deadline that the audio module itself owns and
 announces; do not put the deadline in one module and the report in another, or the
 two will drift.
 
+### Mute silences; pause stops
+
+`K` and `Esc` are different operations on the same voices, and the difference is
+the deck start-up.
+
+Mute once walked **looping channels only**, on the reasoning that a one-shot
+already in flight is over in a moment either way. That is true of ten of the
+eleven cues and false of `ENGINE_START`: a ~22 s recording at double rate is
+~11 s of deck, so `K` silenced the whole game except the opening. Reported from
+play in exactly those words.
+
+The repair is **not** to pause it. §9 couples `deckDwell` to that clip's length
+so the catapult fires on its last note, and freezing the audio clock while the
+launch script's keeps running is the same desync the pause branch exists to
+avoid. So mute sets each element's own `muted` — silent, still playing,
+`currentTime` untouched — and pause calls `pause()`. Two consequences, both
+wanted: unmuting mid-clip picks the start-up up where the countdown actually is,
+and the loop watchdog still sees a muted element's clock advancing, which §16
+requires it to (a muted channel must not be reported as a stall).
+
+Loops are stopped *as well as* silenced, since their drive expression restarts
+them on unmute and a muted loop running for nothing burns an element.
+
+Assert the mechanism, not the silence: "it went quiet" passes for a mute that
+stops the clip dead, which is the repair that breaks the countdown.
+
 ### One owner per media element
 
 **A looping cue must be commanded from exactly one expression.** The engine loop

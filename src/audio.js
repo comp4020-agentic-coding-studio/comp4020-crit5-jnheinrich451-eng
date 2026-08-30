@@ -709,10 +709,43 @@ export function createAudioDirector({ cfg = AUDIO, audioFactory = null, gestureT
     return state.paused;
   }
 
+  /**
+   * MUTE SILENCES A ONE-SHOT WITHOUT STOPPING IT.
+   *
+   * This used to touch looping channels only -- `if (!ch.row.loop) continue` --
+   * on the reasoning that a one-shot already in flight is over in a moment
+   * either way. That holds for all ten of them and fails for the eleventh:
+   * ENGINE_START is a ~22 s recording at double rate, so ~11 s of deck. Reported
+   * from play, and precisely: K silenced everything except the start-up.
+   *
+   * The repair is NOT to pause it. §9 couples `deckDwell` to that clip's length
+   * so the catapult fires on its last note, and freezing one clock while the
+   * launch script's keeps running is the desync that the pause branch above
+   * exists to avoid. The element has to keep playing; it just must not be heard.
+   *
+   * So mute sets each element's own `muted`, which silences it without touching
+   * `currentTime`. Two things fall out of that, both wanted:
+   *
+   *   - unmuting mid-clip picks the start-up up where the countdown actually is,
+   *     rather than restarting a sound whose moment has passed;
+   *   - the loop watchdog is unaffected, because a muted element's clock still
+   *     advances -- §16 requires a muted channel not to be reported as stalled,
+   *     and a `muted` flag keeps that true where a `pause()` would not.
+   *
+   * Loops are still stopped as well as silenced: their drive expression restarts
+   * them on unmute, and leaving them running muted burns an element for nothing.
+   */
   function setMuted(on) {
     state.muted = !!on;
     for (const name of Object.keys(channels)) {
       const ch = channels[name];
+      // Every voice of every cue, one-shots included. A take that is not
+      // sounding is unaffected by the flag, so this needs no play test.
+      for (const take of ch.voices) {
+        for (const el of take) {
+          if (el) el.muted = state.muted;
+        }
+      }
       if (!ch.row.loop) continue;
       const el = ch.voices[0][0];
       if (!el) continue;

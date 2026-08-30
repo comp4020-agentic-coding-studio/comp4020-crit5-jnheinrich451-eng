@@ -5480,7 +5480,7 @@ const holdStep = (d, pos, dt) =>
 
   dir.setPaused(true);
   check("pause: the loop stops", loop.paused === true);
-  check("pause: and so does the ONE-SHOT — the case mute skips", start.paused === true, start.paused);
+  check("pause: and so does the ONE-SHOT — pause STOPS what mute merely silences", start.paused === true, start.paused);
   check("pause: the one-shot keeps its position rather than being reset", Math.abs(start.currentTime - 4.2) < 1e-9, start.currentTime);
 
   // The deck clock is frozen while paused, so the audio clock must be too: §9
@@ -5502,6 +5502,82 @@ const holdStep = (d, pos, dt) =>
   dir3.setPaused(true);
   dir3.setPaused(false);
   check("pause: ...and an unmuted one is not silently muted by it", dir3.state.muted === false);
+}
+
+/**
+ * MUTE SILENCES THE DECK START-UP.
+ *
+ * Reported from play, and exactly: K silenced everything except
+ * `engine-start.mp3`. `setMuted` walked looping channels only, on the reasoning
+ * that a one-shot already in flight is over in a moment either way. That is true
+ * of all ten of the others and false of this one — a ~22 s recording at double
+ * rate is ~11 s of deck, which is most of the opening.
+ *
+ * The repair must NOT pause it. §9 couples `deckDwell` to the clip's length so
+ * the catapult fires on its last note; freezing the audio clock while the launch
+ * script's keeps running is the desync the pause branch exists to avoid. So the
+ * element keeps playing and stops being heard, which is what `muted` means on a
+ * media element and what `pause()` does not.
+ *
+ * §17.14 — assert the MECHANISM. "It went quiet" would pass if mute stopped the
+ * clip dead, which is the repair that breaks the countdown.
+ */
+{
+  const el = () => {
+    const e = {
+      paused: true, currentTime: 0, volume: 1, playbackRate: 1, readyState: 4,
+      networkState: 1, loop: false,
+      play() { e.paused = false; return { catch() {} }; },
+      pause() { e.paused = true; },
+      addEventListener() {}, cloneNode: () => el(),
+    };
+    return e;
+  };
+  const dir = createAudioDirector({ audioFactory: () => el() });
+  dir.arm();
+  dir.play(Cue.ENGINE_START);
+  const start = dir.channels.ENGINE_START.voices[0][0];
+  start.currentTime = 4.2;
+  dir.loop(Cue.ENGINE_LOOP, true, { volume: 0.5 });
+  const loop = dir.channels.ENGINE_LOOP.voices[0][0];
+
+  check("mute: the start-up is sounding before the key", start.paused === false && !AUDIO.cues.ENGINE_START.loop);
+
+  dir.setMuted(true);
+  check("mute: K silences the deck start-up", start.muted === true, start.muted);
+  check("mute: ...WITHOUT stopping it, so the countdown stays coupled to it (§9)", start.paused === false, start.paused);
+  check("mute: ...and without rewinding it", Math.abs(start.currentTime - 4.2) < 1e-9, start.currentTime);
+  check("mute: a loop is still stopped, not left running silently", loop.paused === true);
+  check("mute: the loop is silenced too", loop.muted === true);
+  check("mute: the state says so", dir.state.muted === true);
+
+  dir.setMuted(false);
+  check("mute: unmuting makes the start-up audible again", start.muted === false);
+  check("mute: ...picking it up where the deck actually is", Math.abs(start.currentTime - 4.2) < 1e-9 && start.paused === false, start.currentTime);
+  check("mute: and the state clears", dir.state.muted === false);
+
+  // The clock must still advance while muted, or the loop watchdog would call a
+  // muted channel a stall — §16 names that case explicitly, and `pause()` as the
+  // mute primitive is what would have broken it.
+  check("mute: a muted element's clock is free to advance, so it is not a stall", start.paused === false);
+
+  // Muting BEFORE a cue is asked for: play() already refuses while muted, so
+  // nothing starts and there is nothing to silence.
+  const dir2 = createAudioDirector({ audioFactory: () => el() });
+  dir2.arm();
+  dir2.setMuted(true);
+  check("mute: a cue asked for while muted does not start", dir2.play(Cue.ENGINE_START) === false);
+
+  // One key, both directions, like Esc for pause.
+  const dir3 = createAudioDirector({ audioFactory: () => el() });
+  dir3.arm();
+  check("mute: K toggles on", dir3.toggleMute() === true);
+  check("mute: ...and off", dir3.toggleMute() === false);
+
+  // A director with no audio at all must not throw on the key.
+  const silentDir = createAudioDirector({ audioFactory: () => null });
+  silentDir.arm();
+  check("mute: a silent build takes the key without throwing", silentDir.setMuted(true) === true && silentDir.setMuted(false) === false);
 }
 
 /**
