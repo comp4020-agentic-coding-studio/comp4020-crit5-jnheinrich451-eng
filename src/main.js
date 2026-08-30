@@ -36,7 +36,7 @@ import { TARGETING, LockState, createTargetingSystem } from "./targeting.js";
 import { MISSILE, createMissileSystem } from "./missile.js";
 import { GUN, createGunSystem } from "./gun.js";
 import { ENEMY, createTargetDrone, updateTargetDrone, resetTargetDrone, markTargetHit, damageTarget, loadHostileFighter, installHostileVisual } from "./enemy.js";
-import { HOSTILE, HOSTILE_MISSILE, HostileState, createHostileAI } from "./hostile.js";
+import { HOSTILE, HOSTILE_MISSILE, HostileState, createHostileAI, encounterStatus } from "./hostile.js";
 import { THREAT, ThreatLevel, createThreatMonitor, inDodgePeak, evadeEarned, mergeHostiles } from "./threat.js";
 import { DamageSource, createPlayerDamageEvent, createDevelopmentHitResponse } from "./damage.js";
 import { createCombatHud, projectToScreen } from "./combat-hud.js";
@@ -191,6 +191,14 @@ const hostileAi = wing[0].ai;
 /** The pairs currently worth simulating, targeting or drawing. */
 function liveHostiles() {
   return wing.filter((w) => w.ai.state.active && w.drone.alive);
+}
+
+/** What the mission director is told about the wing. One reused record. */
+const _wingEntries = [];
+function _wingStatus() {
+  _wingEntries.length = 0;
+  for (const w of wing) _wingEntries.push({ active: w.ai.state.active, alive: w.drone.alive, spent: w.ai.spent });
+  return encounterStatus(_wingEntries);
 }
 const threat = createThreatMonitor();
 // Guidance context for the evasion hook: rebuilt each frame, read per missile.
@@ -2162,8 +2170,12 @@ function step() {
       position: aircraftRoot.position,
       strokeStarted: launch.state.stage !== LaunchStage.DECK && launch.state.stage !== LaunchStage.IDLE,
       launchDone: launch.state.done,
-      hostileAlive: wing.some((w) => w.drone.alive),
-      hostileSpent: wing.every((w) => w.ai.spent) && (!missiles || missiles.ownedBy("hostile").length === 0),
+      // ONLY DEPLOYED SLOTS COUNT. MISSION flies one aircraft; the other slot is
+      // built for FREE fly and sits inactive with `alive` still true, which used
+      // to tell the director a hostile was airborne for the entire sortie and
+      // stopped a kill from ever ending a phase. See encounterStatus.
+      hostileAlive: _wingStatus().alive,
+      hostileSpent: _wingStatus().spent && (!missiles || missiles.ownedBy("hostile").length === 0),
     },
     dt
   );

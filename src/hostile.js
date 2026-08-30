@@ -225,6 +225,38 @@ export function altitudeGuard(y, desiredPitch, cfg = HOSTILE) {
  * @param ai   { phase, ammo, cooldown, timer, lockProgress, launched, defendReady }
  * @param ctx  { alive, playerAlive, ready, range, inCone }
  */
+/**
+ * What the mission director should believe about the wing, from slots that may
+ * or may not be deployed.
+ *
+ * A pure rule (§4) because it is the one that broke. `hostileAlive` used to read
+ * `wing.some(w => w.drone.alive)`, which is correct for a wing that is entirely
+ * deployed and WRONG the moment a slot is only built and not sent: MISSION flies
+ * exactly one aircraft (§12), so slot 1 sits inactive with `alive` still true
+ * from its constructor, and the director is told a hostile is airborne for the
+ * whole sortie.
+ *
+ * The symptom is not "an extra enemy" -- nothing is drawn, nothing is targetable
+ * -- it is that KILLING THE HOSTILE STOPS ENDING THE PHASE. INTERCEPT's kill
+ * floor is 6 s against a 26 s full floor, so the player destroys the fighter and
+ * then flies 20 s of an intercept phase with nothing to intercept, which is
+ * exactly how it was reported.
+ *
+ * An INACTIVE slot is not an enemy. It is not simulated, not drawn and not
+ * offered to targeting (§5), so it must not be counted here either.
+ */
+export function encounterStatus(entries) {
+  const deployed = (entries || []).filter((e) => e && e.active);
+  return {
+    // No deployed aircraft is no aircraft: `some` over an empty list is false,
+    // which is what lets a phase end when its encounter was never sent.
+    alive: deployed.some((e) => e.alive),
+    // `every` over an empty list is true, and that is right for the same reason:
+    // a magazine that was never loaded cannot hold the phase open.
+    spent: deployed.every((e) => e.spent),
+  };
+}
+
 export function hostileTransition(ai, ctx, cfg = HOSTILE) {
   const S = HostileState;
   if (!ctx.alive) return S.DESTROYED;

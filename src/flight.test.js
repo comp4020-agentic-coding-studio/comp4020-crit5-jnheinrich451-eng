@@ -14,7 +14,9 @@ import { WEAPONS, WeaponMode, cycleWeapon, createWeaponMounts, createMountedMiss
 import { LockState, LockFail, TARGETING, targetGeometry, qualifies, advanceLock, createTargetingSystem } from "./targeting.js";
 import { MISSILE, MissileState, steer, segmentDistance, advanceSpeed, leadPoint, overshooting, createMissileSystem } from "./missile.js";
 import { ENEMY, createTargetDrone, updateTargetDrone, integrateDrone, resetTargetDrone, markTargetHit, damageTarget, normalizeHostileModel, installHostileVisual, HOSTILE_MODEL } from "./enemy.js";
-import { HOSTILE, HOSTILE_MISSILE, HostileState, wrapPi, aimAngles, forwardFrom, offNoseDeg, steerAngle, predictPoint, inAttackCone, altitudeGuard, hostileTransition, phaseSpeed, createHostileAI } from "./hostile.js";
+import { HOSTILE, HOSTILE_MISSILE, HostileState, wrapPi, aimAngles, forwardFrom, offNoseDeg, steerAngle, predictPoint, inAttackCone, altitudeGuard, hostileTransition, phaseSpeed, createHostileAI,
+  encounterStatus,
+} from "./hostile.js";
 import { THREAT, ThreatLevel, ThreatTier, threatLevelOf, warningTier, threatBearing, dodgeWindow, inDodgePeak, evasionAuthority, evadeEarned, mergeHostiles, createThreatMonitor } from "./threat.js";
 import { DamageSource, createPlayerDamageEvent, createDevelopmentHitResponse } from "./damage.js";
 import { HUD, apparentSize, damp, dampAngle, derivePitchDeg, deriveBankDeg, deriveHeadingDeg, uiScaleFor } from "./combat-hud.js";
@@ -5649,6 +5651,65 @@ const holdStep = (d, pos, dt) =>
   // Moving it closer must not have armed it.
   check("encounter: INTERCEPT still carries NO rounds", enc.intercept.ammo === 0);
   check("encounter: DEFENSIVE and FINAL still do", enc.defensive.ammo > 0 && enc.final.ammo > 0);
+}
+
+/**
+ * AN UNDEPLOYED SLOT IS NOT AN ENEMY.
+ *
+ * The regression that FREE fly's wing of two introduced into MISSION, reported
+ * as "the second INTERCEPT has no F-16": the director was asked
+ * `wing.some(w => w.drone.alive)`, and slot 1 -- built for the sandbox, never
+ * deployed in a sortie -- answers `alive` from its constructor forever. So
+ * `hostileAlive` was permanently true, the kill branch never fired, and
+ * destroying the fighter stopped ending the phase.
+ *
+ * §17.14, assert the mechanism: the visible symptom was a phase running 26 s
+ * instead of 6 s, but the defect is a count that includes aircraft that are not
+ * in the sky. Both halves are asserted below -- the rule itself, and the
+ * transition it feeds.
+ */
+{
+  const slot = (active, alive, spent = false) => ({ active, alive, spent });
+
+  // The exact shape of a MISSION wing: one deployed, one built and idle.
+  const mission = [slot(true, true), slot(false, true)];
+  check("wing: a deployed hostile is alive", encounterStatus(mission).alive === true);
+  const killed = [slot(true, false), slot(false, true)];
+  check("wing: KILLING THE DEPLOYED ONE reports the encounter dead", encounterStatus(killed).alive === false, encounterStatus(killed));
+  check("wing: ...even though an undeployed slot still says it is alive", killed[1].alive === true && killed[1].active === false);
+
+  // FREE fly's shape: both deployed. One survivor keeps the fight alive.
+  check("wing: with a whole wing deployed, one survivor keeps it alive", encounterStatus([slot(true, false), slot(true, true)]).alive === true);
+  check("wing: and both dead ends it", encounterStatus([slot(true, false), slot(true, false)]).alive === false);
+
+  // Empty and absent inputs, because the phase handler runs before any deploy.
+  check("wing: nothing deployed is nothing alive", encounterStatus([slot(false, true), slot(false, true)]).alive === false);
+  check("wing: an empty wing does not throw", encounterStatus([]).alive === false);
+  check("wing: a missing wing does not throw", encounterStatus(null).alive === false);
+  check("wing: a hole in the list is skipped", encounterStatus([null, slot(true, true)]).alive === true);
+
+  // The magazine half, which fed DEFENSIVE's "attack cycle complete" branch and
+  // failed the same way.
+  check("wing: spent counts only deployed magazines", encounterStatus([slot(true, true, true), slot(false, true, false)]).spent === true);
+  check("wing: a deployed aircraft with rounds left is not spent", encounterStatus([slot(true, true, false), slot(true, true, true)]).spent === false);
+  check("wing: an encounter that was never deployed cannot hold a phase open", encounterStatus([slot(false, true, false)]).spent === true);
+
+  // And the transition it exists to drive: the kill floor must actually fire.
+  const base = { phase: MissionPhase.INTERCEPT, phaseTime: MISSION.floor.kill + 0.1, legDone: false };
+  check(
+    "wing: a kill ends INTERCEPT at the kill floor, not the full one",
+    missionTransition(base, { hostileAlive: encounterStatus(killed).alive }) === MissionPhase.DEFENSIVE,
+    MISSION.floor.kill + " vs " + MISSION.floor.INTERCEPT
+  );
+  check(
+    "wing: ...which the OLD whole-wing count would have prevented",
+    missionTransition(base, { hostileAlive: killed.some((e) => e.alive) }) === MissionPhase.INTERCEPT
+  );
+  const dBase = { phase: MissionPhase.DEFENSIVE, phaseTime: MISSION.floor.kill + 0.1, legDone: false };
+  check(
+    "wing: and it ends DEFENSIVE the same way",
+    missionTransition(dBase, { hostileAlive: encounterStatus(killed).alive }) === MissionPhase.TERRAIN
+  );
 }
 
 /**

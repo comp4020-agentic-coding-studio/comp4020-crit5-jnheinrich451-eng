@@ -1032,6 +1032,18 @@ Three things a wing needs that a single hostile did not:
 - **Each aircraft fires its own rounds.** Subscribe to `launch` per instance; one
   subscription closing over a single drone sends every wingman's missile off the
   leader's rail.
+- **Only DEPLOYED slots count when the director asks about the wing.** An
+  inactive slot answers `alive` from its constructor forever, and MISSION flies
+  exactly one aircraft — so `wing.some(w => w.drone.alive)` tells the director a
+  hostile is airborne for the whole sortie. Nothing is drawn and nothing is
+  targetable, so it does not look like an extra enemy: what it does is stop a
+  KILL from ever ending a phase. INTERCEPT's kill floor is 6 s against a 26 s
+  full floor, so the player destroys the fighter and then flies 20 s of an
+  intercept phase with nothing to intercept. Reported exactly that way. Both
+  halves fail together — `hostileSpent` over an undeployed magazine holds
+  DEFENSIVE open the same way — so ask one pure rule (`encounterStatus`) that
+  filters on `active` first, and assert that an inactive-but-alive slot reports
+  the encounter DEAD.
 - **The wingman's side is LATCHED when the lead deploys** (§17.9). Recomputing
   it is wrong twice over: adding the wing index to each aircraft's own encounter
   count cancels when the counters differ by one, and reading the lead's counter
