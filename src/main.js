@@ -793,7 +793,12 @@ director.on("phase", ({ phase }) => {
   const rules = modeRules(mode);
   // §SAM — the ground threat belongs to TERRAIN, which is the phase that used to
   // be the breather. That is the trade the brief asked for.
-  samNet.setActive(rules.sams && phase === MissionPhase.TERRAIN);
+  /**
+   * Ground threats are live from DEFENSIVE now, not just TERRAIN: the DEFEND
+   * area has its own battery (§13), and a site that cannot shoot during the
+   * phase it was placed for is furniture.
+   */
+  samNet.setActive(rules.sams && (phase === MissionPhase.DEFENSIVE || phase === MissionPhase.TERRAIN));
   const enc = rules.hostiles ? encounterFor(phase) : null;
   if (enc) {
     deployHostile(enc);
@@ -1663,8 +1668,19 @@ function updateMissionRows() {
     hud.msn.textContent = `${rules.label} \u00b7 ${formatShortClock(sandbox.state.elapsed)}` + (rules.hostiles ? ` \u00b7 ${sandbox.state.spawns} spwn` : "") + (m.failures ? ` \u00b7 ${m.failures} dn` : "");
     hud.msn.style.color = mode === GameMode.PEACE ? "#9fe6b0" : "#9fd7ff";
   } else {
+    /**
+     * THE CLOCK COUNTS DOWN, because what the player needs is the time they have
+     * LEFT, not the time they have spent. The sortie is capped at five minutes
+     * (§10) and running it out is one of the two ways to lose, so a number that
+     * climbs toward an unstated limit says nothing until it is already too late.
+     *
+     * Instrumentation, not instruction (§16): it reports what the world is
+     * doing, the way the altimeter does. The sandbox branch above is untouched —
+     * those modes are not timed, and a countdown there would invent a deadline
+     * the mode does not have.
+     */
     hud.msn.textContent =
-      `${m.phase} ${formatShortClock(m.phaseTime)} \u00b7 t ${formatShortClock(m.missionTime)} \u00b7 cp${m.checkpoint}` +
+      `${m.phase} ${formatShortClock(m.phaseTime)} \u00b7 T-${formatShortClock(Math.max(0, MISSION.deadline - m.missionTime))} \u00b7 cp${m.checkpoint}` +
       (m.failures ? ` \u00b7 ${m.failures}f` : "") +
       (m.recovering ? ` \u00b7 AUTO ${Math.round(m.autopilot * 100)}%` : "");
     hud.msn.style.color = PHASE_COLOR[m.phase] || "#e8f0f6";

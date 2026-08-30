@@ -3058,16 +3058,40 @@ const makeTerrain = (f, half = 100) => {
 /* ---- placement ---- */
 {
   const legs = [
+    { phase: MissionPhase.DEFENSIVE, name: "COASTLINE", position: { x: 0, y: 500, z: -7900 }, radius: 1300 },
     { phase: MissionPhase.TERRAIN, name: "PASS", position: { x: 0, y: 400, z: -10000 }, radius: 1300 },
     { phase: MissionPhase.TERRAIN, name: "VALLEY", position: { x: 500, y: 400, z: -13000 }, radius: 1400 },
+    { phase: MissionPhase.TERRAIN, name: "RIDGE", position: { x: -600, y: 400, z: -17000 }, radius: 1400 },
     { phase: MissionPhase.EGRESS, name: "COAST", position: { x: 0, y: 300, z: -4000 }, radius: 1250 },
   ];
   const land = () => 200;
   const plan = planSamSites(legs, land);
-  check("placement: two sites per terrain leg", plan.length === 4, plan.length);
-  check("placement: and none on a leg that is not terrain", plan.every((p) => p.leg !== "COAST"), plan.map((p) => p.leg));
-  check("placement: they flank the corridor rather than sitting on it", plan.every((p) => Math.abs(p.x - (p.leg === "PASS" ? 0 : 500)) > 900), plan.map((p) => p.x));
-  check("placement: both sides are used", new Set(plan.map((p) => Math.sign(p.x - (p.leg === "PASS" ? 0 : 500)))).size === 2, plan.map((p) => p.x));
+  /**
+   * THE DEFEND AREA HAS A BATTERY AND THE FIRST INLAND LEG HAS NONE.
+   *
+   * These counts used to be "two per terrain leg". DEFENSIVE was a phase called
+   * DEFEND with nothing to defend against — the nearest ground threat sat 2.9 km
+   * beyond the area's edge — while the first inland leg carried a pair standing
+   * exactly where DEFENSIVE hands over to TERRAIN, belonging to neither phase.
+   * The pair moved forward. Rewritten rather than adapted (§18): the old count
+   * described a layout that is gone.
+   */
+  check("placement: the DEFEND area gets its own battery", plan.filter((p) => p.leg === "DEFEND").length === MISSION.sam.defendCount, plan.filter((p) => p.leg === "DEFEND").length);
+  check("placement: the first inland leg is left clear", plan.every((p) => p.leg !== "PASS"), plan.map((p) => p.leg));
+  check("placement: the later inland legs keep their pairs", plan.filter((p) => p.leg === "VALLEY").length === 2 && plan.filter((p) => p.leg === "RIDGE").length === 2, plan.map((p) => p.leg));
+  check("placement: and none on a leg that is neither", plan.every((p) => p.leg !== "COAST"), plan.map((p) => p.leg));
+  // The battery stands INLAND of the area's centre, not around it: the centre is
+  // barely past the waterline, where every probe would fail minGround (§13).
+  check("placement: the DEFEND battery is inland of the area centre", plan.filter((p) => p.leg === "DEFEND").every((p) => p.z < -7900), plan.filter((p) => p.leg === "DEFEND").map((p) => p.z));
+  // ...and still inside the area the player is being held in, or it is guarding
+  // somewhere they are not.
+  check(
+    "placement: ...and still inside it",
+    plan.filter((p) => p.leg === "DEFEND").every((p) => Math.hypot(p.x - 0, p.z - -7900) <= MISSION.area.radius),
+    plan.filter((p) => p.leg === "DEFEND").map((p) => Math.round(Math.hypot(p.x, p.z + 7900)))
+  );
+  check("placement: they flank the corridor rather than sitting on it", plan.filter((p) => p.leg === "VALLEY").every((p) => Math.abs(p.x - 500) > 900), plan.map((p) => p.x));
+  check("placement: both sides are used", new Set(plan.filter((p) => p.leg === "DEFEND").map((p) => Math.sign(p.x))).size === 2, plan.map((p) => p.x));
   check("placement: they stand on the ground", plan.every((p) => p.y === 200), plan.map((p) => p.y));
 
   // The bug this probing exists for: a lateral offset can miss the land, and the

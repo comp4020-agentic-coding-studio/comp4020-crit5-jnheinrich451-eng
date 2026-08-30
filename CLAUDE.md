@@ -1181,8 +1181,28 @@ tilted, turret hidden — not a deletion.
 Only sites within detection range and envelope pay for a line-of-sight test; six
 sites × 14 samples every frame would be 84 terrain queries.
 
-**Placement:** two per inland leg, flanking the corridor by ~1450 m so the safe
-line is *between* them and low. Each site **probes outward** along its side
+**Placement:** a battery of three in the DEFEND area, then two per inland leg
+from the second one onward, flanking the corridor by ~1450 m so the safe line is
+*between* them and low.
+
+**The DEFEND area has its own battery, and the first inland leg has none.**
+DEFENSIVE was a phase called DEFEND with nothing to defend against — the nearest
+ground threat sat 2.9 km beyond the area's edge — while the first inland leg
+carried a pair standing exactly where DEFENSIVE hands over to TERRAIN, a threat
+belonging to neither phase. The pair moved forward into the area that needed it,
+and ground threats are live from DEFENSIVE rather than only in TERRAIN: a site
+that cannot shoot during the phase it was placed for is furniture.
+
+Two details the terrain forces, both measured on the shipped mesh:
+
+- the battery is laid **along the course inland** of the area's centre, not
+  around it. The centre sits ~300 m past the waterline, where the ground is at
+  sea level and every probe fails `minGround`.
+- each site tries its **preferred flank and then the other**. The inland legs
+  can afford a fixed side because they sit on the island proper; this one sits
+  past a waterline that is not a straight edge, and with a fixed side only one
+  of three found ground. With the fallback all three stand — though on this
+  island they end up on the same flank, because that is where the land is. Each site **probes outward** along its side
 (scales 1.0, 0.72, 1.28, 0.48, 1.55) and takes the first position standing on
 ground at least 30 m above sea level. **A site with nowhere to stand is dropped,
 not floated** — five sites on land beat six with one in the sea.

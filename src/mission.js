@@ -179,7 +179,33 @@ export const MISSION = {
    * flanking it means the safe line is *between* them and low, which is the
    * behaviour the terrain masking is there to reward.
    */
-  sam: { perLeg: 2, lateral: 1450, along: 700, lift: 0, minGround: 30, probes: [1, 0.72, 1.28, 0.48, 1.55] },
+  sam: {
+    perLeg: 2,
+    lateral: 1450,
+    along: 700,
+    lift: 0,
+    minGround: 30,
+    probes: [1, 0.72, 1.28, 0.48, 1.55],
+    /**
+     * THE DEFEND AREA GETS ITS OWN BATTERY, and the first inland leg gets none.
+     *
+     * DEFENSIVE used to be a pure air fight held open by a floor, with the
+     * nearest ground threat 2.9 km beyond its edge — a phase called DEFEND with
+     * nothing to defend against. Meanwhile the first inland leg carried a pair
+     * sitting right where DEFENSIVE hands over to TERRAIN, which reads as a
+     * threat belonging to neither phase.
+     *
+     * So the pair moves forward into the area that needs it. `defendCount` sites
+     * are laid along the course INLAND of the DEFEND centre rather than around
+     * it: the centre sits ~300 m past the waterline, where the ground is at sea
+     * level and every probe would fail `minGround` and be dropped (§13). The
+     * offsets below stay inside the area's 3400 m radius while standing on real
+     * ground.
+     */
+    defendCount: 3,
+    defendAlong: [1800, 2400, 3000],
+    skipFirstTerrainLeg: true,
+  },
 
   cueTime: 2.7,
   fadeIn: 1.2,
@@ -418,7 +444,49 @@ export function planRoute({ coastZ, features = [], cfg = MISSION }) {
 export function planSamSites(legs, groundAt = null, cfg = MISSION) {
   const s = cfg.sam;
   const out = [];
-  const terrainLegs = legs.filter((l) => l.phase === MissionPhase.TERRAIN);
+
+  /**
+   * The DEFEND battery. Laid along the course inland of the area's centre, so
+   * the sites stand on ground while remaining inside the area the player is
+   * being held in. Sides alternate so it is a corridor to thread, not a wall.
+   */
+  const defend = legs.find((l) => l.phase === MissionPhase.DEFENSIVE);
+  if (defend) {
+    for (let k = 0; k < s.defendCount; k++) {
+      const along = s.defendAlong[k] ?? s.defendAlong[s.defendAlong.length - 1];
+      const z = defend.position.z - along; // -Z is inland (§5)
+      /**
+       * Each site tries its PREFERRED flank first and then the other one.
+       *
+       * The inland legs can afford a single fixed side because they sit on the
+       * island proper. This battery sits a kilometre or two past a waterline
+       * that is not a straight edge, so a fixed side puts most of its probes
+       * over water: measured on the shipped terrain, one site of three found
+       * ground and the other two were dropped (§13). Falling back to the far
+       * flank keeps the battery at strength without floating anything.
+       */
+      const preferred = k % 2 === 0 ? 1 : -1;
+      let placed = null;
+      for (const side of [preferred, -preferred]) {
+        for (const scale of s.probes) {
+          const x = defend.position.x + side * s.lateral * scale;
+          const y = groundAt ? groundAt(x, z) : -Infinity;
+          if (y >= s.minGround) {
+            placed = { name: `SamDEFEND${k + 1}`, x, y: y + s.lift, z, leg: "DEFEND", offset: +(side * s.lateral * scale).toFixed(0) };
+            break;
+          }
+        }
+        if (placed) break;
+      }
+      if (placed) out.push(placed);
+    }
+  }
+
+  // The first inland leg is left clear: its pair used to sit exactly where
+  // DEFENSIVE hands over to TERRAIN, which belongs to neither phase. Those
+  // sites are the ones now standing in the DEFEND area above.
+  const allTerrain = legs.filter((l) => l.phase === MissionPhase.TERRAIN);
+  const terrainLegs = s.skipFirstTerrainLeg ? allTerrain.slice(1) : allTerrain;
   terrainLegs.forEach((leg, i) => {
     for (let k = 0; k < s.perLeg; k++) {
       // Alternate which side leads, so the flanking pattern does not become a
