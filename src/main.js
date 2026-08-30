@@ -1093,8 +1093,24 @@ function recoveryGoal() {
 
 // Reused object: the HUD reads the nav cue every frame and must not allocate.
 const _navCtx = { valid: false, position: null, name: null, range: 0 };
+const _areaCtx = { valid: false, name: null, inside: false, range: 0 };
 function navCtx() {
   const m = director.state;
+  /**
+   * An area outranks a waypoint, and OUTSIDE one it becomes the waypoint.
+   *
+   * The HUD's nav renderer already draws both an on-screen diamond and an
+   * off-screen chevron, so pointing it at the area's centre is what produces the
+   * arrow back with no new drawing code. Inside the area there is no destination
+   * at all — the radar halo carries it instead.
+   */
+  if (m.areaValid) {
+    _navCtx.valid = !m.inArea;
+    _navCtx.position = m.areaPosition;
+    _navCtx.name = m.areaName;
+    _navCtx.range = m.areaRange;
+    return _navCtx;
+  }
   _navCtx.valid = m.navValid;
   _navCtx.position = m.navPosition;
   _navCtx.name = m.navName;
@@ -2475,6 +2491,14 @@ function step() {
       // entirely while a missile is inbound.
       nav: navCtx(),
       radar: radarCtx(),
+      area: (() => {
+        const m = director.state;
+        _areaCtx.valid = m.areaValid;
+        _areaCtx.name = m.areaName;
+        _areaCtx.inside = m.inArea;
+        _areaCtx.range = m.areaRange;
+        return _areaCtx;
+      })(),
       missionCue: director.cue,
       missionCueAlpha: director.cueAlpha,
       // Keep the instruments clear of the developer rail at narrow widths.

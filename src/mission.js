@@ -94,6 +94,26 @@ export const MISSION = {
    */
   floor: { INTERCEPT: 26, DEFENSIVE: 30, kill: 6 },
 
+  /**
+   * §18 — THE COMBAT AREA, and the answer to a waypoint that cannot be reached.
+   *
+   * A combat phase holds the player with a floor while its own waypoint is
+   * already behind them — DEFENSIVE inherits a COASTLINE flown under INTERCEPT.
+   * The marker used to fall forward to the NEXT phase's waypoint just to have
+   * something to show, and that was a lie: arriving there advanced nothing, and
+   * the marker only moved when the floor expired. Reported from play as "I enter
+   * 200 m, and pass the NAV, it does not update... it will wait after a while".
+   *
+   * So during those phases there is no destination, and the display says so
+   * differently: an AREA rather than a point. Inside it there is no marker at
+   * all — the wordless way of saying you are where you should be — and the radar
+   * ring lights instead. Outside it, an arrow points back.
+   *
+   * The radius is generous on purpose. This is "the fight is around here", not a
+   * gate to thread.
+   */
+  area: { radius: 3400 },
+
   /** §19 — broad volumes. The player must never miss progression by 50 m. */
   radius: { leg: 1250, intercept: 1300, terrain: 1300, valley: 1400, ridge: 1400, seaward: 1600, extraction: 2400 },
 
@@ -656,6 +676,17 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
     navRange: 0,
     navPosition: { x: 0, y: 0, z: 0 },
     navValid: false,
+    /**
+     * The combat area, published INSTEAD of a waypoint while a floor holds the
+     * player in a phase whose own leg is already behind them. Additive: nothing
+     * in the transition table reads any of it, so the mission logic is unchanged.
+     */
+    areaValid: false,
+    areaName: null,
+    areaPosition: { x: 0, y: 0, z: 0 },
+    areaRadius: 0,
+    areaRange: 0,
+    inArea: false,
     /** 0 while the player flies; ramps to 1 through the closing cinematic. */
     autopilot: 0,
     recovering: false,
@@ -767,6 +798,7 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
     // aircraft still sits where a respawn dropped it must not hand out credit
     // for a waypoint it was dropped on top of.
     armCurrentLeg();
+    publishArea();
     publishNav();
   }
 
@@ -826,6 +858,33 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
    * next real destination. The trigger check below is untouched, which is why this
    * changes no phase timing.
    */
+  /** Phases that hold the player in a region rather than sending them to a point. */
+  const AREA_PHASE = { [MissionPhase.INTERCEPT]: "INTERCEPT", [MissionPhase.DEFENSIVE]: "DEFEND" };
+
+  /**
+   * An area is published when the phase is a combat one AND its own legs are
+   * done — exactly the window in which nav had nothing honest to show. While one
+   * is up `publishNav` yields, so the player sees an area or a waypoint, never
+   * both.
+   */
+  function publishArea() {
+    const name = AREA_PHASE[state.phase];
+    const own = legs.length ? legs[legs.length - 1] : null;
+    const on = !!name && !!own && state.legDone && !state.sandbox;
+    state.areaValid = on;
+    state.areaName = on ? name : null;
+    state.areaRadius = on ? cfg.area.radius : 0;
+    if (on) {
+      state.areaPosition.x = own.position.x;
+      state.areaPosition.y = own.position.y;
+      state.areaPosition.z = own.position.z;
+    } else {
+      state.areaRange = 0;
+      state.inArea = false;
+    }
+    return on;
+  }
+
   function publishNav() {
     /**
      * §11 — A SANDBOX MODE HAS NO NAVIGATION, AT ANY PHASE.
@@ -842,6 +901,15 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
      * director has stopped advancing", and this is "there was never a route".
      */
     if (state.sandbox) {
+      state.navValid = false;
+      state.navName = null;
+      state.navRange = 0;
+      return;
+    }
+    // An area outranks a waypoint: while one is up there is no destination to
+    // publish, and falling forward into the next phase is what made the marker
+    // lie in the first place.
+    if (state.areaValid) {
       state.navValid = false;
       state.navName = null;
       state.navRange = 0;
@@ -982,6 +1050,7 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
         emit("leg", { leg, index: state.legIndex, phase: state.phase });
         state.legIndex += 1;
         if (state.legIndex >= legs.length) state.legDone = true;
+        publishArea();
         // The NEXT leg gets the same test against the same placement — one
         // respawn can sit inside two volumes.
         armCurrentLeg();
@@ -1030,6 +1099,10 @@ export function createMissionDirector({ cfg = MISSION, captureCheckpoint = null,
 
   function publishNavRange(position) {
     state.navRange = state.navValid ? flatDistanceTo(state.navPosition, position) : 0;
+    if (state.areaValid) {
+      state.areaRange = flatDistanceTo(state.areaPosition, position);
+      state.inArea = state.areaRange <= state.areaRadius;
+    }
   }
 
   /** §37 — the timer starts at catapult release and is stated once, here. */

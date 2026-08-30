@@ -4273,10 +4273,23 @@ const VIEWPORTS = { desktop: [1920, 1080], portrait: [390, 844], landscape: [844
     // Reach it. The phase floor has NOT elapsed, so this is exactly the window
     // in which the marker used to disappear.
     fly(at(coastline));
-    check("nav: reaching COASTLINE does not blank the marker", d.state.navValid === true, [d.state.navValid, d.state.navName]);
-    check("nav: it advances to the next real destination", d.state.navName === "PASS", d.state.navName);
-    check("nav: which is inland of the coastline, not behind it", d.state.navPosition.z < coastline.position.z, [d.state.navPosition.z, coastline.position.z]);
-    check("nav: still INTERCEPT — guidance moved, the phase did not", d.state.phase === MissionPhase.INTERCEPT, d.state.phase);
+    /**
+     * REACHING IT PUBLISHES AN AREA, NOT THE NEXT PHASE'S WAYPOINT.
+     *
+     * These three checks used to assert the marker fell forward to PASS. That
+     * kept something on screen, which was the point, but it was a lie: PASS
+     * belongs to TERRAIN, so arriving there advanced nothing and the marker only
+     * moved when the floor expired. Reported from play as "I enter 200 m, and
+     * pass the NAV, it does not update". So they are rewritten rather than
+     * adapted (§18) — the guidance is an AREA now, and the defect they were
+     * written for (nothing at all to fly toward) is still covered, by the third
+     * check below.
+     */
+    check("nav: reaching COASTLINE publishes an AREA, not a waypoint", d.state.areaValid === true && d.state.navValid === false, [d.state.areaValid, d.state.navName]);
+    check("nav: the area is named for what the player is doing", d.state.areaName === "INTERCEPT", d.state.areaName);
+    check("nav: and the player is told they are inside it", d.state.inArea === true, [d.state.areaRange, d.state.areaRadius]);
+    check("nav: it never points at a waypoint the trigger cannot consume", d.state.navName !== "PASS", d.state.navName);
+    check("nav: still INTERCEPT — the display changed, the phase did not", d.state.phase === MissionPhase.INTERCEPT, d.state.phase);
 
     // Let INTERCEPT time out into DEFENSIVE, holding position past the coastline.
     for (let i = 0; i < 500 && d.state.phase === MissionPhase.INTERCEPT; i++) {
@@ -4284,8 +4297,19 @@ const VIEWPORTS = { desktop: [1920, 1080], portrait: [390, 844], landscape: [844
     }
     check("nav: INTERCEPT gives way to DEFENSIVE on its own", d.state.phase === MissionPhase.DEFENSIVE, d.state.phase);
     check("nav: DEFENSIVE does NOT point back at the coastline", d.state.navName !== "COASTLINE", d.state.navName);
-    check("nav: it still names somewhere ahead", d.state.navValid && d.state.navPosition.z < coastline.position.z, [d.state.navName, d.state.navPosition.z]);
-    check("nav: and that is PASS", d.state.navName === "PASS", d.state.navName);
+    // DEFENSIVE inherits a waterline already flown, so it is an area too — which
+    // is the whole reason the marker had nothing honest to show there. Its leg is
+    // consumed on the phase's first update, not on the frame it is entered, so
+    // step once before reading: the area exists from the moment the phase has
+    // nothing left to send the player to.
+    fly({ x: coastline.position.x, y: coastline.position.y, z: coastline.position.z - 900 });
+    check("nav: DEFENSIVE holds the player in an area rather than sending them on", d.state.areaValid === true && d.state.navValid === false, [d.state.areaValid, d.state.navName]);
+    check("nav: named for the job", d.state.areaName === "DEFEND", d.state.areaName);
+    check("nav: 900 m past the waterline is still inside it", d.state.inArea === true, [Math.round(d.state.areaRange), d.state.areaRadius]);
+    // Leave properly and the arrow comes back, pointing at the area behind you.
+    for (let i = 0; i < 5; i++) fly({ x: coastline.position.x, y: coastline.position.y, z: coastline.position.z - 9000 });
+    check("nav: flying well clear of it reports the player outside", d.state.inArea === false, Math.round(d.state.areaRange));
+    check("nav: ...and the area is still published, so an arrow can point back", d.state.areaValid === true, d.state.areaName);
     check("nav: PASS is still an unspent trigger, not skipped", d.state.navPosition.z === pass.position.z);
 
     // A restart must forget everything reached, or nav falls forward past the

@@ -397,6 +397,8 @@ export function createCombatHud(host = document.body, cfg = HUD) {
    * then left alone to fly.
    */
   const missionCue = text(fixedLayer, { "font-size": "17", "letter-spacing": "8", dx: "-4", fill: COLOR.nav });
+  /** Names the area while one is held. Above the heading tape, clear of it. */
+  const areaTitle = text(fixedLayer, { "font-size": "12.5", "letter-spacing": "5.5", fill: COLOR.nav });
 
   /* ---- Stage 04.9: radar ---- */
   const radar = el("g", { id: "hud-radar" }, fixedLayer);
@@ -408,6 +410,20 @@ export function createCombatHud(host = document.body, cfg = HUD) {
   // assumed. This is the "direction" half of the display.
   const radarNose = el("path", { d: "M 0 -7 L -4.5 3 L 4.5 3 Z", fill: COLOR.good, stroke: "none" }, radar);
   const radarLabel = text(radar, { "font-size": "9", "letter-spacing": "2", fill: COLOR.radar });
+  /**
+   * THE AREA HALO. Lit when the player is inside the region a combat phase is
+   * holding them in, and dark otherwise.
+   *
+   * It replaces a waypoint rather than joining one: during those phases there is
+   * nowhere to fly, so a diamond would be a promise the trigger cannot keep. A
+   * ring that is simply ON says "you are where you should be" without a word of
+   * instruction, which is the §16 way to say it — and the arrow that appears
+   * when it goes dark says the rest.
+   *
+   * Drawn last so it sits over the grid, and nav-yellow because it IS the
+   * navigation channel for that moment.
+   */
+  const radarHalo = el("circle", { r: cfg.radarRadius, fill: "none", stroke: COLOR.nav, "stroke-width": "2.4", opacity: "0" }, radar);
 
   /**
    * Blips are pooled and reused. Two shapes, ONE colour: a diamond for air, a
@@ -540,6 +556,8 @@ export function createCombatHud(host = document.body, cfg = HUD) {
    * after a reset, so nothing sweeps in from a stale value.
    */
   const hudState = { pitch: 0, bank: 0, heading: 0, speed: 0, altitude: 0, targetX: 0, targetY: 0, velX: 0, velY: 0, lockProgress: 0, pipX: 0, pipY: 0, navX: 0, navY: 0 };
+  /** Free-running seconds, for the area halo's slow breath. */
+  let areaClock = 0;
   let primed = false;
   let targetPrimed = false;
   let velPrimed = false;
@@ -745,8 +763,15 @@ export function createCombatHud(host = document.body, cfg = HUD) {
 
     /* ---- mission phase cue (§17) ---- */
     const cue = ctx.missionCue || null;
-    missionCue.style.display = cue ? "" : "none";
-    if (cue) {
+    /**
+     * The cue yields to the area title, which occupies the same row and says the
+     * same word. Two texts at one spot in two sizes reads as a rendering fault,
+     * and the persistent one is the more useful of the pair: the cue announces a
+     * phase for 2.7 s, the title says where you still are.
+     */
+    const cueSuppressed = !!(ctx.area && ctx.area.valid);
+    missionCue.style.display = cue && !cueSuppressed ? "" : "none";
+    if (cue && !cueSuppressed) {
       missionCue.setAttribute("x", cx);
       missionCue.setAttribute("y", Math.round(h * cfg.missionCueY));
       missionCue.setAttribute("opacity", clamp01(ctx.missionCueAlpha === undefined ? 1 : ctx.missionCueAlpha).toFixed(2));
@@ -826,6 +851,7 @@ export function createCombatHud(host = document.body, cfg = HUD) {
       const ry = h - cfg.radarMargin * ui - R;
       radar.setAttribute("transform", `translate(${rx} ${ry})`);
       radarRing.setAttribute("r", R);
+      radarHalo.setAttribute("r", R);
       radarMid.setAttribute("r", R * 0.5);
       radarCrossV.setAttribute("x1", 0);
       radarCrossV.setAttribute("x2", 0);
@@ -896,6 +922,29 @@ export function createCombatHud(host = document.body, cfg = HUD) {
      * the next leg is about to become current, and the marker is redundant
      * furniture rather than guidance.
      */
+    /**
+     * The area, if a combat phase is holding the player in one. `ctx.nav` is
+     * already fed the area's centre by the orchestrator when the player is
+     * OUTSIDE it, so the arrow back comes free from the code below — this only
+     * has to light the ring and name the place.
+     */
+    const area = ctx.area || null;
+    const inArea = !!(area && area.valid && area.inside);
+    radarHalo.style.display = inArea ? "" : "none";
+    areaClock += step;
+    // A slow breath rather than a blink: it is a state, not an alert.
+    if (inArea) radarHalo.setAttribute("opacity", (0.62 + 0.22 * Math.sin(areaClock * 2.0)).toFixed(3));
+    areaTitle.style.display = area && area.valid ? "" : "none";
+    if (area && area.valid) {
+      areaTitle.setAttribute("x", cx);
+      // The mission cue's slot. Placing it under the heading tape put it THROUGH
+      // the tape's own digits -- measured, "INTE000CEPT". This row is already
+      // reserved for one line of mission text and is clear of everything.
+      areaTitle.setAttribute("y", Math.round(h * cfg.missionCueY));
+      areaTitle.setAttribute("opacity", inArea ? "1" : "0.55");
+      areaTitle.textContent = area.name || "";
+    }
+
     const nav = ctx.nav || null;
     let navOn = false;
     let navEdge = false;

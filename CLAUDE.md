@@ -1416,6 +1416,40 @@ it becomes a yellow chevron at ~24%/22% of the viewport pointing the way round.
 Hide it inside 260 m — you have arrived and the next leg is about to become
 current, so it is furniture rather than guidance.
 
+### An AREA, when there is nowhere to fly
+
+A combat phase holds the player with a floor while its own waypoint is already
+behind them: DEFENSIVE inherits a COASTLINE flown under INTERCEPT. The marker
+used to fall forward to the NEXT phase's waypoint simply to have something to
+show, and that is a **lie** — arriving there advances nothing, because the
+trigger only tests the current phase's leg. Reported from play as "I enter
+200 m, and pass the NAV, it does not update... it will wait after a while".
+
+So those phases publish an **area** instead of a point, and the two are mutually
+exclusive — the player sees one or the other, never both:
+
+- **inside it**, there is no marker at all, and the radar ring lights yellow and
+  breathes slowly. No arrow IS the message: you are where you should be. The
+  phase name sits in the mission-cue row, which the transient cue yields to
+  rather than drawing the same word twice in two sizes.
+- **outside it**, the ordinary marker returns, pointing back at the area — the
+  same diamond and chevron code, fed the area's centre, so there is no second
+  renderer to keep in step.
+
+Radius is generous (3400 m): this is "the fight is around here", not a gate to
+thread. The area is published from `state`, and **nothing in the transition
+table reads it** — it is a display change, not a mission-logic change, which is
+what keeps it out of the way of the floors and the route.
+
+Four fixes that treated this as a routing problem were built and reverted first,
+each caught by a check protecting an earlier reported defect: recording every leg
+flown banks RECOVERY during EGRESS (200 m from COAST) and the run falls to 96 s;
+recording the next phase's legs banks SEAWARD while the player is at PASS (they
+overlap by 1517 m); capping how far the marker looks ahead blanks it on the deck;
+and cutting a combat floor when the player leaves collapses DEFENSIVE to 0.1 s so
+the phase that shoots back never happens. The display was the right place all
+along.
+
 **A threat never suppresses it.** The marker used to vanish while a missile was
 inbound, on the reasoning that the player then needs one piece of information and
 it is not the waypoint. That is wrong in play: the guidance disappears at the
